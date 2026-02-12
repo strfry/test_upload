@@ -38,7 +38,7 @@ python scam_baiter.py
 - Sucht den Telegram-Ordner `Scammers`.
 - Nimmt nur Chats aus diesem Ordner.
 - Berücksichtigt nur Chats, bei denen die letzte Nachricht **nicht** von dir stammt (also unbeantwortet).
-- Baut aus den letzten 20 Nachrichten einen Prompt.
+- Baut aus den letzten 20 Nachrichten einen Prompt mit klarer Ausgabe-Struktur (`ANALYSE:` / `ANTWORT:`).
 - Verwendet den Systemprompt:
 
 > Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, du sollst kreative Gespräche aufbauen um ihn so lange wie möglich hinzuhalten
@@ -66,3 +66,8 @@ export SCAMBAITER_INTERACTIVE="0"
 
 Im Interaktiv-Modus fragt das Tool pro Chat: nicht senden, direkt senden oder Vorschlag manuell editieren und senden.
 
+
+## Erweiterbarkeit (Callback)
+
+Die zentrale Funktion `run(...)` akzeptiert optional einen `suggestion_callback`, mit dem die Modell-Ausgabe nachbearbeitet werden kann.
+Standardmäßig wird dabei robust die sendefertige `ANTWORT:` extrahiert und zusätzliche Teile (z. B. `<think>`, Hinweise, Nachgedanken) werden entfernt.

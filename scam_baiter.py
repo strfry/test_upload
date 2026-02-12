@@ -12,7 +12,7 @@ import re
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List
+from typing import Callable, List
 
 from huggingface_hub import InferenceClient
 from telethon import TelegramClient
@@ -23,6 +23,12 @@ from telethon.utils import get_peer_id
 SYSTEM_PROMPT = (
     "Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, "
     "du sollst kreative Gespräche aufbauen um ihn so lange wie möglich hinzuhalten"
+)
+
+RESPONSE_FORMAT_INSTRUCTION = (
+    'Gib die Ausgabe exakt in diesem Format zurück:\n'
+    'ANALYSE: <maximal 2 kurze Stichpunkte>\n'
+    'ANTWORT: <genau eine sendefertige Telegram-Nachricht auf Deutsch>'
 )
 
 FOLDER_NAME = "Scammers"
@@ -144,7 +150,8 @@ def build_user_prompt(context: ChatContext) -> str:
     return (
         f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n"
         "Schlage genau eine nächste Antwort auf Deutsch vor. "
-        "Die Antwort soll glaubwürdig, freundlich und scambaiting-geeignet sein.\n\n"
+        "Die Antwort soll glaubwürdig, freundlich und scambaiting-geeignet sein.\n"
+        f"{RESPONSE_FORMAT_INSTRUCTION}\n\n"
         f"Chatverlauf:\n{chat_history}"
     )
 
@@ -154,7 +161,8 @@ def _build_text_generation_prompt(context: ChatContext) -> str:
         f"System: {SYSTEM_PROMPT}\n\n"
         "Du bekommst genau einen einzelnen Telegram-Chat. "
         "Nutze ausschließlich diesen Verlauf und kein externes Wissen über andere Chats.\n"
-        "Gib genau eine kurze nächste Nachricht auf Deutsch zurück, ohne Erklärungen.\n\n"
+        "Nutze für die Ausgabe zwingend dieses Schema mit klarer Trennung:\n"
+        f"{RESPONSE_FORMAT_INSTRUCTION}\n\n"
         f"{build_user_prompt(context)}\n\n"
         "Antwort:"
     )
@@ -166,16 +174,46 @@ def _strip_think_segments(text: str) -> str:
     return cleaned.strip()
 
 
-def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatContext) -> str:
+def _extract_final_reply(text: str) -> str:
+    cleaned = _strip_think_segments(text)
+
+    match = re.search(r"ANTWORT\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        reply = match.group(1).strip()
+        reply = re.split(r"\n(?:ANALYSE|HINWEIS|NOTE)\s*:", reply, maxsplit=1, flags=re.IGNORECASE)[0]
+        return reply.strip()
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    filtered = [
+        line for line in lines
+        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
+    ]
+    return "\n".join(filtered).strip()
+
+
+def _apply_suggestion_callback(
+    raw_text: str,
+    callback: Callable[[str], str] | None = None,
+) -> str:
+    processor = callback or _extract_final_reply
+    return processor(raw_text)
+
+
+def generate_suggestion(
+    hf_client: InferenceClient,
+    model: str,
+    context: ChatContext,
+    suggestion_callback: Callable[[str], str] | None = None,
+) -> str:
     try:
         completion = hf_client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{RESPONSE_FORMAT_INSTRUCTION}"},
                 {"role": "user", "content": build_user_prompt(context)},
             ],
         )
-        return _strip_think_segments(completion.choices[0].message.content)
+        return _apply_suggestion_callback(completion.choices[0].message.content, suggestion_callback)
     except Exception as exc:
         _debug(f"Chat-Completions fehlgeschlagen ({type(exc).__name__}): fallback auf text_generation")
         text = hf_client.text_generation(
@@ -185,7 +223,7 @@ def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatCon
             temperature=0.9,
             return_full_text=False,
         )
-        return _strip_think_segments(text)
+        return _apply_suggestion_callback(text, suggestion_callback)
 
 
 async def _send_message_with_optional_delete(client: TelegramClient, context: ChatContext, message: str) -> None:
@@ -243,7 +281,7 @@ async def maybe_interactive_console_reply(client: TelegramClient, context: ChatC
     return True
 
 
-async def run() -> None:
+async def run(suggestion_callback: Callable[[str], str] | None = None) -> None:
     api_id = int(_require_env("TELEGRAM_API_ID"))
     api_hash = _require_env("TELEGRAM_API_HASH")
 
@@ -269,7 +307,12 @@ async def run() -> None:
     print(f"Gefundene unbeantwortete Chats: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
         _debug(f"Verarbeite Chat isoliert: {context.title} (ID: {context.chat_id})")
-        suggestion = generate_suggestion(hf_client, model=hf_model, context=context)
+        suggestion = generate_suggestion(
+            hf_client,
+            model=hf_model,
+            context=context,
+            suggestion_callback=suggestion_callback,
+        )
         print(f"=== Vorschlag {index}: {context.title} (ID: {context.chat_id}) ===")
         print(suggestion)
         print()
