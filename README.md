@@ -43,4 +43,15 @@ python scam_baiter.py
 
 > Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, du sollst kreative Gespräche aufbauen um ihn so lange wie möglich hinzuhalten
 
-Aktuell werden Vorschläge nur in der Konsole ausgegeben (kein Auto-Senden).
+Standardmäßig werden Vorschläge nur in der Konsole ausgegeben (kein Auto-Senden).
+
+Optional kannst du mit Sicherheitsbremse senden:
+
+```bash
+export SCAMBAITER_SEND="1"
+export SCAMBAITER_SEND_CONFIRM="SEND"   # Pflicht, sonst wird nicht gesendet
+# optional: eigene gesendete Nachricht nach X Sekunden löschen
+export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30"
+```
+
+Hinweis: Das Skript verarbeitet jeden Chat einzeln und baut den Prompt nur aus dem Verlauf dieses einen Scammers auf.

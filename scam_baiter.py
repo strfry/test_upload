@@ -8,6 +8,7 @@ and generates suggested replies via Hugging Face Inference API.
 from __future__ import annotations
 
 import os
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List
@@ -147,15 +148,61 @@ def build_user_prompt(context: ChatContext) -> str:
     )
 
 
-def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatContext) -> str:
-    completion = hf_client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(context)},
-        ],
+def _build_text_generation_prompt(context: ChatContext) -> str:
+    return (
+        f"System: {SYSTEM_PROMPT}\n\n"
+        "Du bekommst genau einen einzelnen Telegram-Chat. "
+        "Nutze ausschließlich diesen Verlauf und kein externes Wissen über andere Chats.\n"
+        "Gib genau eine kurze nächste Nachricht auf Deutsch zurück, ohne Erklärungen.\n\n"
+        f"{build_user_prompt(context)}\n\n"
+        "Antwort:"
     )
-    return completion.choices[0].message.content.strip()
+
+
+def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatContext) -> str:
+    try:
+        completion = hf_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": build_user_prompt(context)},
+            ],
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as exc:
+        _debug(f"Chat-Completions fehlgeschlagen ({type(exc).__name__}): fallback auf text_generation")
+        text = hf_client.text_generation(
+            model=model,
+            prompt=_build_text_generation_prompt(context),
+            max_new_tokens=180,
+            temperature=0.9,
+            return_full_text=False,
+        )
+        return text.strip()
+
+
+async def maybe_send_suggestion(client: TelegramClient, context: ChatContext, suggestion: str) -> None:
+    if not _env_flag("SCAMBAITER_SEND"):
+        return
+
+    if os.getenv("SCAMBAITER_SEND_CONFIRM") != "SEND":
+        print(
+            "[WARN] SCAMBAITER_SEND ist aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'. "
+            "Sende daher nicht automatisch."
+        )
+        return
+
+    sent = await client.send_message(context.chat_id, suggestion)
+    print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
+
+    delete_after_seconds = _env_int("SCAMBAITER_DELETE_OWN_AFTER_SECONDS", default=0)
+    if delete_after_seconds <= 0:
+        return
+
+    print(f"[SEND] Lösche gesendete Nachricht in {delete_after_seconds} Sekunden wieder.")
+    await asyncio.sleep(delete_after_seconds)
+    await client.delete_messages(context.chat_id, [sent.id])
+    print(f"[SEND] Nachricht {sent.id} in {context.title} gelöscht.")
 
 
 async def run() -> None:
@@ -183,10 +230,12 @@ async def run() -> None:
 
     print(f"Gefundene unbeantwortete Chats: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
+        _debug(f"Verarbeite Chat isoliert: {context.title} (ID: {context.chat_id})")
         suggestion = generate_suggestion(hf_client, model=hf_model, context=context)
         print(f"=== Vorschlag {index}: {context.title} (ID: {context.chat_id}) ===")
         print(suggestion)
         print()
+        await maybe_send_suggestion(client, context, suggestion)
 
 
 def _require_env(name: str) -> str:
@@ -196,9 +245,18 @@ def _require_env(name: str) -> str:
     return value
 
 
-def main() -> None:
-    import asyncio
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    return int(value)
+
+
+def main() -> None:
     asyncio.run(run())
 
 
