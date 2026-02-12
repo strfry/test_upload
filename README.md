@@ -1,0 +1,46 @@
+# Telegram Scambaiter (Vorschlagsmodus)
+
+Dieses Skript liest nur **unbeantwortete** Telegram-Konversationen aus dem Ordner `Scammers` und erstellt für jeden Chat einen Antwortvorschlag über die `huggingface_hub` Inference API.
+
+## Setup
+
+1. Python 3.10+ verwenden.
+2. Abhängigkeiten installieren:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Umgebungsvariablen setzen:
+
+```bash
+export TELEGRAM_API_ID="..."
+export TELEGRAM_API_HASH="..."
+export TELEGRAM_SESSION="scambaiter"   # optional
+
+export HF_TOKEN="..."
+export HF_MODEL="..."
+# optional, falls du ein eigenes Inference Endpoint nutzen willst
+export HF_BASE_URL="https://..."
+
+# optional: Debug-Logs für Folder/ID-Matching
+export SCAMBAITER_DEBUG="1"
+```
+
+## Nutzung
+
+```bash
+python scam_baiter.py
+```
+
+## Logik
+
+- Sucht den Telegram-Ordner `Scammers`.
+- Nimmt nur Chats aus diesem Ordner.
+- Berücksichtigt nur Chats, bei denen die letzte Nachricht **nicht** von dir stammt (also unbeantwortet).
+- Baut aus den letzten 20 Nachrichten einen Prompt.
+- Verwendet den Systemprompt:
+
+> Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, du sollst kreative Gespräche aufbauen um ihn so lange wie möglich hinzuhalten
+
+Aktuell werden Vorschläge nur in der Konsole ausgegeben (kein Auto-Senden).

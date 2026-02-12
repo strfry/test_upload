@@ -1,0 +1,2 @@
+huggingface_hub>=0.24.0
+telethon>=1.36.0
