@@ -8,6 +8,7 @@ and generates suggested replies via Hugging Face Inference API.
 from __future__ import annotations
 
 import os
+import re
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
@@ -159,6 +160,12 @@ def _build_text_generation_prompt(context: ChatContext) -> str:
     )
 
 
+def _strip_think_segments(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+    return cleaned.strip()
+
+
 def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatContext) -> str:
     try:
         completion = hf_client.chat.completions.create(
@@ -168,7 +175,7 @@ def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatCon
                 {"role": "user", "content": build_user_prompt(context)},
             ],
         )
-        return completion.choices[0].message.content.strip()
+        return _strip_think_segments(completion.choices[0].message.content)
     except Exception as exc:
         _debug(f"Chat-Completions fehlgeschlagen ({type(exc).__name__}): fallback auf text_generation")
         text = hf_client.text_generation(
@@ -178,7 +185,21 @@ def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatCon
             temperature=0.9,
             return_full_text=False,
         )
-        return text.strip()
+        return _strip_think_segments(text)
+
+
+async def _send_message_with_optional_delete(client: TelegramClient, context: ChatContext, message: str) -> None:
+    sent = await client.send_message(context.chat_id, message)
+    print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
+
+    delete_after_seconds = _env_int("SCAMBAITER_DELETE_OWN_AFTER_SECONDS", default=0)
+    if delete_after_seconds <= 0:
+        return
+
+    print(f"[SEND] Lösche gesendete Nachricht in {delete_after_seconds} Sekunden wieder.")
+    await asyncio.sleep(delete_after_seconds)
+    await client.delete_messages(context.chat_id, [sent.id])
+    print(f"[SEND] Nachricht {sent.id} in {context.title} gelöscht.")
 
 
 async def maybe_send_suggestion(client: TelegramClient, context: ChatContext, suggestion: str) -> None:
@@ -192,17 +213,34 @@ async def maybe_send_suggestion(client: TelegramClient, context: ChatContext, su
         )
         return
 
-    sent = await client.send_message(context.chat_id, suggestion)
-    print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
+    await _send_message_with_optional_delete(client, context, suggestion)
 
-    delete_after_seconds = _env_int("SCAMBAITER_DELETE_OWN_AFTER_SECONDS", default=0)
-    if delete_after_seconds <= 0:
-        return
 
-    print(f"[SEND] Lösche gesendete Nachricht in {delete_after_seconds} Sekunden wieder.")
-    await asyncio.sleep(delete_after_seconds)
-    await client.delete_messages(context.chat_id, [sent.id])
-    print(f"[SEND] Nachricht {sent.id} in {context.title} gelöscht.")
+async def maybe_interactive_console_reply(client: TelegramClient, context: ChatContext, suggestion: str) -> bool:
+    if not _env_flag("SCAMBAITER_INTERACTIVE", default=True):
+        return False
+
+    if not os.isatty(0):
+        print("[WARN] SCAMBAITER_INTERACTIVE ist aktiv, aber kein TTY verfügbar. Überspringe Interaktiv-Modus.")
+        return False
+
+    print("Aktion: [Enter]=nicht senden | s=Vorschlag senden | e=editieren+senden")
+    choice = input("> ").strip().lower()
+    if choice == "s":
+        await _send_message_with_optional_delete(client, context, suggestion)
+        return True
+
+    if choice == "e":
+        print("Gib deine Nachricht ein (leere Zeile = Abbruch):")
+        custom = input("> ").strip()
+        if not custom:
+            print("[INFO] Abgebrochen, nichts gesendet.")
+            return True
+        await _send_message_with_optional_delete(client, context, custom)
+        return True
+
+    print("[INFO] Nicht gesendet.")
+    return True
 
 
 async def run() -> None:
@@ -235,7 +273,9 @@ async def run() -> None:
         print(f"=== Vorschlag {index}: {context.title} (ID: {context.chat_id}) ===")
         print(suggestion)
         print()
-        await maybe_send_suggestion(client, context, suggestion)
+        handled_interactively = await maybe_interactive_console_reply(client, context, suggestion)
+        if not handled_interactively:
+            await maybe_send_suggestion(client, context, suggestion)
 
 
 def _require_env(name: str) -> str:
@@ -245,8 +285,11 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:

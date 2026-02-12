@@ -55,3 +55,14 @@ export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30"
 ```
 
 Hinweis: Das Skript verarbeitet jeden Chat einzeln und baut den Prompt nur aus dem Verlauf dieses einen Scammers auf.
+Zusätzlich wird ein eventuell erzeugter `<think>...</think>`-Teil automatisch entfernt, bevor der Vorschlag angezeigt oder gesendet wird.
+
+Interaktive Konsole (Standard):
+
+```bash
+# optional deaktivieren
+export SCAMBAITER_INTERACTIVE="0"
+```
+
+Im Interaktiv-Modus fragt das Tool pro Chat: nicht senden, direkt senden oder Vorschlag manuell editieren und senden.
+
