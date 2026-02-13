@@ -63,6 +63,7 @@ Verfügbare Bot-Kommandos:
 
 - `/status` – zeigt Auto-Status und letzten Lauf
 - `/runonce` – startet sofort einen Einmaldurchlauf
+- `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
 - `/startauto` – startet den Auto-Modus
 - `/stopauto` – stoppt den Auto-Modus
 - `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick

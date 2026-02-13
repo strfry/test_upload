@@ -58,8 +58,28 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
     async def run_once(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
-        await _guarded_reply(update, "Starte Einmaldurchlauf...")
-        summary = await service.run_once()
+        target_chat_ids: set[int] | None = None
+        if context.args:
+            target_chat_ids = set()
+            for arg in context.args:
+                for token in arg.split(","):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    try:
+                        target_chat_ids.add(int(token))
+                    except ValueError:
+                        await _guarded_reply(
+                            update,
+                            "Ungültige Chat-ID. Nutzung: /runonce oder /runonce <chat_id[,chat_id2,...]>",
+                        )
+                        return
+
+        if target_chat_ids:
+            await _guarded_reply(update, f"Starte Einmaldurchlauf für {len(target_chat_ids)} Chat-ID(s)...")
+        else:
+            await _guarded_reply(update, "Starte Einmaldurchlauf...")
+        summary = await service.run_once(target_chat_ids=target_chat_ids)
         await _guarded_reply(
             update,
             f"Fertig. Chats: {summary.chat_count}, gesendet: {summary.sent_count}",

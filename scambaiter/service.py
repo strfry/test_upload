@@ -27,12 +27,14 @@ class BackgroundService:
         self.last_summary: RunSummary | None = None
         self.last_results: list[SuggestionResult] = []
 
-    async def run_once(self) -> RunSummary:
+    async def run_once(self, target_chat_ids: set[int] | None = None) -> RunSummary:
         async with self._run_lock:
             started = datetime.now()
             sent_count = 0
             folder_chat_ids = await self.core.get_folder_chat_ids()
             contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
+            if target_chat_ids:
+                contexts = [ctx for ctx in contexts if ctx.chat_id in target_chat_ids]
             results: list[SuggestionResult] = []
 
             for context in contexts:

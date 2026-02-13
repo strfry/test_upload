@@ -21,8 +21,9 @@ SYSTEM_PROMPT = (
     "betrügen, erpressen oder Social-Engineering gegen die andere Person betreiben. "
     "Dein einziges Ziel ist, den Scammer mit plausiblen, harmlosen Antworten möglichst lange "
     "in ein Gespräch zu verwickeln. Nutze nur den bereitgestellten Chatverlauf. "
-    "Gib die Ausgabe vorzugsweise in drei Zeilen aus: 'ANALYSE: ...', optional 'META: key=value;key2=value2' und 'ANTWORT: ...'. "
-    "Nutze META für strukturierte Key-Value-Infos (z.B. sprache=de), wenn sinnvoll. "
+    "Gib die Ausgabe vorzugsweise in drei Zeilen aus: 'ANALYSE: ...', 'META: ...' und 'ANTWORT: ...'. "
+    "Wichtige Struktur für META: mindestens der Key 'sprache' (z.B. 'META: sprache=de'). "
+    "Weitere Key-Value-Infos sind erlaubt (Format: key=value;key2=value2). "
     "Die ANTWORT muss genau eine sendefertige Telegram-Nachricht enthalten. "
     "Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (—)."
 )
