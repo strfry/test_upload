@@ -84,7 +84,6 @@ Verfügbare Bot-Kommandos:
 
 Jede Bot-Anfrage wird einem Telegram-Bot-User (`effective_user.id`) zugeordnet.
 Wenn dieser User noch nicht eingeloggt ist, sind nur Login-Kommandos nutzbar (`/start`, `/login`, `/code`, `/password`, `/logout`).
-Wenn Telegram meldet, dass der Code abgelaufen ist, fordert der Bot jetzt automatisch einen neuen Code an und bittet erneut um `/code <PIN>`.
 Die Telethon-Session wird pro Bot-User unter einem eigenen Session-Namen gespeichert.
 
 Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (z.B. `sprache`) automatisch als Keys für den jeweiligen Scammer aktualisiert.
