@@ -30,6 +30,8 @@ class ChatContext:
     chat_id: int
     title: str
     lines: list[str]
+    pending_incoming_chars: int
+    last_incoming_message_id: int | None
 
 
 @dataclass
@@ -43,6 +45,7 @@ class ScambaiterCore:
         self.config = config
         self.client = TelegramClient(config.telegram_session, config.telegram_api_id, config.telegram_api_hash)
         self.hf_client = InferenceClient(api_key=config.hf_token, base_url=config.hf_base_url)
+        self._my_id: int | None = None
 
     async def start(self) -> None:
         await self.client.start()
@@ -73,8 +76,7 @@ class ScambaiterCore:
         raise ValueError(f'Telegram-Ordner "{self.config.folder_name}" wurde nicht gefunden.')
 
     async def collect_unanswered_chats(self, folder_chat_ids: set[int]) -> list[ChatContext]:
-        me = await self.client.get_me()
-        my_id = me.id
+        my_id = await self._get_my_id()
         contexts: list[ChatContext] = []
 
         async for dialog in self.client.iter_dialogs():
@@ -85,16 +87,14 @@ class ScambaiterCore:
                 continue
 
             messages = await self.client.get_messages(dialog.entity, limit=self.config.history_limit)
-            lines: list[str] = []
-            for message in reversed(messages):
-                text = message.message or ""
-                if not text.strip():
-                    continue
-                sender = "Ich" if message.sender_id == my_id else dialog.title
-                lines.append(f"[{self._fmt_dt(message.date)}] {sender}: {text}")
-
-            if lines:
-                contexts.append(ChatContext(chat_id=dialog.id, title=dialog.title, lines=lines))
+            context = self._build_chat_context(
+                chat_id=dialog.id,
+                title=dialog.title,
+                my_id=my_id,
+                messages=messages,
+            )
+            if context:
+                contexts.append(context)
 
         self._debug(f"Unbeantwortete Chats gefunden: {len(contexts)}")
         return contexts
@@ -123,16 +123,42 @@ class ScambaiterCore:
         if self.config.send_confirm != "SEND":
             print("[WARN] SCAMBAITER_SEND aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'.")
             return False
-        await self.send_message_with_optional_delete(context, suggestion)
-        return True
+        current_context = context
+        current_suggestion = suggestion
 
-    async def send_message_with_optional_delete(self, context: ChatContext, message: str) -> None:
+        for attempt in range(3):
+            sent = await self.send_message_with_optional_delete(current_context, current_suggestion)
+            if sent:
+                return True
+
+            refreshed = await self.refresh_chat_context(current_context.chat_id, current_context.title)
+            if refreshed is None:
+                self._debug(f"Chat {current_context.chat_id}: inzwischen beantwortet, kein Senden nötig.")
+                return False
+            current_context = refreshed
+            current_suggestion = self.generate_suggestion(current_context)
+            self._debug(f"Chat {current_context.chat_id}: neue Nachricht erkannt, antworte neu (Versuch {attempt + 2}/3).")
+
+        return False
+
+    async def send_message_with_optional_delete(self, context: ChatContext, message: str) -> bool:
+        if await self._wait_for_reply_window(context):
+            return False
+
+        typing_seconds = calculate_typing_delay_seconds(len(message))
+        if typing_seconds > 0:
+            async with self.client.action(context.chat_id, "typing"):
+                await asyncio.sleep(typing_seconds)
+                if await self._has_new_incoming_message(context):
+                    return False
+
         sent = await self.client.send_message(context.chat_id, message)
         print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
         if self.config.delete_after_seconds > 0:
             await asyncio.sleep(self.config.delete_after_seconds)
             await self.client.delete_messages(context.chat_id, [sent.id])
             print(f"[SEND] Nachricht {sent.id} in {context.title} gelöscht.")
+        return True
 
     async def maybe_interactive_console_reply(self, context: ChatContext, suggestion: str) -> bool:
         if not self.config.interactive_enabled:
@@ -153,6 +179,73 @@ class ScambaiterCore:
                 await self.send_message_with_optional_delete(context, custom)
             return True
         return True
+
+    async def refresh_chat_context(self, chat_id: int, fallback_title: str = "Chat") -> ChatContext | None:
+        my_id = await self._get_my_id()
+        entity = await self.client.get_entity(chat_id)
+        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or fallback_title
+        messages = await self.client.get_messages(entity, limit=self.config.history_limit)
+        return self._build_chat_context(chat_id=chat_id, title=title, my_id=my_id, messages=messages)
+
+    async def _get_my_id(self) -> int:
+        if self._my_id is None:
+            me = await self.client.get_me()
+            self._my_id = me.id
+        return self._my_id
+
+    def _build_chat_context(self, chat_id: int, title: str, my_id: int, messages: list) -> ChatContext | None:
+        lines: list[str] = []
+        pending_chars = 0
+        latest_incoming_id: int | None = None
+
+        for message in reversed(messages):
+            text = message.message or ""
+            if not text.strip():
+                continue
+            sender = "Ich" if message.sender_id == my_id else title
+            lines.append(f"[{self._fmt_dt(message.date)}] {sender}: {text}")
+
+        for message in messages:
+            if message.sender_id == my_id:
+                break
+            text = (message.message or "").strip()
+            if not text:
+                continue
+            pending_chars += len(text)
+            if latest_incoming_id is None:
+                latest_incoming_id = message.id
+
+        if not lines:
+            return None
+
+        return ChatContext(
+            chat_id=chat_id,
+            title=title,
+            lines=lines,
+            pending_incoming_chars=pending_chars,
+            last_incoming_message_id=latest_incoming_id,
+        )
+
+    async def _wait_for_reply_window(self, context: ChatContext) -> bool:
+        wait_seconds = calculate_response_delay_seconds(context.pending_incoming_chars)
+        elapsed = 0.0
+        while elapsed < wait_seconds:
+            sleep_for = min(0.8, wait_seconds - elapsed)
+            await asyncio.sleep(sleep_for)
+            elapsed += sleep_for
+            if await self._has_new_incoming_message(context):
+                return True
+        return False
+
+    async def _has_new_incoming_message(self, context: ChatContext) -> bool:
+        latest = await self.client.get_messages(context.chat_id, limit=1)
+        if not latest:
+            return False
+        newest = latest[0]
+        if newest.id == context.last_incoming_message_id:
+            return False
+        my_id = await self._get_my_id()
+        return newest.sender_id != my_id
 
     @staticmethod
     def _fmt_dt(dt: datetime | None) -> str:
@@ -195,3 +288,13 @@ def extract_final_reply(text: str) -> str:
         if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
     ]
     return strip_wrapping_quotes("\n".join(filtered).strip())
+
+
+def calculate_response_delay_seconds(incoming_chars: int) -> float:
+    normalized = max(0, incoming_chars)
+    return min(45.0, max(1.5, normalized / 24))
+
+
+def calculate_typing_delay_seconds(outgoing_chars: int) -> float:
+    normalized = max(0, outgoing_chars)
+    return min(30.0, max(1.0, normalized / 14))
