@@ -123,7 +123,7 @@ def create_bot_app(token: str, config: AppConfig, allowed_chat_id: int | None = 
     max_message_len = 3500
     help_text = (
         "Verfügbare Kommandos:\n"
-        "- /help – diese Hilfe\n"
+        "- /help – zeigt Hilfe (nach Login)\n"
         "- /login <telefonnummer> – startet Telethon-Login für deinen User\n"
         "- /code <PIN> – bestätigt den Telegram Login-Code\n"
         "- /password <passwort> – bestätigt optionales 2FA-Passwort\n"
@@ -189,7 +189,16 @@ def create_bot_app(token: str, config: AppConfig, allowed_chat_id: int | None = 
         return None
 
     async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        runtime = await _require_runtime(update)
+        if not runtime:
+            return
         await _guarded_reply(update, help_text)
+
+    async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _guarded_reply(
+            update,
+            "Willkommen. Bitte zuerst einloggen: /login <telefonnummer>, dann /code <PIN> und ggf. /password <passwort>. Danach steht /help zur Verfügung.",
+        )
 
     async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized_chat(update):
@@ -427,7 +436,7 @@ def create_bot_app(token: str, config: AppConfig, allowed_chat_id: int | None = 
         await _guarded_reply(update, f"KV Store für {scammer_chat_id}:\n" + "\n".join(lines))
 
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("start", help_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("code", code))
     app.add_handler(CommandHandler("password", password))

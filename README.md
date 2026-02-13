@@ -2,8 +2,8 @@
 
 Das Tool hat jetzt zwei Betriebsarten:
 
-1. **Batch-Modus (Standard):** läuft einmal durch und zeigt Vorschläge an (wie bisher).
-2. **BotAPI-Modus:** läuft dauerhaft im Hintergrund und wird per Telegram-Bot gesteuert.
+1. **BotAPI-Modus (Standard):** läuft dauerhaft im Hintergrund und wird per Telegram-Bot gesteuert.
+2. **Batch-Modus (optional):** läuft einmal durch und zeigt Vorschläge an.
 
 ## Setup
 
@@ -41,18 +41,20 @@ export SCAMBAITER_ANALYSIS_DB_PATH="scambaiter.sqlite3"  # Persistenz für Analy
 
 ## Batch-Modus
 
-Wenn **kein** `SCAMBAITER_BOT_TOKEN` gesetzt ist, läuft das Tool einmal:
+Batch-Modus ist optional und nur aktiv, wenn du ihn explizit einschaltest:
 
 ```bash
+export SCAMBAITER_BATCH_MODE="1"
 python scam_baiter.py
 ```
 
 ## BotAPI-Modus (Hintergrund + Steuerung per Telegram)
 
-Setze zusätzlich einen Bot-Token, dann startet das Tool als dauerhafter Prozess mit Polling:
+Im Standard startet das Tool im BotAPI-Modus (dauerhaft mit Polling).
+Bot-Token kann über `TELEGRAM_BOT_TOKEN`, `BOT_TOKEN` oder weiterhin optional über `SCAMBAITER_BOT_TOKEN` gesetzt werden:
 
 ```bash
-export SCAMBAITER_BOT_TOKEN="123456:ABC..."
+export TELEGRAM_BOT_TOKEN="123456:ABC..."
 export SCAMBAITER_BOT_ALLOWED_CHAT_ID="123456789"   # optionaler Zugriffsschutz
 export SCAMBAITER_AUTO_INTERVAL_SECONDS="120"
 
@@ -61,12 +63,12 @@ python scam_baiter.py
 
 Verfügbare Bot-Kommandos:
 
-- `/help` – zeigt die Hilfe mit allen Kommandos
-- `/start` – zeigt ebenfalls die Hilfe
+- `/start` – zeigt die Login-Anleitung
 - `/login <telefonnummer>` – startet den Telethon-Login für deinen Bot-User und sendet den Telegram-Code
 - `/code <PIN>` – bestätigt den Login-Code
 - `/password <passwort>` – bestätigt optionales 2FA-Passwort
 - `/logout` – meldet deinen Bot-User ab
+- `/help` – zeigt die Hilfe mit allen Kommandos (erst nach Login)
 - `/status` – zeigt Auto-Status und letzten Lauf
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
@@ -81,7 +83,7 @@ Verfügbare Bot-Kommandos:
 
 
 Jede Bot-Anfrage wird einem Telegram-Bot-User (`effective_user.id`) zugeordnet.
-Wenn dieser User noch nicht eingeloggt ist, fordert der Bot zuerst den Login über `/login` + `/code` (und ggf. `/password`) an.
+Wenn dieser User noch nicht eingeloggt ist, sind nur Login-Kommandos nutzbar (`/start`, `/login`, `/code`, `/password`, `/logout`).
 Die Telethon-Session wird pro Bot-User unter einem eigenen Session-Namen gespeichert.
 
 Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (z.B. `sprache`) automatisch als Keys für den jeweiligen Scammer aktualisiert.

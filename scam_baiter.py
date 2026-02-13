@@ -51,7 +51,7 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
 async def run() -> None:
     config = load_config()
 
-    if not config.bot_token:
+    if config.batch_mode:
         core = ScambaiterCore(config)
         store = AnalysisStore(config.analysis_db_path)
         await core.start()
@@ -60,6 +60,9 @@ async def run() -> None:
         finally:
             await core.close()
         return
+
+    if not config.bot_token:
+        raise ValueError("Kein Bot-Token konfiguriert. Setze TELEGRAM_BOT_TOKEN, BOT_TOKEN oder optional SCAMBAITER_BOT_TOKEN. Für den alten Batch-Modus setze zusätzlich SCAMBAITER_BATCH_MODE=1.")
 
     bot_app = create_bot_app(
         token=config.bot_token,
