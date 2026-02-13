@@ -33,15 +33,17 @@ export SCAMBAITER_DEBUG="1"
 python scam_baiter.py
 ```
 
+Hinweis: `HF_MODEL` muss ein Chat-Completions-fähiges Modell sein.
+
 ## Logik
 
 - Sucht den Telegram-Ordner `Scammers`.
 - Nimmt nur Chats aus diesem Ordner.
 - Berücksichtigt nur Chats, bei denen die letzte Nachricht **nicht** von dir stammt (also unbeantwortet).
-- Baut aus den letzten 20 Nachrichten einen Prompt mit klarer Ausgabe-Struktur (`ANALYSE:` / `ANTWORT:`).
+- Baut aus den letzten 20 Nachrichten einen Prompt; der komplette Chatverlauf wird als User-Input übergeben.
 - Verwendet den Systemprompt:
 
-> Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, du sollst kreative Gespräche aufbauen um ihn so lange wie möglich hinzuhalten
+> Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, du sollst kreative Gespräche aufbauen, um ihn so lange wie möglich hinzuhalten. Nutze nur den bereitgestellten Chatverlauf. Antworte mit genau einer sendefertigen Telegram-Nachricht auf Deutsch und ohne Zusatztexte. Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (—).
 
 Standardmäßig werden Vorschläge nur in der Konsole ausgegeben (kein Auto-Senden).
 
@@ -70,4 +72,4 @@ Im Interaktiv-Modus fragt das Tool pro Chat: nicht senden, direkt senden oder Vo
 ## Erweiterbarkeit (Callback)
 
 Die zentrale Funktion `run(...)` akzeptiert optional einen `suggestion_callback`, mit dem die Modell-Ausgabe nachbearbeitet werden kann.
-Standardmäßig wird dabei robust die sendefertige `ANTWORT:` extrahiert und zusätzliche Teile (z. B. `<think>`, Hinweise, Nachgedanken) werden entfernt. Falls das Modell die Antwort in Anführungszeichen setzt, werden umschließende Quotes ebenfalls entfernt.
+Standardmäßig wird die Modell-Ausgabe bereinigt (z. B. `<think>`, Meta-Labels wie `ANALYSE:`/`HINWEIS:` und umschließende Anführungszeichen), damit nur die sendefertige Nachricht übrig bleibt.

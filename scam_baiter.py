@@ -22,13 +22,10 @@ from telethon.utils import get_peer_id
 
 SYSTEM_PROMPT = (
     "Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, "
-    "du sollst kreative Gespräche aufbauen um ihn so lange wie möglich hinzuhalten"
-)
-
-RESPONSE_FORMAT_INSTRUCTION = (
-    'Gib die Ausgabe exakt in diesem Format zurück:\n'
-    'ANALYSE: <maximal 2 kurze Stichpunkte>\n'
-    'ANTWORT: <genau eine sendefertige Telegram-Nachricht auf Deutsch>'
+    "du sollst kreative Gespräche aufbauen, um ihn so lange wie möglich hinzuhalten. "
+    "Nutze nur den bereitgestellten Chatverlauf. Antworte mit genau einer sendefertigen "
+    "Telegram-Nachricht auf Deutsch und ohne Zusatztexte. Vermeide KI-typische Ausgaben, "
+    "insbesondere Emojis und den langen Gedankenstrich (—)."
 )
 
 FOLDER_NAME = "Scammers"
@@ -148,23 +145,8 @@ def _fmt_dt(dt: datetime | None) -> str:
 def build_user_prompt(context: ChatContext) -> str:
     chat_history = "\n".join(context.lines)
     return (
-        f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n"
-        "Schlage genau eine nächste Antwort auf Deutsch vor. "
-        "Die Antwort soll glaubwürdig, freundlich und scambaiting-geeignet sein.\n"
-        f"{RESPONSE_FORMAT_INSTRUCTION}\n\n"
+        f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n\n"
         f"Chatverlauf:\n{chat_history}"
-    )
-
-
-def _build_text_generation_prompt(context: ChatContext) -> str:
-    return (
-        f"System: {SYSTEM_PROMPT}\n\n"
-        "Du bekommst genau einen einzelnen Telegram-Chat. "
-        "Nutze ausschließlich diesen Verlauf und kein externes Wissen über andere Chats.\n"
-        "Nutze für die Ausgabe zwingend dieses Schema mit klarer Trennung:\n"
-        f"{RESPONSE_FORMAT_INSTRUCTION}\n\n"
-        f"{build_user_prompt(context)}\n\n"
-        "Antwort:"
     )
 
 
@@ -201,7 +183,7 @@ def _strip_wrapping_quotes(text: str) -> str:
 def _extract_final_reply(text: str) -> str:
     cleaned = _strip_think_segments(text)
 
-    match = re.search(r"ANTWORT\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    match = re.search(r"(?:ANTWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if match:
         reply = match.group(1).strip()
         reply = re.split(r"\n(?:ANALYSE|HINWEIS|NOTE)\s*:", reply, maxsplit=1, flags=re.IGNORECASE)[0]
@@ -229,25 +211,14 @@ def generate_suggestion(
     context: ChatContext,
     suggestion_callback: Callable[[str], str] | None = None,
 ) -> str:
-    try:
-        completion = hf_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{RESPONSE_FORMAT_INSTRUCTION}"},
-                {"role": "user", "content": build_user_prompt(context)},
-            ],
-        )
-        return _apply_suggestion_callback(completion.choices[0].message.content, suggestion_callback)
-    except Exception as exc:
-        _debug(f"Chat-Completions fehlgeschlagen ({type(exc).__name__}): fallback auf text_generation")
-        text = hf_client.text_generation(
-            model=model,
-            prompt=_build_text_generation_prompt(context),
-            max_new_tokens=180,
-            temperature=0.9,
-            return_full_text=False,
-        )
-        return _apply_suggestion_callback(text, suggestion_callback)
+    completion = hf_client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt(context)},
+        ],
+    )
+    return _apply_suggestion_callback(completion.choices[0].message.content, suggestion_callback)
 
 
 async def _send_message_with_optional_delete(client: TelegramClient, context: ChatContext, message: str) -> None:
