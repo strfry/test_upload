@@ -1,17 +1,17 @@
-# Telegram Scambaiter (Vorschlagsmodus)
+# Telegram Scambaiter
 
-Dieses Skript liest nur **unbeantwortete** Telegram-Konversationen aus dem Ordner `Scammers` und erstellt für jeden Chat einen Antwortvorschlag über die `huggingface_hub` Inference API.
+Das Tool hat jetzt zwei Betriebsarten:
+
+1. **Batch-Modus (Standard):** läuft einmal durch und zeigt Vorschläge an (wie bisher).
+2. **BotAPI-Modus:** läuft dauerhaft im Hintergrund und wird per Telegram-Bot gesteuert.
 
 ## Setup
-
-1. Python 3.10+ verwenden.
-2. Abhängigkeiten installieren:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Umgebungsvariablen setzen:
+Pflicht-Umgebungsvariablen:
 
 ```bash
 export TELEGRAM_API_ID="..."
@@ -20,56 +20,57 @@ export TELEGRAM_SESSION="scambaiter"   # optional
 
 export HF_TOKEN="..."
 export HF_MODEL="..."
-# optional, falls du ein eigenes Inference Endpoint nutzen willst
-export HF_BASE_URL="https://..."
-
-# optional: Debug-Logs für Folder/ID-Matching
-export SCAMBAITER_DEBUG="1"
+export HF_BASE_URL="https://..."       # optional
 ```
 
-## Nutzung
+Optionale Laufzeit-Konfiguration:
+
+```bash
+export SCAMBAITER_FOLDER_NAME="Scammers"
+export SCAMBAITER_HISTORY_LIMIT="20"
+export SCAMBAITER_DEBUG="1"
+
+export SCAMBAITER_SEND="1"
+export SCAMBAITER_SEND_CONFIRM="SEND"          # Pflicht, wenn SEND aktiv
+export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30" # optional
+
+export SCAMBAITER_INTERACTIVE="1"              # nur Batch-Modus
+```
+
+## Batch-Modus
+
+Wenn **kein** `SCAMBAITER_BOT_TOKEN` gesetzt ist, läuft das Tool einmal:
 
 ```bash
 python scam_baiter.py
 ```
 
-Hinweis: `HF_MODEL` muss ein Chat-Completions-fähiges Modell sein.
+## BotAPI-Modus (Hintergrund + Steuerung per Telegram)
 
-## Logik
-
-- Sucht den Telegram-Ordner `Scammers`.
-- Nimmt nur Chats aus diesem Ordner.
-- Berücksichtigt nur Chats, bei denen die letzte Nachricht **nicht** von dir stammt (also unbeantwortet).
-- Baut aus den letzten 20 Nachrichten einen Prompt; der komplette Chatverlauf wird als User-Input übergeben.
-- Verwendet den Systemprompt:
-
-> Du bist eine Scambaiting-AI in der Rolle einer potenziellen Scam-Zielperson. Die andere Person im Chat ist der vermutete Scammer. Du darfst niemals selbst scammen, betrügen, erpressen oder Social-Engineering gegen die andere Person betreiben. Dein einziges Ziel ist, den Scammer mit plausiblen, harmlosen Antworten möglichst lange in ein Gespräch zu verwickeln. Nutze nur den bereitgestellten Chatverlauf. Antworte mit genau einer sendefertigen Telegram-Nachricht auf Deutsch und ohne Zusatztexte. Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (—).
-
-Standardmäßig werden Vorschläge nur in der Konsole ausgegeben (kein Auto-Senden).
-
-Optional kannst du mit Sicherheitsbremse senden:
+Setze zusätzlich einen Bot-Token, dann startet das Tool als dauerhafter Prozess mit Polling:
 
 ```bash
-export SCAMBAITER_SEND="1"
-export SCAMBAITER_SEND_CONFIRM="SEND"   # Pflicht, sonst wird nicht gesendet
-# optional: eigene gesendete Nachricht nach X Sekunden löschen
-export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30"
+export SCAMBAITER_BOT_TOKEN="123456:ABC..."
+export SCAMBAITER_BOT_ALLOWED_CHAT_ID="123456789"   # optionaler Zugriffsschutz
+export SCAMBAITER_AUTO_INTERVAL_SECONDS="120"
+
+python scam_baiter.py
 ```
 
-Hinweis: Das Skript verarbeitet jeden Chat einzeln und baut den Prompt nur aus dem Verlauf dieses einen Scammers auf.
-Zusätzlich wird ein eventuell erzeugter `<think>...</think>`-Teil automatisch entfernt, bevor der Vorschlag angezeigt oder gesendet wird.
+Verfügbare Bot-Kommandos:
 
-Interaktive Konsole (Standard):
+- `/status` – zeigt Auto-Status und letzten Lauf
+- `/runonce` – startet sofort einen Einmaldurchlauf
+- `/startauto` – startet den Auto-Modus
+- `/stopauto` – stoppt den Auto-Modus
+- `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick
 
-```bash
-# optional deaktivieren
-export SCAMBAITER_INTERACTIVE="0"
-```
+## Projektstruktur
 
-Im Interaktiv-Modus fragt das Tool pro Chat: nicht senden, direkt senden oder Vorschlag manuell editieren und senden.
+Zur Trennung der Concerns wurde der Code aufgeteilt:
 
-
-## Erweiterbarkeit (Callback)
-
-Die zentrale Funktion `run(...)` akzeptiert optional einen `suggestion_callback`, mit dem die Modell-Ausgabe nachbearbeitet werden kann.
-Standardmäßig wird die Modell-Ausgabe bereinigt (z. B. `<think>`, Meta-Labels wie `ANALYSE:`/`HINWEIS:` und umschließende Anführungszeichen), damit nur die sendefertige Nachricht übrig bleibt.
+- `scam_baiter.py`: Einstieg und Modus-Umschaltung
+- `scambaiter/config.py`: Umgebungsvariablen/Config
+- `scambaiter/core.py`: Telegram- und HF-Kernlogik
+- `scambaiter/service.py`: Hintergrund-Loop + Laufstatus
+- `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos
