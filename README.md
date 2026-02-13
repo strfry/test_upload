@@ -65,7 +65,7 @@ Verfügbare Bot-Kommandos:
 - `/startauto` – startet den Auto-Modus
 - `/stopauto` – stoppt den Auto-Modus
 - `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick
-- `/history` – zeigt die letzten persistent gespeicherten Analysen inkl. Metadaten
+- `/history` – zeigt die letzten persistent gespeicherten Analysen inkl. Metadaten (lange Ausgaben werden in mehrere Nachrichten aufgeteilt)
 - `/kvset <scammer_chat_id> <key> <value>` – setzt/überschreibt einen Key für einen Scammer
 - `/kvget <scammer_chat_id> <key>` – liest einen Key für einen Scammer
 - `/kvdel <scammer_chat_id> <key>` – löscht einen Key für einen Scammer

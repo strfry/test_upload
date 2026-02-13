@@ -225,7 +225,7 @@ def extract_analysis(text: str) -> str | None:
     match = re.search(r"ANALYSE\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if not match:
         return None
-    analysis = re.split(r"\n(?:ANTWORT|REPLY)\s*:", match.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
+    analysis = re.split(r"\n(?:ANTWORT|REPLY|META)\s*:", match.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
     analysis = analysis.strip()
     return analysis or None
 

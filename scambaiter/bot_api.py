@@ -8,6 +8,7 @@ from scambaiter.service import BackgroundService
 
 def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int | None = None) -> Application:
     app = Application.builder().token(token).build()
+    max_message_len = 3500
 
     def _authorized(update: Update) -> bool:
         if allowed_chat_id is None:
@@ -21,6 +22,21 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
             return
         if update.message:
             await update.message.reply_text(text)
+
+    async def _guarded_reply_chunks(update: Update, text: str) -> None:
+        if len(text) <= max_message_len:
+            await _guarded_reply(update, text)
+            return
+        lines = text.splitlines(keepends=True)
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) > max_message_len and chunk:
+                await _guarded_reply(update, chunk.rstrip())
+                chunk = line
+            else:
+                chunk += line
+        if chunk:
+            await _guarded_reply(update, chunk.rstrip())
 
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -82,15 +98,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         if not entries:
             await _guarded_reply(update, "Keine gespeicherten Analysen vorhanden.")
             return
-        lines: list[str] = []
+        blocks: list[str] = []
         for item in entries:
             parts = [f"- {item.created_at:%Y-%m-%d %H:%M} | {item.title} ({item.chat_id})"]
             if item.metadata:
                 parts.append("Meta=" + ",".join(f"{k}={v}" for k, v in item.metadata.items()))
             if item.analysis:
-                parts.append(f"Analyse={item.analysis[:80]}")
-            lines.append(" | ".join(parts))
-        await _guarded_reply(update, "Persistierte Analysen:\n" + "\n".join(lines))
+                parts.append(f"Analyse={item.analysis}")
+            blocks.append("\n".join(parts))
+        await _guarded_reply_chunks(update, "Persistierte Analysen:\n\n" + "\n\n".join(blocks))
 
     async def kv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
