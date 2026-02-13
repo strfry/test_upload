@@ -77,6 +77,7 @@ class AnalysisStore:
         analysis: str | None,
         metadata: dict[str, str],
     ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
         with self._connect() as conn:
             conn.execute(
                 """
@@ -84,13 +85,50 @@ class AnalysisStore:
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    datetime.now().isoformat(timespec="seconds"),
+                    now,
                     chat_id,
                     title,
                     suggestion,
                     analysis,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
+            )
+            self._upsert_kv_snapshot(
+                conn,
+                scammer_chat_id=chat_id,
+                suggestion=suggestion,
+                analysis=analysis,
+                metadata=metadata,
+                now=now,
+            )
+
+    def _upsert_kv_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        scammer_chat_id: int,
+        suggestion: str,
+        analysis: str | None,
+        metadata: dict[str, str],
+        now: str,
+    ) -> None:
+        kv_items = dict(metadata)
+        kv_items["antwort"] = suggestion
+        if analysis:
+            kv_items["analyse"] = analysis
+
+        for key, value in kv_items.items():
+            key = str(key).strip().lower()
+            value = str(value).strip()
+            if not key or not value:
+                continue
+            conn.execute(
+                """
+                INSERT INTO key_values_by_scammer (scammer_chat_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(scammer_chat_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (scammer_chat_id, key, value, now),
             )
 
     def latest(self, limit: int = 5) -> list[StoredAnalysis]:

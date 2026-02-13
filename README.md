@@ -73,6 +73,8 @@ Verfügbare Bot-Kommandos:
 - `/kvdel <scammer_chat_id> <key>` – löscht einen Key für einen Scammer
 - `/kvlist <scammer_chat_id>` – listet Keys für einen Scammer
 
+Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (z.B. `sprache`) automatisch als Keys für den jeweiligen Scammer aktualisiert.
+
 ## Projektstruktur
 
 Zur Trennung der Concerns wurde der Code aufgeteilt:
