@@ -174,6 +174,30 @@ def _strip_think_segments(text: str) -> str:
     return cleaned.strip()
 
 
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    pairs = [
+        ('"', '"'),
+        ("'", "'"),
+        ("„", "“"),
+        ("“", "”"),
+        ("«", "»"),
+    ]
+    cleaned = text.strip()
+
+    changed = True
+    while changed and len(cleaned) >= 2:
+        changed = False
+        for left, right in pairs:
+            if cleaned.startswith(left) and cleaned.endswith(right):
+                cleaned = cleaned[len(left):-len(right)].strip()
+                changed = True
+                break
+
+    return cleaned
+
+
 def _extract_final_reply(text: str) -> str:
     cleaned = _strip_think_segments(text)
 
@@ -181,14 +205,14 @@ def _extract_final_reply(text: str) -> str:
     if match:
         reply = match.group(1).strip()
         reply = re.split(r"\n(?:ANALYSE|HINWEIS|NOTE)\s*:", reply, maxsplit=1, flags=re.IGNORECASE)[0]
-        return reply.strip()
+        return _strip_wrapping_quotes(reply.strip())
 
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     filtered = [
         line for line in lines
         if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
     ]
-    return "\n".join(filtered).strip()
+    return _strip_wrapping_quotes("\n".join(filtered).strip())
 
 
 def _apply_suggestion_callback(

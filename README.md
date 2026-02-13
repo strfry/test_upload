@@ -70,4 +70,4 @@ Im Interaktiv-Modus fragt das Tool pro Chat: nicht senden, direkt senden oder Vo
 ## Erweiterbarkeit (Callback)
 
 Die zentrale Funktion `run(...)` akzeptiert optional einen `suggestion_callback`, mit dem die Modell-Ausgabe nachbearbeitet werden kann.
-Standardmäßig wird dabei robust die sendefertige `ANTWORT:` extrahiert und zusätzliche Teile (z. B. `<think>`, Hinweise, Nachgedanken) werden entfernt.
+Standardmäßig wird dabei robust die sendefertige `ANTWORT:` extrahiert und zusätzliche Teile (z. B. `<think>`, Hinweise, Nachgedanken) werden entfernt. Falls das Modell die Antwort in Anführungszeichen setzt, werden umschließende Quotes ebenfalls entfernt.
