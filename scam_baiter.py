@@ -12,7 +12,6 @@ import asyncio
 from scambaiter.bot_api import create_bot_app
 from scambaiter.config import load_config
 from scambaiter.core import ScambaiterCore
-from scambaiter.service import BackgroundService
 from scambaiter.storage import AnalysisStore
 
 
@@ -51,37 +50,36 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
 
 async def run() -> None:
     config = load_config()
-    core = ScambaiterCore(config)
-    store = AnalysisStore(config.analysis_db_path)
-    await core.start()
-    try:
-        if not config.bot_token:
-            await run_batch(core, store)
-            return
 
-        service = BackgroundService(core, interval_seconds=config.auto_interval_seconds, store=store)
-        bot_app = create_bot_app(
-            token=config.bot_token,
-            service=service,
-            allowed_chat_id=config.bot_allowed_chat_id,
-        )
-        print(
-            "BotAPI aktiv. Verfügbare Kommandos: "
-            "/status /runonce /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
-        )
-        await bot_app.initialize()
-        await bot_app.start()
-        await bot_app.updater.start_polling()
+    if not config.bot_token:
+        core = ScambaiterCore(config)
+        store = AnalysisStore(config.analysis_db_path)
+        await core.start()
         try:
-            while True:
-                await asyncio.sleep(3600)
+            await run_batch(core, store)
         finally:
-            await service.stop_auto()
-            await bot_app.updater.stop()
-            await bot_app.stop()
-            await bot_app.shutdown()
+            await core.close()
+        return
+
+    bot_app = create_bot_app(
+        token=config.bot_token,
+        config=config,
+        allowed_chat_id=config.bot_allowed_chat_id,
+    )
+    print(
+        "BotAPI aktiv. Verfügbare Kommandos: "
+        "/help /login /code /password /logout /status /runonce /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
+    )
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling()
+    try:
+        while True:
+            await asyncio.sleep(3600)
     finally:
-        await core.close()
+        await bot_app.updater.stop()
+        await bot_app.stop()
+        await bot_app.shutdown()
 
 
 def main() -> None:

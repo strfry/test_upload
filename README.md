@@ -63,6 +63,10 @@ Verfügbare Bot-Kommandos:
 
 - `/help` – zeigt die Hilfe mit allen Kommandos
 - `/start` – zeigt ebenfalls die Hilfe
+- `/login <telefonnummer>` – startet den Telethon-Login für deinen Bot-User und sendet den Telegram-Code
+- `/code <PIN>` – bestätigt den Login-Code
+- `/password <passwort>` – bestätigt optionales 2FA-Passwort
+- `/logout` – meldet deinen Bot-User ab
 - `/status` – zeigt Auto-Status und letzten Lauf
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
@@ -74,6 +78,11 @@ Verfügbare Bot-Kommandos:
 - `/kvget <scammer_chat_id> <key>` – liest einen Key für einen Scammer
 - `/kvdel <scammer_chat_id> <key>` – löscht einen Key für einen Scammer
 - `/kvlist <scammer_chat_id>` – listet Keys für einen Scammer
+
+
+Jede Bot-Anfrage wird einem Telegram-Bot-User (`effective_user.id`) zugeordnet.
+Wenn dieser User noch nicht eingeloggt ist, fordert der Bot zuerst den Login über `/login` + `/code` (und ggf. `/password`) an.
+Die Telethon-Session wird pro Bot-User unter einem eigenen Session-Namen gespeichert.
 
 Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (z.B. `sprache`) automatisch als Keys für den jeweiligen Scammer aktualisiert.
 Wenn `sprache` pro Scammer gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
