@@ -9,6 +9,21 @@ from scambaiter.service import BackgroundService
 def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int | None = None) -> Application:
     app = Application.builder().token(token).build()
     max_message_len = 3500
+    help_text = (
+        "Verfügbare Kommandos:\n"
+        "- /help – diese Hilfe\n"
+        "- /status – Auto-Status und letzter Lauf\n"
+        "- /runonce – startet sofort einen Einmaldurchlauf\n"
+        "- /runonce <chat_id[,chat_id2,...]> – Einmaldurchlauf nur für bestimmte Chat-IDs\n"
+        "- /startauto – startet den Auto-Modus\n"
+        "- /stopauto – stoppt den Auto-Modus\n"
+        "- /last – letzte Vorschläge (max. 5)\n"
+        "- /history – letzte persistierte Analysen\n"
+        "- /kvset <scammer_chat_id> <key> <value> – Key setzen/überschreiben\n"
+        "- /kvget <scammer_chat_id> <key> – Key lesen\n"
+        "- /kvdel <scammer_chat_id> <key> – Key löschen\n"
+        "- /kvlist <scammer_chat_id> – Keys auflisten"
+    )
 
     def _authorized(update: Update) -> bool:
         if allowed_chat_id is None:
@@ -54,6 +69,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
                 f"Gesendete Nachrichten: {summary.sent_count}"
             ),
         )
+
+    async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _guarded_reply(update, help_text)
 
     async def run_once(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -214,6 +232,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         await _guarded_reply(update, f"KV Store für {scammer_chat_id}:\n" + "\n".join(lines))
 
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("start", help_cmd))
     app.add_handler(CommandHandler("runonce", run_once))
     app.add_handler(CommandHandler("startauto", start_auto))
     app.add_handler(CommandHandler("stopauto", stop_auto))

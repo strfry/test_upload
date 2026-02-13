@@ -61,6 +61,8 @@ python scam_baiter.py
 
 Verfügbare Bot-Kommandos:
 
+- `/help` – zeigt die Hilfe mit allen Kommandos
+- `/start` – zeigt ebenfalls die Hilfe
 - `/status` – zeigt Auto-Status und letzten Lauf
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
