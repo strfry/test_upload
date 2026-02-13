@@ -8,9 +8,11 @@ and generates suggested replies via Hugging Face Inference API.
 from __future__ import annotations
 
 import os
+import re
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List
+from typing import Callable, List
 
 from huggingface_hub import InferenceClient
 from telethon import TelegramClient
@@ -19,8 +21,13 @@ from telethon.tl.types import DialogFilter
 from telethon.utils import get_peer_id
 
 SYSTEM_PROMPT = (
-    "Du bist eine Scambaiting-AI. Jemand versucht dir auf Telegram zu schreiben, "
-    "du sollst kreative Gespräche aufbauen um ihn so lange wie möglich hinzuhalten"
+    "Du bist eine Scambaiting-AI in der Rolle einer potenziellen Scam-Zielperson. "
+    "Die andere Person im Chat ist der vermutete Scammer. Du darfst niemals selbst scammen, "
+    "betrügen, erpressen oder Social-Engineering gegen die andere Person betreiben. "
+    "Dein einziges Ziel ist, den Scammer mit plausiblen, harmlosen Antworten möglichst lange "
+    "in ein Gespräch zu verwickeln. Nutze nur den bereitgestellten Chatverlauf. "
+    "Antworte mit genau einer sendefertigen Telegram-Nachricht auf Deutsch und ohne Zusatztexte. "
+    "Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (—)."
 )
 
 FOLDER_NAME = "Scammers"
@@ -140,14 +147,72 @@ def _fmt_dt(dt: datetime | None) -> str:
 def build_user_prompt(context: ChatContext) -> str:
     chat_history = "\n".join(context.lines)
     return (
-        f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n"
-        "Schlage genau eine nächste Antwort auf Deutsch vor. "
-        "Die Antwort soll glaubwürdig, freundlich und scambaiting-geeignet sein.\n\n"
+        f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n\n"
         f"Chatverlauf:\n{chat_history}"
     )
 
 
-def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatContext) -> str:
+def _strip_think_segments(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+    return cleaned.strip()
+
+
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    pairs = [
+        ('"', '"'),
+        ("'", "'"),
+        ("„", "“"),
+        ("“", "”"),
+        ("«", "»"),
+    ]
+    cleaned = text.strip()
+
+    changed = True
+    while changed and len(cleaned) >= 2:
+        changed = False
+        for left, right in pairs:
+            if cleaned.startswith(left) and cleaned.endswith(right):
+                cleaned = cleaned[len(left):-len(right)].strip()
+                changed = True
+                break
+
+    return cleaned
+
+
+def _extract_final_reply(text: str) -> str:
+    cleaned = _strip_think_segments(text)
+
+    match = re.search(r"(?:ANTWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        reply = match.group(1).strip()
+        reply = re.split(r"\n(?:ANALYSE|HINWEIS|NOTE)\s*:", reply, maxsplit=1, flags=re.IGNORECASE)[0]
+        return _strip_wrapping_quotes(reply.strip())
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    filtered = [
+        line for line in lines
+        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
+    ]
+    return _strip_wrapping_quotes("\n".join(filtered).strip())
+
+
+def _apply_suggestion_callback(
+    raw_text: str,
+    callback: Callable[[str], str] | None = None,
+) -> str:
+    processor = callback or _extract_final_reply
+    return processor(raw_text)
+
+
+def generate_suggestion(
+    hf_client: InferenceClient,
+    model: str,
+    context: ChatContext,
+    suggestion_callback: Callable[[str], str] | None = None,
+) -> str:
     completion = hf_client.chat.completions.create(
         model=model,
         messages=[
@@ -155,10 +220,65 @@ def generate_suggestion(hf_client: InferenceClient, model: str, context: ChatCon
             {"role": "user", "content": build_user_prompt(context)},
         ],
     )
-    return completion.choices[0].message.content.strip()
+    return _apply_suggestion_callback(completion.choices[0].message.content, suggestion_callback)
 
 
-async def run() -> None:
+async def _send_message_with_optional_delete(client: TelegramClient, context: ChatContext, message: str) -> None:
+    sent = await client.send_message(context.chat_id, message)
+    print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
+
+    delete_after_seconds = _env_int("SCAMBAITER_DELETE_OWN_AFTER_SECONDS", default=0)
+    if delete_after_seconds <= 0:
+        return
+
+    print(f"[SEND] Lösche gesendete Nachricht in {delete_after_seconds} Sekunden wieder.")
+    await asyncio.sleep(delete_after_seconds)
+    await client.delete_messages(context.chat_id, [sent.id])
+    print(f"[SEND] Nachricht {sent.id} in {context.title} gelöscht.")
+
+
+async def maybe_send_suggestion(client: TelegramClient, context: ChatContext, suggestion: str) -> None:
+    if not _env_flag("SCAMBAITER_SEND"):
+        return
+
+    if os.getenv("SCAMBAITER_SEND_CONFIRM") != "SEND":
+        print(
+            "[WARN] SCAMBAITER_SEND ist aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'. "
+            "Sende daher nicht automatisch."
+        )
+        return
+
+    await _send_message_with_optional_delete(client, context, suggestion)
+
+
+async def maybe_interactive_console_reply(client: TelegramClient, context: ChatContext, suggestion: str) -> bool:
+    if not _env_flag("SCAMBAITER_INTERACTIVE", default=True):
+        return False
+
+    if not os.isatty(0):
+        print("[WARN] SCAMBAITER_INTERACTIVE ist aktiv, aber kein TTY verfügbar. Überspringe Interaktiv-Modus.")
+        return False
+
+    print("Aktion: [Enter]=nicht senden | s=Vorschlag senden | e=editieren+senden")
+    choice = input("> ").strip().lower()
+    if choice == "s":
+        await _send_message_with_optional_delete(client, context, suggestion)
+        return True
+
+    if choice == "e":
+        print("Gib deine Nachricht ein (leere Zeile = Abbruch):")
+        custom = input("> ").strip()
+        if not custom:
+            print("[INFO] Abgebrochen, nichts gesendet.")
+            return True
+        await _send_message_with_optional_delete(client, context, custom)
+        return True
+
+    print("[INFO] Nicht gesendet.")
+    return True
+
+
+async def run(suggestion_callback: Callable[[str], str] | None = None) -> None:
     api_id = int(_require_env("TELEGRAM_API_ID"))
     api_hash = _require_env("TELEGRAM_API_HASH")
 
@@ -183,10 +303,19 @@ async def run() -> None:
 
     print(f"Gefundene unbeantwortete Chats: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
-        suggestion = generate_suggestion(hf_client, model=hf_model, context=context)
+        _debug(f"Verarbeite Chat isoliert: {context.title} (ID: {context.chat_id})")
+        suggestion = generate_suggestion(
+            hf_client,
+            model=hf_model,
+            context=context,
+            suggestion_callback=suggestion_callback,
+        )
         print(f"=== Vorschlag {index}: {context.title} (ID: {context.chat_id}) ===")
         print(suggestion)
         print()
+        handled_interactively = await maybe_interactive_console_reply(client, context, suggestion)
+        if not handled_interactively:
+            await maybe_send_suggestion(client, context, suggestion)
 
 
 def _require_env(name: str) -> str:
@@ -196,9 +325,21 @@ def _require_env(name: str) -> str:
     return value
 
 
-def main() -> None:
-    import asyncio
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    return int(value)
+
+
+def main() -> None:
     asyncio.run(run())
 
 
