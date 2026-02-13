@@ -21,6 +21,7 @@ export TELEGRAM_SESSION="scambaiter"   # optional
 export HF_TOKEN="..."
 export HF_MODEL="..."
 export HF_BASE_URL="https://..."       # optional
+export HF_MAX_TOKENS="350"             # optional, längere Modellantworten erlauben
 ```
 
 Optionale Laufzeit-Konfiguration:

@@ -129,6 +129,7 @@ class ScambaiterCore:
     ) -> ModelOutput:
         completion = self.hf_client.chat.completions.create(
             model=self.config.hf_model,
+            max_tokens=self.config.hf_max_tokens,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": self.build_user_prompt(context)},
@@ -222,10 +223,28 @@ def extract_final_reply(text: str) -> str:
 
 def extract_analysis(text: str) -> str | None:
     cleaned = strip_think_segments(text)
-    match = re.search(r"ANALYSE\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
+    lines = cleaned.splitlines()
+    start_idx: int | None = None
+    collected: list[str] = []
+
+    for idx, line in enumerate(lines):
+        match = re.match(r"^\s*ANALYSE\s*:\s*(.*)$", line, flags=re.IGNORECASE)
+        if match:
+            start_idx = idx
+            first = match.group(1).strip()
+            if first:
+                collected.append(first)
+            break
+
+    if start_idx is None:
         return None
-    analysis = re.split(r"\n(?:ANTWORT|REPLY|META)\s*:", match.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
+
+    for line in lines[start_idx + 1 :]:
+        if re.match(r"^\s*(?:META|ANTWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
+            break
+        collected.append(line.strip())
+
+    analysis = "\n".join(part for part in collected if part).strip()
     analysis = analysis.strip()
     return analysis or None
 
