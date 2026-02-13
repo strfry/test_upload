@@ -98,16 +98,21 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         if not service.store:
             await _guarded_reply(update, "Keine Datenbank konfiguriert.")
             return
-        if len(context.args) < 2:
-            await _guarded_reply(update, "Nutzung: /kvset <key> <value>")
+        if len(context.args) < 3:
+            await _guarded_reply(update, "Nutzung: /kvset <scammer_chat_id> <key> <value>")
             return
-        key = context.args[0].strip().lower()
-        value = " ".join(context.args[1:]).strip()
+        try:
+            scammer_chat_id = int(context.args[0])
+        except ValueError:
+            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
+            return
+        key = context.args[1].strip().lower()
+        value = " ".join(context.args[2:]).strip()
         if not key or not value:
-            await _guarded_reply(update, "Nutzung: /kvset <key> <value>")
+            await _guarded_reply(update, "Nutzung: /kvset <scammer_chat_id> <key> <value>")
             return
-        service.store.kv_set(key, value)
-        await _guarded_reply(update, f"Gespeichert: {key}={value}")
+        service.store.kv_set(scammer_chat_id, key, value)
+        await _guarded_reply(update, f"Gespeichert für {scammer_chat_id}: {key}={value}")
 
     async def kv_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -115,15 +120,23 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         if not service.store:
             await _guarded_reply(update, "Keine Datenbank konfiguriert.")
             return
-        if len(context.args) != 1:
-            await _guarded_reply(update, "Nutzung: /kvget <key>")
+        if len(context.args) != 2:
+            await _guarded_reply(update, "Nutzung: /kvget <scammer_chat_id> <key>")
             return
-        key = context.args[0].strip().lower()
-        item = service.store.kv_get(key)
+        try:
+            scammer_chat_id = int(context.args[0])
+        except ValueError:
+            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
+            return
+        key = context.args[1].strip().lower()
+        item = service.store.kv_get(scammer_chat_id, key)
         if not item:
             await _guarded_reply(update, "Key nicht gefunden.")
             return
-        await _guarded_reply(update, f"{item.key}={item.value} (updated {item.updated_at:%Y-%m-%d %H:%M:%S})")
+        await _guarded_reply(
+            update,
+            f"[{item.scammer_chat_id}] {item.key}={item.value} (updated {item.updated_at:%Y-%m-%d %H:%M:%S})",
+        )
 
     async def kv_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -131,11 +144,16 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         if not service.store:
             await _guarded_reply(update, "Keine Datenbank konfiguriert.")
             return
-        if len(context.args) != 1:
-            await _guarded_reply(update, "Nutzung: /kvdel <key>")
+        if len(context.args) != 2:
+            await _guarded_reply(update, "Nutzung: /kvdel <scammer_chat_id> <key>")
             return
-        key = context.args[0].strip().lower()
-        deleted = service.store.kv_delete(key)
+        try:
+            scammer_chat_id = int(context.args[0])
+        except ValueError:
+            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
+            return
+        key = context.args[1].strip().lower()
+        deleted = service.store.kv_delete(scammer_chat_id, key)
         await _guarded_reply(update, "Gelöscht." if deleted else "Key nicht gefunden.")
 
     async def kv_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,12 +162,20 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         if not service.store:
             await _guarded_reply(update, "Keine Datenbank konfiguriert.")
             return
-        items = service.store.kv_list(limit=20)
+        if len(context.args) != 1:
+            await _guarded_reply(update, "Nutzung: /kvlist <scammer_chat_id>")
+            return
+        try:
+            scammer_chat_id = int(context.args[0])
+        except ValueError:
+            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
+            return
+        items = service.store.kv_list(scammer_chat_id, limit=20)
         if not items:
-            await _guarded_reply(update, "Keine Keys gespeichert.")
+            await _guarded_reply(update, "Keine Keys für diesen Scammer gespeichert.")
             return
         lines = [f"- {item.key}={item.value}" for item in items]
-        await _guarded_reply(update, "KV Store:\n" + "\n".join(lines))
+        await _guarded_reply(update, f"KV Store für {scammer_chat_id}:\n" + "\n".join(lines))
 
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("runonce", run_once))

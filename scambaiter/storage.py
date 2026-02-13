@@ -18,6 +18,7 @@ class StoredAnalysis:
 
 @dataclass
 class StoredKeyValue:
+    scammer_chat_id: int
     key: str
     value: str
     updated_at: datetime
@@ -50,10 +51,12 @@ class AnalysisStore:
             self._ensure_column(conn, "analyses", "language", "TEXT")
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS key_values (
-                    key TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS key_values_by_scammer (
+                    scammer_chat_id INTEGER NOT NULL,
+                    key TEXT NOT NULL,
                     value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (scammer_chat_id, key)
                 )
                 """
             )
@@ -127,42 +130,53 @@ class AnalysisStore:
             metadata["sprache"] = legacy_language
         return metadata
 
-    def kv_set(self, key: str, value: str) -> None:
+    def kv_set(self, scammer_chat_id: int, key: str, value: str) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO key_values (key, value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                INSERT INTO key_values_by_scammer (scammer_chat_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(scammer_chat_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                 """,
-                (key, value, now),
+                (scammer_chat_id, key, value, now),
             )
 
-    def kv_get(self, key: str) -> StoredKeyValue | None:
+    def kv_get(self, scammer_chat_id: int, key: str) -> StoredKeyValue | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT key, value, updated_at FROM key_values WHERE key = ?",
-                (key,),
+                """
+                SELECT scammer_chat_id, key, value, updated_at
+                FROM key_values_by_scammer
+                WHERE scammer_chat_id = ? AND key = ?
+                """,
+                (scammer_chat_id, key),
             ).fetchone()
         if not row:
             return None
-        return StoredKeyValue(key=row[0], value=row[1], updated_at=datetime.fromisoformat(row[2]))
+        return StoredKeyValue(scammer_chat_id=row[0], key=row[1], value=row[2], updated_at=datetime.fromisoformat(row[3]))
 
-    def kv_delete(self, key: str) -> bool:
+    def kv_delete(self, scammer_chat_id: int, key: str) -> bool:
         with self._connect() as conn:
-            result = conn.execute("DELETE FROM key_values WHERE key = ?", (key,))
+            result = conn.execute(
+                "DELETE FROM key_values_by_scammer WHERE scammer_chat_id = ? AND key = ?",
+                (scammer_chat_id, key),
+            )
             return result.rowcount > 0
 
-    def kv_list(self, limit: int = 20) -> list[StoredKeyValue]:
+    def kv_list(self, scammer_chat_id: int, limit: int = 20) -> list[StoredKeyValue]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT key, value, updated_at
-                FROM key_values
+                SELECT scammer_chat_id, key, value, updated_at
+                FROM key_values_by_scammer
+                WHERE scammer_chat_id = ?
                 ORDER BY key ASC
                 LIMIT ?
                 """,
-                (limit,),
+                (scammer_chat_id, limit),
             ).fetchall()
-        return [StoredKeyValue(key=row[0], value=row[1], updated_at=datetime.fromisoformat(row[2])) for row in rows]
+        return [
+            StoredKeyValue(scammer_chat_id=row[0], key=row[1], value=row[2], updated_at=datetime.fromisoformat(row[3]))
+            for row in rows
+        ]

@@ -66,10 +66,10 @@ Verfügbare Bot-Kommandos:
 - `/stopauto` – stoppt den Auto-Modus
 - `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick
 - `/history` – zeigt die letzten persistent gespeicherten Analysen inkl. Metadaten
-- `/kvset <key> <value>` – setzt/überschreibt einen Key im KV-Store
-- `/kvget <key>` – liest einen Key aus dem KV-Store
-- `/kvdel <key>` – löscht einen Key
-- `/kvlist` – listet Keys aus dem KV-Store
+- `/kvset <scammer_chat_id> <key> <value>` – setzt/überschreibt einen Key für einen Scammer
+- `/kvget <scammer_chat_id> <key>` – liest einen Key für einen Scammer
+- `/kvdel <scammer_chat_id> <key>` – löscht einen Key für einen Scammer
+- `/kvlist <scammer_chat_id>` – listet Keys für einen Scammer
 
 ## Projektstruktur
 
@@ -80,4 +80,4 @@ Zur Trennung der Concerns wurde der Code aufgeteilt:
 - `scambaiter/core.py`: Telegram- und HF-Kernlogik
 - `scambaiter/service.py`: Hintergrund-Loop + Laufstatus
 - `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos
-- `scambaiter/storage.py`: SQLite-Persistenz für Analysen + generischen Key-Value-Store
+- `scambaiter/storage.py`: SQLite-Persistenz für Analysen + Scammer-spezifischen Key-Value-Store
