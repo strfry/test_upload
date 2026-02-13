@@ -83,8 +83,13 @@ class MultiUserManager:
         except PhoneCodeInvalidError:
             return "Der eingegebene Code ist ungültig. Bitte erneut mit /code <PIN>."
         except PhoneCodeExpiredError:
-            self._login_states[user_id] = LoginState()
-            return "Der Code ist abgelaufen. Bitte neuen Login starten: /login <telefonnummer>."
+            code = await runtime.core.client.send_code_request(state.phone)
+            self._login_states[user_id] = LoginState(
+                phone=state.phone,
+                phone_code_hash=code.phone_code_hash,
+                waiting_code=True,
+            )
+            return "Der Code ist abgelaufen. Ich habe automatisch einen neuen Code gesendet. Bitte antworte mit /code <PIN>."
 
     async def submit_password(self, user_id: int, password: str) -> str:
         state = self._login_states.get(user_id)
@@ -212,7 +217,7 @@ def create_bot_app(token: str, config: AppConfig, allowed_chat_id: int | None = 
             return
         phone = context.args[0].strip()
         await manager.begin_login(user_id, phone)
-        await _guarded_reply(update, f"Code gesendet an {phone}. Bitte antworte mit /code <PIN>.")
+        await _guarded_reply(update, f"Code gesendet an {phone}. Bitte antworte zügig mit /code <PIN> (Telegram-Codes laufen nach kurzer Zeit ab).")
 
     async def code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized_chat(update):
