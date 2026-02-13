@@ -74,6 +74,7 @@ Verfügbare Bot-Kommandos:
 - `/kvlist <scammer_chat_id>` – listet Keys für einen Scammer
 
 Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (z.B. `sprache`) automatisch als Keys für den jeweiligen Scammer aktualisiert.
+Wenn `sprache` pro Scammer gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
 
 ## Projektstruktur
 

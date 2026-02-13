@@ -26,7 +26,11 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
 
     print(f"Gefundene unbeantwortete Chats: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
-        output = core.generate_output(context)
+        language_hint = None
+        lang_item = store.kv_get(context.chat_id, "sprache")
+        if lang_item:
+            language_hint = lang_item.value
+        output = core.generate_output(context, language_hint=language_hint)
         store.save(
             chat_id=context.chat_id,
             title=context.title,

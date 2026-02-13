@@ -38,7 +38,13 @@ class BackgroundService:
             results: list[SuggestionResult] = []
 
             for context in contexts:
-                output = self.core.generate_output(context)
+                language_hint = None
+                if self.store:
+                    lang_item = self.store.kv_get(context.chat_id, "sprache")
+                    if lang_item:
+                        language_hint = lang_item.value
+
+                output = self.core.generate_output(context, language_hint=language_hint)
                 results.append(
                     SuggestionResult(
                         context=context,

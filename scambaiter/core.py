@@ -123,16 +123,30 @@ class ScambaiterCore:
     def generate_suggestion(self, context: ChatContext, suggestion_callback: Callable[[str], str] | None = None) -> str:
         return self.generate_output(context, suggestion_callback=suggestion_callback).suggestion
 
+    @staticmethod
+    def build_system_prompt(language_hint: str | None = None) -> str:
+        prompt = SYSTEM_PROMPT
+        if not language_hint:
+            return prompt
+
+        lang = language_hint.strip().lower()
+        if lang in {"en", "english", "englisch"}:
+            return prompt + " You must respond exclusively in English."
+        if lang in {"de", "deutsch", "german"}:
+            return prompt + " Du antwortest immer auf Deutsch."
+        return prompt
+
     def generate_output(
         self,
         context: ChatContext,
         suggestion_callback: Callable[[str], str] | None = None,
+        language_hint: str | None = None,
     ) -> ModelOutput:
         completion = self.hf_client.chat.completions.create(
             model=self.config.hf_model,
             max_tokens=self.config.hf_max_tokens,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self.build_system_prompt(language_hint)},
                 {"role": "user", "content": self.build_user_prompt(context)},
             ],
         )
