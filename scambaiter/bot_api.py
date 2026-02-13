@@ -72,9 +72,93 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
             lines.append(f"- {result.context.title} ({result.context.chat_id}): {result.suggestion}")
         await _guarded_reply(update, "Letzte Vorschläge:\n" + "\n".join(lines))
 
+    async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            return
+        entries = service.store.latest(limit=5)
+        if not entries:
+            await _guarded_reply(update, "Keine gespeicherten Analysen vorhanden.")
+            return
+        lines: list[str] = []
+        for item in entries:
+            parts = [f"- {item.created_at:%Y-%m-%d %H:%M} | {item.title} ({item.chat_id})"]
+            if item.metadata:
+                parts.append("Meta=" + ",".join(f"{k}={v}" for k, v in item.metadata.items()))
+            if item.analysis:
+                parts.append(f"Analyse={item.analysis[:80]}")
+            lines.append(" | ".join(parts))
+        await _guarded_reply(update, "Persistierte Analysen:\n" + "\n".join(lines))
+
+    async def kv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            return
+        if len(context.args) < 2:
+            await _guarded_reply(update, "Nutzung: /kvset <key> <value>")
+            return
+        key = context.args[0].strip().lower()
+        value = " ".join(context.args[1:]).strip()
+        if not key or not value:
+            await _guarded_reply(update, "Nutzung: /kvset <key> <value>")
+            return
+        service.store.kv_set(key, value)
+        await _guarded_reply(update, f"Gespeichert: {key}={value}")
+
+    async def kv_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            return
+        if len(context.args) != 1:
+            await _guarded_reply(update, "Nutzung: /kvget <key>")
+            return
+        key = context.args[0].strip().lower()
+        item = service.store.kv_get(key)
+        if not item:
+            await _guarded_reply(update, "Key nicht gefunden.")
+            return
+        await _guarded_reply(update, f"{item.key}={item.value} (updated {item.updated_at:%Y-%m-%d %H:%M:%S})")
+
+    async def kv_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            return
+        if len(context.args) != 1:
+            await _guarded_reply(update, "Nutzung: /kvdel <key>")
+            return
+        key = context.args[0].strip().lower()
+        deleted = service.store.kv_delete(key)
+        await _guarded_reply(update, "Gelöscht." if deleted else "Key nicht gefunden.")
+
+    async def kv_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            return
+        items = service.store.kv_list(limit=20)
+        if not items:
+            await _guarded_reply(update, "Keine Keys gespeichert.")
+            return
+        lines = [f"- {item.key}={item.value}" for item in items]
+        await _guarded_reply(update, "KV Store:\n" + "\n".join(lines))
+
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("runonce", run_once))
     app.add_handler(CommandHandler("startauto", start_auto))
     app.add_handler(CommandHandler("stopauto", stop_auto))
     app.add_handler(CommandHandler("last", last))
+    app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("kvset", kv_set))
+    app.add_handler(CommandHandler("kvget", kv_get))
+    app.add_handler(CommandHandler("kvdel", kv_del))
+    app.add_handler(CommandHandler("kvlist", kv_list))
     return app

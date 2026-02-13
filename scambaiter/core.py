@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +21,9 @@ SYSTEM_PROMPT = (
     "betrügen, erpressen oder Social-Engineering gegen die andere Person betreiben. "
     "Dein einziges Ziel ist, den Scammer mit plausiblen, harmlosen Antworten möglichst lange "
     "in ein Gespräch zu verwickeln. Nutze nur den bereitgestellten Chatverlauf. "
-    "Antworte mit genau einer sendefertigen Telegram-Nachricht auf Deutsch und ohne Zusatztexte. "
+    "Gib die Ausgabe vorzugsweise in drei Zeilen aus: 'ANALYSE: ...', optional 'META: key=value;key2=value2' und 'ANTWORT: ...'. "
+    "Nutze META für strukturierte Key-Value-Infos (z.B. sprache=de), wenn sinnvoll. "
+    "Die ANTWORT muss genau eine sendefertige Telegram-Nachricht enthalten. "
     "Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (—)."
 )
 
@@ -36,6 +39,16 @@ class ChatContext:
 class SuggestionResult:
     context: ChatContext
     suggestion: str
+    analysis: str | None = None
+    metadata: dict[str, str] | None = None
+
+
+@dataclass
+class ModelOutput:
+    raw: str
+    suggestion: str
+    analysis: str | None
+    metadata: dict[str, str]
 
 
 class ScambaiterCore:
@@ -107,6 +120,13 @@ class ScambaiterCore:
         )
 
     def generate_suggestion(self, context: ChatContext, suggestion_callback: Callable[[str], str] | None = None) -> str:
+        return self.generate_output(context, suggestion_callback=suggestion_callback).suggestion
+
+    def generate_output(
+        self,
+        context: ChatContext,
+        suggestion_callback: Callable[[str], str] | None = None,
+    ) -> ModelOutput:
         completion = self.hf_client.chat.completions.create(
             model=self.config.hf_model,
             messages=[
@@ -115,7 +135,10 @@ class ScambaiterCore:
             ],
         )
         raw = completion.choices[0].message.content
-        return (suggestion_callback or extract_final_reply)(raw)
+        suggestion = (suggestion_callback or extract_final_reply)(raw)
+        analysis = extract_analysis(raw)
+        metadata = extract_metadata(raw)
+        return ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
         if not self.config.send_enabled:
@@ -195,3 +218,44 @@ def extract_final_reply(text: str) -> str:
         if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
     ]
     return strip_wrapping_quotes("\n".join(filtered).strip())
+
+
+def extract_analysis(text: str) -> str | None:
+    cleaned = strip_think_segments(text)
+    match = re.search(r"ANALYSE\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    analysis = re.split(r"\n(?:ANTWORT|REPLY)\s*:", match.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
+    analysis = analysis.strip()
+    return analysis or None
+
+
+def extract_metadata(text: str) -> dict[str, str]:
+    cleaned = strip_think_segments(text)
+    metadata: dict[str, str] = {}
+
+    json_match = re.search(r"META\s*:\s*(\{.+?\})", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    k = str(key).strip().lower()
+                    v = str(value).strip()
+                    if k and v:
+                        metadata[k] = v
+        except json.JSONDecodeError:
+            pass
+
+    line_match = re.search(r"META\s*:\s*(.+)", cleaned, flags=re.IGNORECASE)
+    if line_match:
+        for part in line_match.group(1).split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key and value:
+                metadata[key] = value
+
+    return metadata

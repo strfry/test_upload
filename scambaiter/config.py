@@ -22,6 +22,7 @@ class AppConfig:
     bot_token: str | None
     bot_allowed_chat_id: int | None
     auto_interval_seconds: int
+    analysis_db_path: str
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -70,4 +71,5 @@ def load_config() -> AppConfig:
             else None
         ),
         auto_interval_seconds=env_int("SCAMBAITER_AUTO_INTERVAL_SECONDS", 120),
+        analysis_db_path=os.getenv("SCAMBAITER_ANALYSIS_DB_PATH", "scambaiter.sqlite3"),
     )

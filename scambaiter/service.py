@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from scambaiter.core import ScambaiterCore, SuggestionResult
+from scambaiter.storage import AnalysisStore
 
 
 @dataclass
@@ -16,8 +17,9 @@ class RunSummary:
 
 
 class BackgroundService:
-    def __init__(self, core: ScambaiterCore, interval_seconds: int) -> None:
+    def __init__(self, core: ScambaiterCore, interval_seconds: int, store: AnalysisStore | None = None) -> None:
         self.core = core
+        self.store = store
         self.interval_seconds = max(15, interval_seconds)
         self.auto_enabled = False
         self._loop_task: asyncio.Task | None = None
@@ -34,9 +36,24 @@ class BackgroundService:
             results: list[SuggestionResult] = []
 
             for context in contexts:
-                suggestion = self.core.generate_suggestion(context)
-                results.append(SuggestionResult(context=context, suggestion=suggestion))
-                if await self.core.maybe_send_suggestion(context, suggestion):
+                output = self.core.generate_output(context)
+                results.append(
+                    SuggestionResult(
+                        context=context,
+                        suggestion=output.suggestion,
+                        analysis=output.analysis,
+                        metadata=output.metadata,
+                    )
+                )
+                if self.store:
+                    self.store.save(
+                        chat_id=context.chat_id,
+                        title=context.title,
+                        suggestion=output.suggestion,
+                        analysis=output.analysis,
+                        metadata=output.metadata,
+                    )
+                if await self.core.maybe_send_suggestion(context, output.suggestion):
                     sent_count += 1
 
             summary = RunSummary(
