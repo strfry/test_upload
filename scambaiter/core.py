@@ -10,6 +10,8 @@ from typing import Callable
 
 REPLY_MARKER_PATTERN = re.compile(r"(?:ANTWORT|ANWORT|REPLY)\s*:", flags=re.IGNORECASE)
 
+MAX_GENERATION_ATTEMPTS = 2
+
 from huggingface_hub import InferenceClient
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -145,32 +147,56 @@ class ScambaiterCore:
         suggestion_callback: Callable[[str], str] | None = None,
         language_hint: str | None = None,
     ) -> ModelOutput:
-        completion = self.hf_client.chat.completions.create(
-            model=self.config.hf_model,
-            max_tokens=self.config.hf_max_tokens,
-            messages=[
+        parser = suggestion_callback or extract_final_reply
+        last_output: ModelOutput | None = None
+
+        for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+            messages = [
                 {"role": "system", "content": self.build_system_prompt(language_hint)},
                 {"role": "user", "content": self.build_user_prompt(context)},
-            ],
-        )
-        raw = completion.choices[0].message.content
-        suggestion = (suggestion_callback or extract_final_reply)(raw)
-        analysis = extract_analysis(raw)
-        metadata = extract_metadata(raw)
+            ]
+            if attempt > 1:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Deine letzte Antwort war nicht sendefertig. "
+                            "Gib jetzt nur eine einzige natürliche Telegram-Nachricht aus, "
+                            "ohne Analyse, ohne Meta, ohne Denkprozess."
+                        ),
+                    }
+                )
 
-        self._debug(f"Model-Raw-Ausgabe für {context.title} ({context.chat_id}): {raw}")
-        self._debug(f"Extrahierte Antwort für {context.title} ({context.chat_id}): {suggestion}")
-        if not has_explicit_reply_marker(raw):
-            print(
-                f"[WARN] Kein ANTWORT/REPLY-Marker in Modellausgabe für {context.title} ({context.chat_id}). "
-                f"Fallback-Antwort wird verwendet: {suggestion}"
+            completion = self.hf_client.chat.completions.create(
+                model=self.config.hf_model,
+                max_tokens=self.config.hf_max_tokens,
+                messages=messages,
             )
-        if looks_like_reasoning_output(suggestion):
+            raw = completion.choices[0].message.content
+            suggestion = parser(raw)
+            analysis = extract_analysis(raw)
+            metadata = extract_metadata(raw)
+
+            self._debug(f"Model-Raw-Ausgabe (Versuch {attempt}) für {context.title} ({context.chat_id}): {raw}")
+            self._debug(f"Extrahierte Antwort (Versuch {attempt}) für {context.title} ({context.chat_id}): {suggestion}")
+            if not has_explicit_reply_marker(raw):
+                print(
+                    f"[WARN] Kein ANTWORT/REPLY-Marker in Modellausgabe für {context.title} ({context.chat_id}) "
+                    f"(Versuch {attempt})."
+                )
+
+            current_output = ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
+            last_output = current_output
+            if suggestion and not looks_like_reasoning_output(suggestion):
+                return current_output
+
             print(
-                f"[WARN] Extrahierte Antwort wirkt wie Denkprozess für {context.title} ({context.chat_id}): {suggestion}"
+                f"[WARN] Extrahierte Antwort wirkt wie Denkprozess oder ist leer für {context.title} "
+                f"({context.chat_id}) in Versuch {attempt}: {suggestion}"
             )
 
-        return ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
+        assert last_output is not None
+        return last_output
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
         if not self.config.send_enabled:
