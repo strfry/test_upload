@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
+
+REPLY_MARKER_PATTERN = re.compile(r"(?:ANTWORT|ANWORT|REPLY)\s*:", flags=re.IGNORECASE)
+
 from huggingface_hub import InferenceClient
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -154,6 +157,19 @@ class ScambaiterCore:
         suggestion = (suggestion_callback or extract_final_reply)(raw)
         analysis = extract_analysis(raw)
         metadata = extract_metadata(raw)
+
+        self._debug(f"Model-Raw-Ausgabe für {context.title} ({context.chat_id}): {raw}")
+        self._debug(f"Extrahierte Antwort für {context.title} ({context.chat_id}): {suggestion}")
+        if not has_explicit_reply_marker(raw):
+            print(
+                f"[WARN] Kein ANTWORT/REPLY-Marker in Modellausgabe für {context.title} ({context.chat_id}). "
+                f"Fallback-Antwort wird verwendet: {suggestion}"
+            )
+        if looks_like_reasoning_output(suggestion):
+            print(
+                f"[WARN] Extrahierte Antwort wirkt wie Denkprozess für {context.title} ({context.chat_id}): {suggestion}"
+            )
+
         return ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
@@ -161,6 +177,11 @@ class ScambaiterCore:
             return False
         if self.config.send_confirm != "SEND":
             print("[WARN] SCAMBAITER_SEND aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'.")
+            return False
+        if looks_like_reasoning_output(suggestion):
+            print(
+                f"[WARN] Nachricht für {context.title} ({context.chat_id}) nicht gesendet: extrahierter Text wirkt wie Denkprozess."
+            )
             return False
         await self.send_message_with_optional_delete(context, suggestion)
         return True
@@ -221,19 +242,43 @@ def strip_wrapping_quotes(text: str) -> str:
 
 def extract_final_reply(text: str) -> str:
     cleaned = strip_think_segments(text)
-    match = re.search(r"(?:ANTWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    match = re.search(r"(?:ANTWORT|ANWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if match:
         reply = match.group(1).strip()
-        reply = re.split(r"\n(?:ANALYSE|HINWEIS|NOTE)\s*:", reply, maxsplit=1, flags=re.IGNORECASE)[0]
+        reply = re.split(
+            r"\n(?:ANALYSE|HINWEIS|NOTE|META|ANTWORT|ANWORT|REPLY)\s*:",
+            reply,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
         return strip_wrapping_quotes(reply)
 
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     filtered = [
         line
         for line in lines
-        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
+        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT|META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE)
     ]
-    return strip_wrapping_quotes("\n".join(filtered).strip())
+    if not filtered:
+        return ""
+    return strip_wrapping_quotes(filtered[-1].strip())
+
+
+
+
+def has_explicit_reply_marker(text: str) -> bool:
+    return REPLY_MARKER_PATTERN.search(strip_think_segments(text)) is not None
+
+
+def looks_like_reasoning_output(text: str) -> bool:
+    stripped = text.strip().lower()
+    if not stripped:
+        return True
+    reasoning_patterns = (
+        r"^(analyse|analysis|gedanke|thinking|thought|chain[- ]of[- ]thought|schritt\s*\d+)\b",
+        r"\b(ich denke|let me think|i should|zuerst|danach|abschließend)\b",
+    )
+    return any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in reasoning_patterns)
 
 
 def extract_analysis(text: str) -> str | None:
@@ -255,7 +300,7 @@ def extract_analysis(text: str) -> str | None:
         return None
 
     for line in lines[start_idx + 1 :]:
-        if re.match(r"^\s*(?:META|ANTWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
+        if re.match(r"^\s*(?:META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
             break
         collected.append(line.strip())
 
