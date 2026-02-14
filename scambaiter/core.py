@@ -149,11 +149,19 @@ class ScambaiterCore:
     ) -> ModelOutput:
         parser = suggestion_callback or extract_final_reply
         last_output: ModelOutput | None = None
+        system_prompt = self.build_system_prompt(language_hint)
+        user_prompt = self.build_user_prompt(context)
+
+        self._debug(
+            f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
+        )
+        self._debug(f"System-Prompt: {truncate_for_log(system_prompt)}")
+        self._debug(f"User-Prompt: {truncate_for_log(user_prompt)}")
 
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
             messages = [
-                {"role": "system", "content": self.build_system_prompt(language_hint)},
-                {"role": "user", "content": self.build_user_prompt(context)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ]
             if attempt > 1:
                 messages.append(
@@ -166,6 +174,8 @@ class ScambaiterCore:
                         ),
                     }
                 )
+
+            self._debug(f"Model-Request (Versuch {attempt}): {truncate_for_log(str(messages), max_len=2000)}")
 
             completion = self.hf_client.chat.completions.create(
                 model=self.config.hf_model,
@@ -245,6 +255,13 @@ class ScambaiterCore:
         if dt is None:
             return "?"
         return dt.strftime("%Y-%m-%d %H:%M")
+
+
+
+def truncate_for_log(text: str, max_len: int = 1200) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "... [gekürzt]"
 
 
 def strip_think_segments(text: str) -> str:
