@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
+from telegram import Bot
+
 from scambaiter.bot_api import create_bot_app
 from scambaiter.config import load_config
 from scambaiter.core import ScambaiterCore
@@ -60,18 +62,27 @@ async def run() -> None:
             return
 
         service = BackgroundService(core, interval_seconds=config.auto_interval_seconds, store=store)
+        bot_me = await Bot(config.bot_token).get_me()
+        control_chat_id = await core.resolve_control_chat_id(bot_me.username)
         bot_app = create_bot_app(
             token=config.bot_token,
             service=service,
-            allowed_chat_id=config.bot_allowed_chat_id,
+            allowed_chat_id=control_chat_id,
         )
         print(
             "BotAPI aktiv. Verfügbare Kommandos: "
-            "/status /runonce /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
+            "/status /runonce /chats /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
         )
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling()
+        await bot_app.bot.send_message(
+            chat_id=control_chat_id,
+            text=(
+                "Scambaiter Bot gestartet.\n"
+                "Kommandos: /status /runonce /chats /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
+            ),
+        )
         try:
             while True:
                 await asyncio.sleep(3600)

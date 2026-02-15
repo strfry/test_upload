@@ -33,14 +33,16 @@ class BackgroundService:
         async with self._run_lock:
             started = datetime.now()
             sent_count = 0
-            folder_chat_ids = await self.core.get_folder_chat_ids()
-            contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
-            if target_chat_ids:
-                contexts = [ctx for ctx in contexts if ctx.chat_id in target_chat_ids]
 
             if target_chat_ids:
-                process_contexts = contexts
+                process_contexts: list[ChatContext] = []
+                for chat_id in sorted(target_chat_ids):
+                    context = await self.core.build_chat_context(chat_id)
+                    if context:
+                        process_contexts.append(context)
             else:
+                folder_chat_ids = await self.core.get_folder_chat_ids()
+                contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
                 process_contexts = [ctx for ctx in contexts if self._should_process_context(ctx)]
 
             results: list[SuggestionResult] = []

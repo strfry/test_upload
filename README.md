@@ -54,17 +54,21 @@ Setze zusätzlich einen Bot-Token, dann startet das Tool als dauerhafter Prozess
 
 ```bash
 export SCAMBAITER_BOT_TOKEN="123456:ABC..."
-export SCAMBAITER_BOT_ALLOWED_CHAT_ID="123456789"   # optionaler Zugriffsschutz
 export SCAMBAITER_AUTO_INTERVAL_SECONDS="120"
 
 python scam_baiter.py
 ```
+
+Hinweis: Der Control-Chat wird beim Start automatisch über die Telegram-App-API ermittelt. Dazu wird ein Dialog mit dem Bot-Username gesucht; wenn gefunden, wird die eigene User-ID als erlaubter Bot-Chat verwendet. Wenn kein Dialog gefunden wird, bricht der Start mit Fehler ab.
+
+Beim Start sendet der Bot außerdem automatisch eine Begrüßungs-/Befehlsübersicht in diesen erlaubten Chat.
 
 Verfügbare Bot-Kommandos:
 
 - `/status` – zeigt Auto-Status und letzten Lauf
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
+- `/chats` – zeigt klickbare Buttons je Chat für Einzellauf (`run:<chat_id>`) oder KV-Anzeige (`kv:<chat_id>`)
 - `/startauto` – startet den Auto-Modus
 - `/stopauto` – stoppt den Auto-Modus
 - `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick

@@ -96,6 +96,21 @@ class ScambaiterCore:
         if self.config.debug_enabled:
             print(f"[DEBUG] {message}")
 
+    async def resolve_control_chat_id(self, bot_username: str) -> int:
+        me = await self.client.get_me()
+        my_id = me.id
+        wanted = bot_username.strip().lstrip("@").lower()
+
+        async for dialog in self.client.iter_dialogs():
+            entity = dialog.entity
+            username = (getattr(entity, "username", None) or "").strip().lstrip("@").lower()
+            if username == wanted:
+                return my_id
+
+        raise ValueError(
+            f"Bot-Dialog mit @{wanted} nicht gefunden. Bitte den Bot zuerst anschreiben und neu starten."
+        )
+
     async def get_folder_chat_ids(self) -> set[int]:
         result = await self.client(GetDialogFiltersRequest())
         wanted = self.config.folder_name.strip().lower()

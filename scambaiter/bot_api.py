@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from scambaiter.service import BackgroundService
 
 
-def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int | None = None) -> Application:
+def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int) -> Application:
     app = Application.builder().token(token).build()
     max_message_len = 3500
 
     def _authorized(update: Update) -> bool:
-        if allowed_chat_id is None:
-            return True
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
 
     async def _guarded_reply(update: Update, text: str) -> None:
@@ -92,6 +90,71 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
             update,
             f"Fertig. Chats: {summary.chat_count}, gesendet: {summary.sent_count}",
         )
+
+    async def chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        folder_chat_ids = await service.core.get_folder_chat_ids()
+        contexts = await service.core.collect_unanswered_chats(folder_chat_ids)
+        if not contexts:
+            await _guarded_reply(update, "Keine unbeantworteten Chats im Ordner gefunden.")
+            return
+
+        for chat_context in contexts[:20]:
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("▶️ Run", callback_data=f"run:{chat_context.chat_id}"),
+                        InlineKeyboardButton("🗂 KV", callback_data=f"kv:{chat_context.chat_id}"),
+                    ]
+                ]
+            )
+            if update.message:
+                await update.message.reply_text(
+                    f"{chat_context.title} ({chat_context.chat_id})",
+                    reply_markup=keyboard,
+                )
+
+    async def callback_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        await query.answer()
+
+        if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
+            await query.edit_message_text("Nicht autorisiert.")
+            return
+
+        data = query.data or ""
+        try:
+            action, chat_id_raw = data.split(":", maxsplit=1)
+            chat_id = int(chat_id_raw)
+        except ValueError:
+            await query.edit_message_text("Ungültige Aktion.")
+            return
+
+        if action == "run":
+            await query.edit_message_text(f"Starte Einzellauf für {chat_id}...")
+            summary = await service.run_once(target_chat_ids={chat_id})
+            await context.bot.send_message(
+                chat_id=allowed_chat_id,
+                text=f"Einzellauf für {chat_id} abgeschlossen. Chats: {summary.chat_count}, gesendet: {summary.sent_count}",
+            )
+            return
+
+        if action == "kv":
+            if not service.store:
+                await query.edit_message_text("Keine Datenbank konfiguriert.")
+                return
+            items = service.store.kv_list(chat_id, limit=20)
+            if not items:
+                await query.edit_message_text(f"Keine Keys für {chat_id} gespeichert.")
+                return
+            lines = [f"- {item.key}={item.value}" for item in items]
+            await query.edit_message_text(f"KV Store für {chat_id}:\n" + "\n".join(lines))
+            return
+
+        await query.edit_message_text("Unbekannte Aktion.")
 
     async def start_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -254,6 +317,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
 
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("runonce", run_once))
+    app.add_handler(CommandHandler("chats", chats))
     app.add_handler(CommandHandler("startauto", start_auto))
     app.add_handler(CommandHandler("stopauto", stop_auto))
     app.add_handler(CommandHandler("last", last))
@@ -264,4 +328,5 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
     app.add_handler(CommandHandler("kvlist", kv_list))
     app.add_handler(CommandHandler("promptpreview", prompt_preview))
     app.add_handler(CommandHandler("testimagedesc", test_image_desc))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(run|kv):"))
     return app

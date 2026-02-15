@@ -22,7 +22,6 @@ class AppConfig:
     interactive_enabled: bool
     debug_enabled: bool
     bot_token: str | None
-    bot_allowed_chat_id: int | None
     auto_interval_seconds: int
     analysis_db_path: str
 
@@ -69,11 +68,6 @@ def load_config() -> AppConfig:
         interactive_enabled=env_flag("SCAMBAITER_INTERACTIVE", default=True),
         debug_enabled=env_flag("SCAMBAITER_DEBUG"),
         bot_token=os.getenv("SCAMBAITER_BOT_TOKEN"),
-        bot_allowed_chat_id=(
-            int(os.getenv("SCAMBAITER_BOT_ALLOWED_CHAT_ID"))
-            if os.getenv("SCAMBAITER_BOT_ALLOWED_CHAT_ID")
-            else None
-        ),
         auto_interval_seconds=env_int("SCAMBAITER_AUTO_INTERVAL_SECONDS", 120),
         analysis_db_path=os.getenv("SCAMBAITER_ANALYSIS_DB_PATH", "scambaiter.sqlite3"),
     )
