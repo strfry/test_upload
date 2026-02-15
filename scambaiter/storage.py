@@ -24,6 +24,13 @@ class StoredImageDescription:
     updated_at: datetime
 
 @dataclass
+class StoredKnownChat:
+    chat_id: int
+    title: str
+    updated_at: datetime
+
+
+@dataclass
 class StoredKeyValue:
     scammer_chat_id: int
     key: str
@@ -183,6 +190,51 @@ class AnalysisStore:
         if legacy_language and "sprache" not in metadata:
             metadata["sprache"] = legacy_language
         return metadata
+
+    def list_known_chats(self, limit: int = 50) -> list[StoredKnownChat]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                WITH latest_analyses AS (
+                    SELECT a.chat_id, a.title, MAX(a.created_at) AS updated_at
+                    FROM analyses a
+                    GROUP BY a.chat_id
+                ),
+                latest_kv AS (
+                    SELECT k.scammer_chat_id AS chat_id, MAX(k.updated_at) AS updated_at
+                    FROM key_values_by_scammer k
+                    GROUP BY k.scammer_chat_id
+                )
+                SELECT la.chat_id,
+                       la.title,
+                       COALESCE(lk.updated_at, la.updated_at) AS updated_at
+                FROM latest_analyses la
+                LEFT JOIN latest_kv lk ON lk.chat_id = la.chat_id
+
+                UNION ALL
+
+                SELECT lk.chat_id,
+                       CAST(lk.chat_id AS TEXT) AS title,
+                       lk.updated_at
+                FROM latest_kv lk
+                WHERE lk.chat_id NOT IN (SELECT chat_id FROM latest_analyses)
+
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        known_chats: list[StoredKnownChat] = []
+        for row in rows:
+            known_chats.append(
+                StoredKnownChat(
+                    chat_id=int(row[0]),
+                    title=str(row[1]),
+                    updated_at=datetime.fromisoformat(row[2]),
+                )
+            )
+        return known_chats
 
     def kv_set(self, scammer_chat_id: int, key: str, value: str) -> None:
         now = datetime.now().isoformat(timespec="seconds")

@@ -94,24 +94,27 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     async def chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
-        folder_chat_ids = await service.core.get_folder_chat_ids()
-        contexts = await service.core.collect_unanswered_chats(folder_chat_ids)
-        if not contexts:
-            await _guarded_reply(update, "Keine unbeantworteten Chats im Ordner gefunden.")
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
             return
 
-        for chat_context in contexts[:20]:
+        known_chats = service.store.list_known_chats(limit=50)
+        if not known_chats:
+            await _guarded_reply(update, "Keine Chats in der Datenbank gefunden.")
+            return
+
+        for item in known_chats:
             keyboard = InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("▶️ Run", callback_data=f"run:{chat_context.chat_id}"),
-                        InlineKeyboardButton("🗂 KV", callback_data=f"kv:{chat_context.chat_id}"),
+                        InlineKeyboardButton("▶️ Run", callback_data=f"run:{item.chat_id}"),
+                        InlineKeyboardButton("🗂 KV", callback_data=f"kv:{item.chat_id}"),
                     ]
                 ]
             )
             if update.message:
                 await update.message.reply_text(
-                    f"{chat_context.title} ({chat_context.chat_id})",
+                    f"{item.title} ({item.chat_id})",
                     reply_markup=keyboard,
                 )
 
