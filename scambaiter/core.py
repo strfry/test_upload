@@ -139,12 +139,86 @@ class ScambaiterCore:
         self._debug(f"Unbeantwortete Chats gefunden: {len(contexts)}")
         return contexts
 
+    async def build_chat_context(self, chat_id: int) -> ChatContext | None:
+        me = await self.client.get_me()
+        my_id = me.id
+        entity = await self.client.get_entity(chat_id)
+        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
+        messages = await self.client.get_messages(entity, limit=self.config.history_limit)
+
+        lines: list[str] = []
+        for message in reversed(messages):
+            line = await self._format_message_line(message, my_id=my_id, dialog_title=title)
+            if line:
+                lines.append(line)
+
+        if not lines:
+            return None
+
+        return ChatContext(chat_id=chat_id, title=title, lines=lines)
+
     def build_user_prompt(self, context: ChatContext) -> str:
         history = "\n".join(context.lines)
         return (
             f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n\n"
             f"Chatverlauf:\n{history}"
         )
+
+    def build_prompt_debug_summary(self, context: ChatContext, max_lines: int = 5) -> str:
+        image_lines = [line for line in context.lines if IMAGE_MARKER_PREFIX in line]
+        head_lines = context.lines[:max_lines]
+        tail_lines = context.lines[-max_lines:] if len(context.lines) > max_lines else []
+
+        parts = [
+            f"Chat: {context.title} ({context.chat_id})",
+            f"Zeilen gesamt: {len(context.lines)}",
+            f"Bildzeilen: {len(image_lines)}",
+        ]
+
+        if image_lines:
+            parts.append("Bildzeilen (gekürzt):")
+            for line in image_lines[:max_lines]:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        if head_lines:
+            parts.append("Anfang des Verlaufs:")
+            for line in head_lines:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        if tail_lines:
+            parts.append("Ende des Verlaufs:")
+            for line in tail_lines:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        return "\n".join(parts)
+
+    async def describe_recent_images_for_chat(self, chat_id: int, limit: int = 3) -> list[str]:
+        messages = await self.client.get_messages(chat_id, limit=max(20, limit * 10))
+        descriptions: list[str] = []
+
+        for message in messages:
+            is_photo = bool(getattr(message, "photo", None))
+            document = getattr(message, "document", None)
+            mime_type = getattr(document, "mime_type", "") if document else ""
+            is_image_document = bool(mime_type and mime_type.startswith("image/"))
+            if not is_photo and not is_image_document:
+                continue
+
+            image_bytes = await self.client.download_media(message, file=bytes)
+            if not image_bytes:
+                continue
+
+            description = await self.describe_image(image_bytes)
+            if description:
+                marker = "photo" if is_photo else f"document:{mime_type}"
+                descriptions.append(
+                    f"msg_id={message.id} ({marker}): {truncate_for_log(description, max_len=300)}"
+                )
+            if len(descriptions) >= limit:
+                break
+
+        return descriptions
+
 
     async def describe_image(self, image_bytes: bytes) -> str | None:
         image_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -186,7 +260,11 @@ class ScambaiterCore:
         text = (message.message or "").strip()
         sender = "Ich" if message.sender_id == my_id else dialog_title
 
-        if getattr(message, "photo", None) and message.sender_id != my_id:
+        document = getattr(message, "document", None)
+        mime_type = getattr(document, "mime_type", "") if document else ""
+        has_image = bool(getattr(message, "photo", None)) or bool(mime_type and mime_type.startswith("image/"))
+
+        if has_image and message.sender_id != my_id:
             marker = IMAGE_MARKER_PREFIX + "]"
             try:
                 image_bytes = await self.client.download_media(message, file=bytes)
@@ -194,6 +272,8 @@ class ScambaiterCore:
                     description = await self.describe_image(image_bytes)
                     if description:
                         marker = f"{IMAGE_MARKER_PREFIX}: {description}]"
+                else:
+                    self._debug(f"Keine Bilddaten heruntergeladen (msg_id={message.id}).")
             except Exception as exc:
                 self._debug(f"Bildbeschreibung fehlgeschlagen (msg_id={message.id}): {exc}")
 
@@ -237,7 +317,8 @@ class ScambaiterCore:
             f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
         )
         self._debug(f"System-Prompt: {truncate_for_log(system_prompt)}")
-        self._debug(f"User-Prompt: {truncate_for_log(user_prompt)}")
+        self._debug(f"User-Prompt: {truncate_for_log(user_prompt, max_len=3000)}")
+        self._debug("Prompt-Zusammenfassung:\n" + self.build_prompt_debug_summary(context))
 
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
             messages = [
