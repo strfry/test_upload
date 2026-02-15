@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 
-from scambaiter.core import ScambaiterCore, SuggestionResult
+from scambaiter.core import ChatContext, ScambaiterCore, SuggestionResult
 from scambaiter.storage import AnalysisStore
 
 
@@ -26,6 +27,7 @@ class BackgroundService:
         self._run_lock = asyncio.Lock()
         self.last_summary: RunSummary | None = None
         self.last_results: list[SuggestionResult] = []
+        self._context_fingerprints: dict[int, str] = {}
 
     async def run_once(self, target_chat_ids: set[int] | None = None) -> RunSummary:
         async with self._run_lock:
@@ -35,9 +37,15 @@ class BackgroundService:
             contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
             if target_chat_ids:
                 contexts = [ctx for ctx in contexts if ctx.chat_id in target_chat_ids]
+
+            if target_chat_ids:
+                process_contexts = contexts
+            else:
+                process_contexts = [ctx for ctx in contexts if self._should_process_context(ctx)]
+
             results: list[SuggestionResult] = []
 
-            for context in contexts:
+            for context in process_contexts:
                 language_hint = None
                 if self.store:
                     lang_item = self.store.kv_get(context.chat_id, "sprache")
@@ -67,12 +75,29 @@ class BackgroundService:
             summary = RunSummary(
                 started_at=started,
                 finished_at=datetime.now(),
-                chat_count=len(contexts),
+                chat_count=len(process_contexts),
                 sent_count=sent_count,
             )
             self.last_results = results
             self.last_summary = summary
             return summary
+
+
+    def _should_process_context(self, context: ChatContext) -> bool:
+        fingerprint = self._fingerprint_context(context)
+        previous = self._context_fingerprints.get(context.chat_id)
+        self._context_fingerprints[context.chat_id] = fingerprint
+        if previous == fingerprint:
+            self.core._debug(
+                f"Überspringe Chat {context.title} ({context.chat_id}): unverändert seit letztem Lauf."
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _fingerprint_context(context: ChatContext) -> str:
+        joined = "\n".join(context.lines)
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
     async def start_auto(self) -> None:
         if self.auto_enabled:

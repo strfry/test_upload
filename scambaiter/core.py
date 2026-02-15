@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
+
+REPLY_MARKER_PATTERN = re.compile(r"(?:ANTWORT|ANWORT|REPLY)\s*:", flags=re.IGNORECASE)
+
+MAX_GENERATION_ATTEMPTS = 2
+
 from huggingface_hub import InferenceClient
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -134,6 +139,24 @@ class ScambaiterCore:
         self._debug(f"Unbeantwortete Chats gefunden: {len(contexts)}")
         return contexts
 
+    async def build_chat_context(self, chat_id: int) -> ChatContext | None:
+        me = await self.client.get_me()
+        my_id = me.id
+        entity = await self.client.get_entity(chat_id)
+        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
+        messages = await self.client.get_messages(entity, limit=self.config.history_limit)
+
+        lines: list[str] = []
+        for message in reversed(messages):
+            line = await self._format_message_line(message, my_id=my_id, dialog_title=title)
+            if line:
+                lines.append(line)
+
+        if not lines:
+            return None
+
+        return ChatContext(chat_id=chat_id, title=title, lines=lines)
+
     def build_user_prompt(self, context: ChatContext) -> str:
         history = "\n".join(context.lines)
         return (
@@ -141,17 +164,77 @@ class ScambaiterCore:
             f"Chatverlauf:\n{history}"
         )
 
+    def build_prompt_debug_summary(self, context: ChatContext, max_lines: int = 5) -> str:
+        image_lines = [line for line in context.lines if IMAGE_MARKER_PREFIX in line]
+        head_lines = context.lines[:max_lines]
+        tail_lines = context.lines[-max_lines:] if len(context.lines) > max_lines else []
+
+        parts = [
+            f"Chat: {context.title} ({context.chat_id})",
+            f"Zeilen gesamt: {len(context.lines)}",
+            f"Bildzeilen: {len(image_lines)}",
+        ]
+
+        if image_lines:
+            parts.append("Bildzeilen (gekürzt):")
+            for line in image_lines[:max_lines]:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        if head_lines:
+            parts.append("Anfang des Verlaufs:")
+            for line in head_lines:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        if tail_lines:
+            parts.append("Ende des Verlaufs:")
+            for line in tail_lines:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        return "\n".join(parts)
+
+    async def describe_recent_images_for_chat(self, chat_id: int, limit: int = 3) -> list[str]:
+        messages = await self.client.get_messages(chat_id, limit=max(20, limit * 10))
+        descriptions: list[str] = []
+
+        for message in messages:
+            is_photo = bool(getattr(message, "photo", None))
+            document = getattr(message, "document", None)
+            mime_type = getattr(document, "mime_type", "") if document else ""
+            is_image_document = bool(mime_type and mime_type.startswith("image/"))
+            if not is_photo and not is_image_document:
+                continue
+
+            image_bytes = await self.client.download_media(message, file=bytes)
+            if not image_bytes:
+                continue
+
+            description = await self.describe_image(image_bytes)
+            if description:
+                marker = "photo" if is_photo else f"document:{mime_type}"
+                descriptions.append(
+                    f"msg_id={message.id} ({marker}): {truncate_for_log(description, max_len=300)}"
+                )
+            if len(descriptions) >= limit:
+                break
+
+        return descriptions
+
+
     async def describe_image(self, image_bytes: bytes) -> str | None:
         image_hash = hashlib.sha256(image_bytes).hexdigest()
         if self.store:
             cached = self.store.image_description_get(image_hash)
             if cached and cached.description.strip():
-                return cached.description.strip()
+                cached_description = extract_image_description(cached.description)
+                if cached_description:
+                    if cached_description != cached.description:
+                        self.store.image_description_set(image_hash, cached_description)
+                    return cached_description
 
         encoded = base64.b64encode(image_bytes).decode("ascii")
         completion = self.hf_client.chat.completions.create(
             model=self.config.hf_vision_model,
-            max_tokens=240,
+            max_tokens=360,
             messages=[
                 {
                     "role": "user",
@@ -159,8 +242,11 @@ class ScambaiterCore:
                         {
                             "type": "text",
                             "text": (
-                                "Beschreibe das Bild ausführlich, konkret und wohlwollend auf Deutsch. "
-                                "Nutze 2-4 Sätze mit gut beobachtbaren Details ohne Spekulationen."
+                                "You are an image captioning assistant. "
+                                "Return final answer only in German and only in this exact format: "
+                                "BESCHREIBUNG: <2-4 complete German sentences>. "
+                                "Use concrete observable details, keep a benevolent tone, no speculation. "
+                                "Do not include analysis, planning, bullets, or meta text."
                             ),
                         },
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
@@ -169,8 +255,10 @@ class ScambaiterCore:
             ],
         )
         content = completion.choices[0].message.content
-        description = _normalize_text_content(content).strip()
+        raw_description = _normalize_text_content(content).strip()
+        description = extract_image_description(raw_description)
         if not description:
+            self._debug(f"Ungültige Bildbeschreibung verworfen: {truncate_for_log(raw_description, max_len=600)}")
             return None
 
         if self.store:
@@ -181,7 +269,11 @@ class ScambaiterCore:
         text = (message.message or "").strip()
         sender = "Ich" if message.sender_id == my_id else dialog_title
 
-        if getattr(message, "photo", None) and message.sender_id != my_id:
+        document = getattr(message, "document", None)
+        mime_type = getattr(document, "mime_type", "") if document else ""
+        has_image = bool(getattr(message, "photo", None)) or bool(mime_type and mime_type.startswith("image/"))
+
+        if has_image and message.sender_id != my_id:
             marker = IMAGE_MARKER_PREFIX + "]"
             try:
                 image_bytes = await self.client.download_media(message, file=bytes)
@@ -189,6 +281,8 @@ class ScambaiterCore:
                     description = await self.describe_image(image_bytes)
                     if description:
                         marker = f"{IMAGE_MARKER_PREFIX}: {description}]"
+                else:
+                    self._debug(f"Keine Bilddaten heruntergeladen (msg_id={message.id}).")
             except Exception as exc:
                 self._debug(f"Bildbeschreibung fehlgeschlagen (msg_id={message.id}): {exc}")
 
@@ -223,26 +317,79 @@ class ScambaiterCore:
         suggestion_callback: Callable[[str], str] | None = None,
         language_hint: str | None = None,
     ) -> ModelOutput:
-        completion = self.hf_client.chat.completions.create(
-            model=self.config.hf_model,
-            max_tokens=self.config.hf_max_tokens,
-            messages=[
-                {"role": "system", "content": self.build_system_prompt(language_hint)},
-                {"role": "user", "content": self.build_user_prompt(context)},
-            ],
+        parser = suggestion_callback or extract_final_reply
+        last_output: ModelOutput | None = None
+        system_prompt = self.build_system_prompt(language_hint)
+        user_prompt = self.build_user_prompt(context)
+
+        self._debug(
+            f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
         )
-        content = completion.choices[0].message.content
-        raw = _normalize_text_content(content)
-        suggestion = (suggestion_callback or extract_final_reply)(raw).strip()
-        analysis = extract_analysis(raw)
-        metadata = extract_metadata(raw)
-        return ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
+        self._debug(f"System-Prompt: {truncate_for_log(system_prompt)}")
+        self._debug(f"User-Prompt: {truncate_for_log(user_prompt, max_len=3000)}")
+        self._debug("Prompt-Zusammenfassung:\n" + self.build_prompt_debug_summary(context))
+
+        for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            if attempt > 1:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Deine letzte Antwort war nicht sendefertig. "
+                            "Gib jetzt nur eine einzige natürliche Telegram-Nachricht aus, "
+                            "ohne Analyse, ohne Meta, ohne Denkprozess."
+                        ),
+                    }
+                )
+
+            self._debug(f"Model-Request (Versuch {attempt}): {truncate_for_log(str(messages), max_len=2000)}")
+
+            completion = self.hf_client.chat.completions.create(
+                model=self.config.hf_model,
+                max_tokens=self.config.hf_max_tokens,
+                messages=messages,
+            )
+            content = completion.choices[0].message.content
+            raw = _normalize_text_content(content)
+            suggestion = parser(raw).strip()
+            analysis = extract_analysis(raw)
+            metadata = extract_metadata(raw)
+
+            self._debug(f"Model-Raw-Ausgabe (Versuch {attempt}) für {context.title} ({context.chat_id}): {raw}")
+            self._debug(f"Extrahierte Antwort (Versuch {attempt}) für {context.title} ({context.chat_id}): {suggestion}")
+            if not has_explicit_reply_marker(raw):
+                print(
+                    f"[WARN] Kein ANTWORT/REPLY-Marker in Modellausgabe für {context.title} ({context.chat_id}) "
+                    f"(Versuch {attempt})."
+                )
+
+            current_output = ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
+            last_output = current_output
+            if suggestion and not looks_like_reasoning_output(suggestion):
+                return current_output
+
+            print(
+                f"[WARN] Extrahierte Antwort wirkt wie Denkprozess oder ist leer für {context.title} "
+                f"({context.chat_id}) in Versuch {attempt}: {suggestion}"
+            )
+
+        assert last_output is not None
+        return last_output
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
         if not self.config.send_enabled:
             return False
         if self.config.send_confirm != "SEND":
             print("[WARN] SCAMBAITER_SEND aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'.")
+            return False
+        if looks_like_reasoning_output(suggestion):
+            print(
+                f"[WARN] Nachricht für {context.title} ({context.chat_id}) nicht gesendet: extrahierter Text wirkt wie Denkprozess."
+            )
             return False
         if not suggestion.strip():
             print(f"[WARN] Leerer Antwortvorschlag für {context.title} (ID: {context.chat_id}) - Nachricht wird nicht gesendet.")
@@ -288,6 +435,13 @@ class ScambaiterCore:
         return dt.strftime("%Y-%m-%d %H:%M")
 
 
+
+def truncate_for_log(text: str, max_len: int = 1200) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "... [gekürzt]"
+
+
 def strip_think_segments(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
     return cleaned.replace("<think>", "").replace("</think>", "").strip()
@@ -307,21 +461,96 @@ def strip_wrapping_quotes(text: str) -> str:
     return cleaned
 
 
+def extract_image_description(text: str) -> str | None:
+    cleaned = strip_think_segments(text)
+
+    # Prefer explicit markers if the model follows instructions.
+    marker_match = re.search(r"(?:^|\n)\s*(?:BESCHREIBUNG|DESCRIPTION)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if marker_match:
+        cleaned = marker_match.group(1).strip()
+
+    # If the model emits preamble + draft in one line, keep only the draft tail.
+    drafting_match = re.search(r"(?:drafting|entwurf|final(?: answer)?|beschreibung)\s*:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if drafting_match:
+        cleaned = drafting_match.group(1).strip()
+
+    raw_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not raw_lines:
+        return None
+
+    filtered: list[str] = []
+    reject_patterns = (
+        r"^(the user wants|let me|looking at the image|now i need|i will|i should|analysis|analyse|reasoning)\b",
+        r"^(description should|bildbeschreibung)\b",
+        r"^(meta|antwort|reply|hinweis|note)\s*:",
+        r"^[\-•*]\s*",
+    )
+    for line in raw_lines:
+        normalized = line.strip().strip('"').strip("'")
+        if not normalized:
+            continue
+
+        # Drop inline reasoning lead-ins before a colon and keep trailing candidate text.
+        if re.search(r"^(looking at the image|analysis|let me|drafting|entwurf)\s*:", normalized, flags=re.IGNORECASE):
+            parts = normalized.split(":", 1)
+            normalized = parts[1].strip() if len(parts) > 1 else ""
+            if not normalized:
+                continue
+
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in reject_patterns):
+            continue
+        filtered.append(normalized)
+
+    if not filtered:
+        return None
+
+    description = " ".join(filtered)
+    description = re.sub(r"\s+", " ", description).strip()
+    description = strip_wrapping_quotes(description)
+    if not description or looks_like_reasoning_output(description):
+        return None
+    return description
+
+
 def extract_final_reply(text: str) -> str:
     cleaned = strip_think_segments(text)
-    match = re.search(r"(?:ANTWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    match = re.search(r"(?:ANTWORT|ANWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if match:
         reply = match.group(1).strip()
-        reply = re.split(r"\n(?:ANALYSE|HINWEIS|NOTE)\s*:", reply, maxsplit=1, flags=re.IGNORECASE)[0]
+        reply = re.split(
+            r"\n(?:ANALYSE|HINWEIS|NOTE|META|ANTWORT|ANWORT|REPLY)\s*:",
+            reply,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
         return strip_wrapping_quotes(reply)
 
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     filtered = [
         line
         for line in lines
-        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
+        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT|META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE)
     ]
-    return strip_wrapping_quotes("\n".join(filtered).strip())
+    if not filtered:
+        return ""
+    return strip_wrapping_quotes(filtered[-1].strip())
+
+
+
+
+def has_explicit_reply_marker(text: str) -> bool:
+    return REPLY_MARKER_PATTERN.search(strip_think_segments(text)) is not None
+
+
+def looks_like_reasoning_output(text: str) -> bool:
+    stripped = text.strip().lower()
+    if not stripped:
+        return True
+    reasoning_patterns = (
+        r"^(analyse|analysis|gedanke|thinking|thought|chain[- ]of[- ]thought|schritt\s*\d+)\b",
+        r"\b(ich denke|let me think|i should|zuerst|danach|abschließend)\b",
+    )
+    return any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in reasoning_patterns)
 
 
 def extract_analysis(text: str) -> str | None:
@@ -343,7 +572,7 @@ def extract_analysis(text: str) -> str | None:
         return None
 
     for line in lines[start_idx + 1 :]:
-        if re.match(r"^\s*(?:META|ANTWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
+        if re.match(r"^\s*(?:META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
             break
         collected.append(line.strip())
 
