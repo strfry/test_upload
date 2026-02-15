@@ -540,14 +540,46 @@ def extract_final_reply(text: str) -> str:
         return strip_wrapping_quotes(reply)
 
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    filtered = [
-        line
-        for line in lines
-        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT|META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE)
-    ]
-    if not filtered:
+    if not lines:
         return ""
-    return strip_wrapping_quotes(filtered[-1].strip())
+
+    section_header = re.compile(
+        r"^\s*(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT|META|ANTWORT|ANWORT|REPLY)\s*:\s*(.*)$",
+        flags=re.IGNORECASE,
+    )
+    reply_sections = {"antwort", "anwort", "reply"}
+    current_section: str | None = None
+    reply_lines: list[str] = []
+    unsectioned_lines: list[str] = []
+
+    for line in lines:
+        header_match = section_header.match(line)
+        if header_match:
+            current_section = header_match.group(1).strip().lower()
+            trailing = header_match.group(2).strip()
+            if current_section in reply_sections and trailing:
+                reply_lines.append(trailing)
+            continue
+
+        if current_section in reply_sections:
+            reply_lines.append(line)
+        elif current_section is None:
+            unsectioned_lines.append(line)
+
+    if reply_lines:
+        return strip_wrapping_quotes("\n".join(reply_lines).strip())
+
+    if not unsectioned_lines:
+        return ""
+
+    # Drop boilerplate lead-ins if the model omitted explicit markers.
+    leadin_pattern = re.compile(
+        r"^(hier ist|here is|antwort|reply|finale?\s+antwort|final\s+answer)\b",
+        flags=re.IGNORECASE,
+    )
+    filtered_unsectioned = [line for line in unsectioned_lines if not leadin_pattern.match(line)]
+    candidate_lines = filtered_unsectioned or unsectioned_lines
+    return strip_wrapping_quotes("\n".join(candidate_lines).strip())
 
 
 
@@ -560,9 +592,11 @@ def looks_like_reasoning_output(text: str) -> bool:
     stripped = text.strip().lower()
     if not stripped:
         return True
+    if "<think>" in stripped or "</think>" in stripped:
+        return True
     reasoning_patterns = (
         r"^(analyse|analysis|gedanke|thinking|thought|chain[- ]of[- ]thought|schritt\s*\d+)\b",
-        r"\b(ich denke|let me think|i should|zuerst|danach|abschließend)\b",
+        r"^(let me think|i should|zuerst|first|danach|then|abschließend|finally)\b",
     )
     return any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in reasoning_patterns)
 
