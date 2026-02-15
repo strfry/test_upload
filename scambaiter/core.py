@@ -25,17 +25,26 @@ from scambaiter.storage import AnalysisStore
 
 
 IMAGE_MARKER_PREFIX = "[Bild gesendet"
+PROMPT_KV_KEYS = (
+    "sprache",
+    "messenger",
+    "absicht",
+    "kontakt",
+    "kontakt_art",
+    "betrüger_art",
+    "scam-verdacht",
+    "typ",
+)
 
 SYSTEM_PROMPT = (
     "Du bist eine Scambaiting-AI in der Rolle einer potenziellen Scam-Zielperson. "
-    "Die andere Person im Chat ist der vermutete Scammer. Du darfst niemals selbst scammen, "
+    "Die andere Person im Chat kann ein Scammer sein, muss es aber nicht. Du darfst niemals selbst scammen, "
     "betrügen, erpressen oder Social-Engineering gegen die andere Person betreiben. "
     "Dein einziges Ziel ist, den Scammer mit plausiblen, harmlosen Antworten möglichst lange "
     "in ein Gespräch zu verwickeln. Nutze nur den bereitgestellten Chatverlauf. "
-    "Gib die Ausgabe vorzugsweise in drei Zeilen aus: 'ANALYSE: ...', 'META: ...' und 'ANTWORT: ...'. "
-    "Wichtige Struktur für META: mindestens der Key 'sprache' (z.B. 'META: sprache=de'). "
-    "Weitere Key-Value-Infos sind erlaubt (Format: key=value;key2=value2). "
-    "Die ANTWORT muss genau eine sendefertige Telegram-Nachricht enthalten. "
+    "Gib die Ausgabe immer exakt in drei Zeilen aus: 'ANALYSE: ...', 'META: ...' und 'ANTWORT: ...'. "
+    "META muss ein valides JSON-Objekt sein, z.B. 'META: {\"sprache\":\"de\",\"absicht\":\"scam\"}'. "
+    "META muss mindestens die Keys 'sprache' und 'absicht' enthalten. "
     "Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (-)."
 )
 
@@ -172,12 +181,21 @@ class ScambaiterCore:
 
         return ChatContext(chat_id=chat_id, title=title, lines=lines)
 
-    def build_user_prompt(self, context: ChatContext) -> str:
+    def build_user_prompt(self, context: ChatContext, prompt_kv_state: dict[str, str] | None = None) -> str:
         history = "\n".join(context.lines)
-        return (
+        prompt = (
             f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n\n"
             f"Chatverlauf:\n{history}"
         )
+        if prompt_kv_state:
+            kv_lines = "\n".join(f"- {key}={value}" for key, value in sorted(prompt_kv_state.items()))
+            prompt += (
+                "\n\n"
+                "System-Kontext (KV-Whitelist, nur zur internen Steuerung):\n"
+                f"{kv_lines}\n"
+                "Diese KV-Werte sind Kontext, aber nicht wortwörtlich in ANTWORT zu zitieren."
+            )
+        return prompt
 
     def build_prompt_debug_summary(self, context: ChatContext, max_lines: int = 5) -> str:
         image_lines = [line for line in context.lines if IMAGE_MARKER_PREFIX in line]
@@ -330,11 +348,12 @@ class ScambaiterCore:
         context: ChatContext,
         suggestion_callback: Callable[[str], str] | None = None,
         language_hint: str | None = None,
+        prompt_kv_state: dict[str, str] | None = None,
     ) -> ModelOutput:
         parser = suggestion_callback or extract_final_reply
         last_output: ModelOutput | None = None
         system_prompt = self.build_system_prompt(language_hint)
-        user_prompt = self.build_user_prompt(context)
+        user_prompt = self.build_user_prompt(context, prompt_kv_state=prompt_kv_state)
 
         self._debug(
             f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
@@ -646,29 +665,37 @@ def extract_metadata(text: str) -> dict[str, str]:
     cleaned = strip_think_segments(text)
     metadata: dict[str, str] = {}
 
-    json_match = re.search(r"META\s*:\s*(\{.+?\})", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if json_match:
+    meta_line: str | None = None
+    for line in cleaned.splitlines():
+        line_match = re.match(r"^\s*META\s*:\s*(.*)$", line, flags=re.IGNORECASE)
+        if line_match:
+            meta_line = line_match.group(1).strip()
+            break
+
+    if not meta_line:
+        return metadata
+
+    if meta_line.startswith("{") and meta_line.endswith("}"):
         try:
-            data = json.loads(json_match.group(1))
+            data = json.loads(meta_line)
             if isinstance(data, dict):
                 for key, value in data.items():
                     k = str(key).strip().lower()
                     v = str(value).strip()
                     if k and v:
                         metadata[k] = v
+                return metadata
         except json.JSONDecodeError:
             pass
 
-    line_match = re.search(r"META\s*:\s*(.+)", cleaned, flags=re.IGNORECASE)
-    if line_match:
-        for part in line_match.group(1).split(";"):
-            if "=" not in part:
-                continue
-            key, value = part.split("=", 1)
-            key = key.strip().lower()
-            value = value.strip()
-            if key and value:
-                metadata[key] = value
+    for part in meta_line.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key and value:
+            metadata[key] = value
 
     return metadata
 

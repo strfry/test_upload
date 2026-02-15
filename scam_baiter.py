@@ -13,7 +13,7 @@ from telegram import Bot
 
 from scambaiter.bot_api import create_bot_app
 from scambaiter.config import load_config
-from scambaiter.core import ScambaiterCore
+from scambaiter.core import PROMPT_KV_KEYS, ScambaiterCore
 from scambaiter.service import BackgroundService
 from scambaiter.storage import AnalysisStore
 
@@ -29,10 +29,16 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
     print(f"Gefundene unbeantwortete Chats: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
         language_hint = None
+        prompt_kv_state: dict[str, str] = {}
         lang_item = store.kv_get(context.chat_id, "sprache")
         if lang_item:
             language_hint = lang_item.value
-        output = core.generate_output(context, language_hint=language_hint)
+        prompt_kv_state = store.kv_get_many(context.chat_id, list(PROMPT_KV_KEYS))
+        output = core.generate_output(
+            context,
+            language_hint=language_hint,
+            prompt_kv_state=prompt_kv_state,
+        )
         store.save(
             chat_id=context.chat_id,
             title=context.title,

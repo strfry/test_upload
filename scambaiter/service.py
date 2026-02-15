@@ -5,7 +5,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 
-from scambaiter.core import ChatContext, ScambaiterCore, SuggestionResult
+from scambaiter.core import PROMPT_KV_KEYS, ChatContext, ScambaiterCore, SuggestionResult
 from scambaiter.storage import AnalysisStore
 
 
@@ -49,12 +49,19 @@ class BackgroundService:
 
             for context in process_contexts:
                 language_hint = None
+                prompt_kv_state: dict[str, str] = {"messenger": "telegram"}
                 if self.store:
                     lang_item = self.store.kv_get(context.chat_id, "sprache")
                     if lang_item:
                         language_hint = lang_item.value
+                    prompt_kv_state.update(self.store.kv_get_many(context.chat_id, list(PROMPT_KV_KEYS)))
+                prompt_kv_state["messenger"] = "telegram"
 
-                output = self.core.generate_output(context, language_hint=language_hint)
+                output = self.core.generate_output(
+                    context,
+                    language_hint=language_hint,
+                    prompt_kv_state=prompt_kv_state,
+                )
                 results.append(
                     SuggestionResult(
                         context=context,
