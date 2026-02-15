@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import base64
@@ -36,7 +36,7 @@ SYSTEM_PROMPT = (
     "Wichtige Struktur für META: mindestens der Key 'sprache' (z.B. 'META: sprache=de'). "
     "Weitere Key-Value-Infos sind erlaubt (Format: key=value;key2=value2). "
     "Die ANTWORT muss genau eine sendefertige Telegram-Nachricht enthalten. "
-    "Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (—)."
+    "Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (-)."
 )
 
 
@@ -233,7 +233,6 @@ class ScambaiterCore:
                 break
 
         return descriptions
-
 
     async def describe_image(self, image_bytes: bytes) -> str | None:
         image_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -463,7 +462,7 @@ def strip_think_segments(text: str) -> str:
 
 
 def strip_wrapping_quotes(text: str) -> str:
-    pairs = [('"', '"'), ("'", "'"), ("„", "“"), ("“", "”"), ("«", "»")]
+    pairs = [('"', '"'), ("'", "'")]
     cleaned = text.strip()
     changed = True
     while changed and len(cleaned) >= 2:
@@ -498,7 +497,7 @@ def extract_image_description(text: str) -> str | None:
         r"^(the user wants|let me|looking at the image|now i need|i will|i should|analysis|analyse|reasoning)\b",
         r"^(description should|bildbeschreibung)\b",
         r"^(meta|antwort|reply|hinweis|note)\s*:",
-        r"^[\-•*]\s*",
+        r"^[-*]\s*",
     )
     for line in raw_lines:
         normalized = line.strip().strip('"').strip("'")
@@ -625,3 +624,5 @@ def extract_metadata(text: str) -> dict[str, str]:
                 metadata[key] = value
 
     return metadata
+
+

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -9,6 +9,26 @@ from scambaiter.service import BackgroundService
 def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int) -> Application:
     app = Application.builder().token(token).build()
     max_message_len = 3500
+    base_info_keys = [
+        "sprache",
+        "scamtyp",
+        "kontakt",
+        "kontakt_art",
+        "betrüger_art",
+        "betrueger_art",
+        "scam-verdacht",
+        "typ",
+    ]
+    base_info_labels = {
+        "sprache": "Sprache",
+        "scamtyp": "Scamtyp",
+        "kontakt": "Kontakt",
+        "kontakt_art": "Kontakt",
+        "betrüger_art": "Betrüger-Art",
+        "betrueger_art": "Betrüger-Art",
+        "scam-verdacht": "Scam-Verdacht",
+        "typ": "Typ",
+    }
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -35,6 +55,32 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 chunk += line
         if chunk:
             await _guarded_reply(update, chunk.rstrip())
+
+    def _truncate_value(value: str, max_len: int = 60) -> str:
+        value = value.strip()
+        if len(value) <= max_len:
+            return value
+        return value[: max_len - 3].rstrip() + "..."
+
+    def _format_chat_overview(chat_id: int, title: str, updated_at: object, kv_data: dict[str, str]) -> str:
+        lines = [f"{title} ({chat_id})"]
+        if hasattr(updated_at, "strftime"):
+            lines.append(f"Zuletzt: {updated_at:%Y-%m-%d %H:%M}")
+        if kv_data:
+            seen_labels: set[str] = set()
+            parts: list[str] = []
+            for key in base_info_keys:
+                value = kv_data.get(key)
+                if not value:
+                    continue
+                label = base_info_labels.get(key, key)
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                parts.append(f"{label}={_truncate_value(value)}")
+            if parts:
+                lines.append("Info: " + ", ".join(parts))
+        return "\n".join(lines)
 
     def _parse_chat_id_arg(args: list[str]) -> int | None:
         if len(args) != 1:
@@ -104,6 +150,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         for item in known_chats:
+            kv_data: dict[str, str] = {}
+            if service.store:
+                kv_data = service.store.kv_get_many(item.chat_id, base_info_keys)
             keyboard = InlineKeyboardMarkup(
                 [
                     [
@@ -113,8 +162,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 ]
             )
             if update.message:
+                summary = _format_chat_overview(item.chat_id, item.title, item.updated_at, kv_data)
                 await update.message.reply_text(
-                    f"{item.title} ({item.chat_id})",
+                    summary,
                     reply_markup=keyboard,
                 )
 
@@ -141,7 +191,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             summary = await service.run_once(target_chat_ids={chat_id})
             await context.bot.send_message(
                 chat_id=allowed_chat_id,
-                text=f"Einzellauf für {chat_id} abgeschlossen. Chats: {summary.chat_count}, gesendet: {summary.sent_count}",
+                text=f"Einzellauf fuer {chat_id} abgeschlossen. Chats: {summary.chat_count}, gesendet: {summary.sent_count}",
             )
             return
 
@@ -154,7 +204,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await query.edit_message_text(f"Keine Keys für {chat_id} gespeichert.")
                 return
             lines = [f"- {item.key}={item.value}" for item in items]
-            await query.edit_message_text(f"KV Store für {chat_id}:\n" + "\n".join(lines))
+            await query.edit_message_text(f"KV Store fuer {chat_id}:\n" + "\n".join(lines))
             return
 
         await query.edit_message_text("Unbekannte Aktion.")
@@ -180,7 +230,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         lines: list[str] = []
         for result in service.last_results[:5]:
             lines.append(f"- {result.context.title} ({result.context.chat_id}): {result.suggestion}")
-        await _guarded_reply(update, "Letzte Vorschläge:\n" + "\n".join(lines))
+        await _guarded_reply(update, "Letzte Vorschlaege:\n" + "\n".join(lines))
 
     async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -222,7 +272,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _guarded_reply(update, "Nutzung: /kvset <scammer_chat_id> <key> <value>")
             return
         service.store.kv_set(scammer_chat_id, key, value)
-        await _guarded_reply(update, f"Gespeichert für {scammer_chat_id}: {key}={value}")
+        await _guarded_reply(update, f"Gespeichert fuer {scammer_chat_id}: {key}={value}")
 
     async def kv_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -264,7 +314,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
         key = context.args[1].strip().lower()
         deleted = service.store.kv_delete(scammer_chat_id, key)
-        await _guarded_reply(update, "Gelöscht." if deleted else "Key nicht gefunden.")
+        await _guarded_reply(update, "Geloescht." if deleted else "Key nicht gefunden.")
 
     async def kv_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -282,10 +332,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
         items = service.store.kv_list(scammer_chat_id, limit=20)
         if not items:
-            await _guarded_reply(update, "Keine Keys für diesen Scammer gespeichert.")
+            await _guarded_reply(update, "Keine Keys fuer diesen Scammer gespeichert.")
             return
         lines = [f"- {item.key}={item.value}" for item in items]
-        await _guarded_reply(update, f"KV Store für {scammer_chat_id}:\n" + "\n".join(lines))
+        await _guarded_reply(update, f"KV Store fuer {scammer_chat_id}:\n" + "\n".join(lines))
 
     async def prompt_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -311,7 +361,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _guarded_reply(update, "Nutzung: /testimagedesc <scammer_chat_id>")
             return
 
-        await _guarded_reply(update, "Teste Bildbeschreibung für die letzten Bilder im Chat...")
+        await _guarded_reply(update, "Teste Bildbeschreibung fuer die letzten Bilder im Chat...")
         descriptions = await service.core.describe_recent_images_for_chat(chat_id, limit=3)
         if not descriptions:
             await _guarded_reply(update, "Keine Bilder gefunden oder keine Beschreibung erzeugt.")
@@ -333,3 +383,4 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app.add_handler(CommandHandler("testimagedesc", test_image_desc))
     app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(run|kv):"))
     return app
+

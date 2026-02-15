@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Telegram Scambaiter suggestion tool.
 
 Batch mode (default): one run with optional interactive send.
@@ -70,7 +70,7 @@ async def run() -> None:
             allowed_chat_id=control_chat_id,
         )
         print(
-            "BotAPI aktiv. Verfügbare Kommandos: "
+            "BotAPI aktiv. verfügbare Kommandos: "
             "/status /runonce /chats /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
         )
         await bot_app.initialize()
@@ -101,3 +101,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

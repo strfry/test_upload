@@ -287,6 +287,19 @@ class AnalysisStore:
             for row in rows
         ]
 
+    def kv_get_many(self, scammer_chat_id: int, keys: list[str]) -> dict[str, str]:
+        cleaned = [key.strip().lower() for key in keys if key.strip()]
+        if not cleaned:
+            return {}
+        placeholders = ",".join("?" for _ in cleaned)
+        query = (
+            "SELECT key, value FROM key_values_by_scammer "
+            f"WHERE scammer_chat_id = ? AND key IN ({placeholders})"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(query, (scammer_chat_id, *cleaned)).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows}
+
     def image_description_get(self, image_hash: str) -> StoredImageDescription | None:
         with self._connect() as conn:
             row = conn.execute(

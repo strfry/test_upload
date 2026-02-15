@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -124,3 +124,5 @@ class BackgroundService:
             except Exception as exc:
                 print(f"[ERROR] Auto-Lauf fehlgeschlagen: {exc}")
             await asyncio.sleep(self.interval_seconds)
+
+
