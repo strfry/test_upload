@@ -20,10 +20,11 @@ class AppConfig:
     delete_after_seconds: int
     interactive_enabled: bool
     debug_enabled: bool
-    bot_token: str | None
+    bot_token: str
     bot_allowed_chat_id: int | None
     auto_interval_seconds: int
     analysis_db_path: str
+    batch_mode: bool
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -66,7 +67,7 @@ def load_config() -> AppConfig:
         delete_after_seconds=env_int("SCAMBAITER_DELETE_OWN_AFTER_SECONDS", 0),
         interactive_enabled=env_flag("SCAMBAITER_INTERACTIVE", default=True),
         debug_enabled=env_flag("SCAMBAITER_DEBUG"),
-        bot_token=os.getenv("SCAMBAITER_BOT_TOKEN"),
+        bot_token=os.getenv("SCAMBAITER_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "",
         bot_allowed_chat_id=(
             int(os.getenv("SCAMBAITER_BOT_ALLOWED_CHAT_ID"))
             if os.getenv("SCAMBAITER_BOT_ALLOWED_CHAT_ID")
@@ -74,4 +75,5 @@ def load_config() -> AppConfig:
         ),
         auto_interval_seconds=env_int("SCAMBAITER_AUTO_INTERVAL_SECONDS", 120),
         analysis_db_path=os.getenv("SCAMBAITER_ANALYSIS_DB_PATH", "scambaiter.sqlite3"),
+        batch_mode=env_flag("SCAMBAITER_BATCH_MODE"),
     )
