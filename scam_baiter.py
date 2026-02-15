@@ -67,11 +67,19 @@ async def run() -> None:
         )
         print(
             "BotAPI aktiv. Verfügbare Kommandos: "
-            "/status /runonce /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
+            "/start /status /runonce /chats /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
         )
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling()
+        if config.bot_allowed_chat_id is not None:
+            await bot_app.bot.send_message(
+                chat_id=config.bot_allowed_chat_id,
+                text=(
+                    "ControlBot gestartet. Wichtigste Kommandos:\n"
+                    "/status, /runonce, /chats, /startauto, /stopauto, /history"
+                ),
+            )
         try:
             while True:
                 await asyncio.sleep(3600)
