@@ -62,9 +62,11 @@ python scam_baiter.py
 
 Verfügbare Bot-Kommandos:
 
+- `/start` oder `/help` – zeigt beim Start die wichtigsten Befehle
 - `/status` – zeigt Auto-Status und letzten Lauf
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
+- `/chats` – listet unbeantwortete Chats mit Klick-Buttons (Einzellauf/Variablen)
 - `/startauto` – startet den Auto-Modus
 - `/stopauto` – stoppt den Auto-Modus
 - `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick
@@ -78,6 +80,8 @@ Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (
 Eingehende Bildnachrichten vom Scammer werden automatisch mit `HF_VISION_MODEL` ausführlich und wohlwollend beschrieben und als Marker (`[Bild gesendet: ...]`) in den Chatverlauf für die Textgenerierung eingefügt.
 Die Bildbeschreibung wird per Bild-Hash in der SQLite-DB (`image_descriptions`) gecacht, damit jedes identische Bild nur einmal an das Vision-Modell geschickt wird.
 Wenn `sprache` pro Scammer gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
+Wenn `SCAMBAITER_BOT_ALLOWED_CHAT_ID` gesetzt ist, sendet der Bot beim Start automatisch die wichtigsten Kommandos als BotAPI-Nachricht in diesen Chat.
+Zusätzlich akzeptiert der laufende Prozess dieselben Steuerbefehle auch über STDIO (z.B. `help`, `status`, `runonce`, `startauto`, `stopauto`, `kvlist ...`), damit die Steuerung sowohl im Bot-Chat als auch lokal im Terminal funktioniert.
 
 ## Projektstruktur
 

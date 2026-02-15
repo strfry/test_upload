@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from scambaiter.service import BackgroundService
 
@@ -45,6 +45,20 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
             return int(args[0].strip())
         except ValueError:
             return None
+
+    def _command_overview() -> str:
+        return (
+            "ControlBot ist aktiv. Wichtigste Kommandos:\n"
+            "/status - Auto-Status + letzter Lauf\n"
+            "/runonce [chat_id,...] - Einmallauf\n"
+            "/chats - Chats mit Klick-Buttons (Run/Variablen)\n"
+            "/startauto | /stopauto - Auto-Modus steuern\n"
+            "/last | /history - letzte Ergebnisse\n"
+            "/kvset /kvget /kvdel /kvlist - Variablen"
+        )
+
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _guarded_reply(update, _command_overview())
 
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -92,6 +106,94 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
             update,
             f"Fertig. Chats: {summary.chat_count}, gesendet: {summary.sent_count}",
         )
+
+    async def chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        limit = 10
+        if context.args:
+            try:
+                limit = max(1, min(20, int(context.args[0])))
+            except ValueError:
+                await _guarded_reply(update, "Nutzung: /chats [limit]")
+                return
+
+        folder_chat_ids = await service.core.get_folder_chat_ids()
+        contexts = await service.core.collect_unanswered_chats(folder_chat_ids)
+        if not contexts:
+            await _guarded_reply(update, "Keine unbeantworteten Chats gefunden.")
+            return
+
+        selected = contexts[:limit]
+        keyboard = []
+        for item in selected:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"▶ Run {item.title[:20]}",
+                        callback_data=f"run:{item.chat_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Variablen",
+                        callback_data=f"kv:{item.chat_id}",
+                    ),
+                ]
+            )
+
+        await update.message.reply_text(
+            "Chats auswählen (Einzellauf oder Variablen):",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    async def chat_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        if not _authorized(update):
+            await query.answer("Nicht autorisiert.", show_alert=True)
+            return
+
+        await query.answer()
+        data = query.data or ""
+        if ":" not in data:
+            await query.edit_message_text("Ungültige Aktion.")
+            return
+
+        action, raw_chat_id = data.split(":", 1)
+        try:
+            chat_id = int(raw_chat_id)
+        except ValueError:
+            await query.edit_message_text("Ungültige Chat-ID.")
+            return
+
+        if action == "run":
+            summary = await service.run_once(target_chat_ids={chat_id})
+            if summary.chat_count == 0:
+                await query.edit_message_text(f"Für Chat {chat_id} wurde kein Verlauf gefunden.")
+                return
+            suggestion_text = ""
+            if service.last_results:
+                suggestion_text = service.last_results[0].suggestion
+            message = f"Einzellauf für {chat_id} abgeschlossen. Gesendet: {summary.sent_count}."
+            if suggestion_text:
+                message += f"\n\nVorschlag:\n{suggestion_text}"
+            await query.edit_message_text(message[:max_message_len])
+            return
+
+        if action == "kv":
+            if not service.store:
+                await query.edit_message_text("Keine Datenbank konfiguriert.")
+                return
+            items = service.store.kv_list(chat_id, limit=20)
+            if not items:
+                await query.edit_message_text(f"Keine Variablen für {chat_id} gespeichert.")
+                return
+            lines = [f"- {item.key}={item.value}" for item in items]
+            text = f"Variablen für {chat_id}:\n" + "\n".join(lines)
+            await query.edit_message_text(text[:max_message_len])
+            return
+
+        await query.edit_message_text("Unbekannte Aktion.")
 
     async def start_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -252,8 +354,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
             return
         await _guarded_reply_chunks(update, "Bildbeschreibungen:\n" + "\n".join(f"- {item}" for item in descriptions))
 
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("runonce", run_once))
+    app.add_handler(CommandHandler("chats", chats))
     app.add_handler(CommandHandler("startauto", start_auto))
     app.add_handler(CommandHandler("stopauto", stop_auto))
     app.add_handler(CommandHandler("last", last))
@@ -264,4 +369,5 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
     app.add_handler(CommandHandler("kvlist", kv_list))
     app.add_handler(CommandHandler("promptpreview", prompt_preview))
     app.add_handler(CommandHandler("testimagedesc", test_image_desc))
+    app.add_handler(CallbackQueryHandler(chat_action, pattern=r"^(run|kv):"))
     return app
