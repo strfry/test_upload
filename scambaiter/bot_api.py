@@ -38,6 +38,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         if chunk:
             await _guarded_reply(update, chunk.rstrip())
 
+    def _parse_chat_id_arg(args: list[str]) -> int | None:
+        if len(args) != 1:
+            return None
+        try:
+            return int(args[0].strip())
+        except ValueError:
+            return None
+
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
@@ -213,6 +221,37 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
         lines = [f"- {item.key}={item.value}" for item in items]
         await _guarded_reply(update, f"KV Store für {scammer_chat_id}:\n" + "\n".join(lines))
 
+    async def prompt_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        chat_id = _parse_chat_id_arg(context.args)
+        if chat_id is None:
+            await _guarded_reply(update, "Nutzung: /promptpreview <scammer_chat_id>")
+            return
+
+        chat_context = await service.core.build_chat_context(chat_id)
+        if not chat_context:
+            await _guarded_reply(update, "Kein Chatverlauf gefunden.")
+            return
+
+        preview = service.core.build_prompt_debug_summary(chat_context, max_lines=8)
+        await _guarded_reply_chunks(update, "Prompt-Preview:\n" + preview)
+
+    async def test_image_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        chat_id = _parse_chat_id_arg(context.args)
+        if chat_id is None:
+            await _guarded_reply(update, "Nutzung: /testimagedesc <scammer_chat_id>")
+            return
+
+        await _guarded_reply(update, "Teste Bildbeschreibung für die letzten Bilder im Chat...")
+        descriptions = await service.core.describe_recent_images_for_chat(chat_id, limit=3)
+        if not descriptions:
+            await _guarded_reply(update, "Keine Bilder gefunden oder keine Beschreibung erzeugt.")
+            return
+        await _guarded_reply_chunks(update, "Bildbeschreibungen:\n" + "\n".join(f"- {item}" for item in descriptions))
+
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("runonce", run_once))
     app.add_handler(CommandHandler("startauto", start_auto))
@@ -223,4 +262,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int 
     app.add_handler(CommandHandler("kvget", kv_get))
     app.add_handler(CommandHandler("kvdel", kv_del))
     app.add_handler(CommandHandler("kvlist", kv_list))
+    app.add_handler(CommandHandler("promptpreview", prompt_preview))
+    app.add_handler(CommandHandler("testimagedesc", test_image_desc))
     return app

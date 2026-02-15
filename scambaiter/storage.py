@@ -16,6 +16,13 @@ class StoredAnalysis:
     metadata: dict[str, str]
 
 
+
+@dataclass
+class StoredImageDescription:
+    image_hash: str
+    description: str
+    updated_at: datetime
+
 @dataclass
 class StoredKeyValue:
     scammer_chat_id: int
@@ -57,6 +64,15 @@ class AnalysisStore:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (scammer_chat_id, key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS image_descriptions (
+                    image_hash TEXT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -218,3 +234,31 @@ class AnalysisStore:
             StoredKeyValue(scammer_chat_id=row[0], key=row[1], value=row[2], updated_at=datetime.fromisoformat(row[3]))
             for row in rows
         ]
+
+    def image_description_get(self, image_hash: str) -> StoredImageDescription | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT image_hash, description, updated_at
+                FROM image_descriptions
+                WHERE image_hash = ?
+                """,
+                (image_hash,),
+            ).fetchone()
+        if not row:
+            return None
+        return StoredImageDescription(image_hash=row[0], description=row[1], updated_at=datetime.fromisoformat(row[2]))
+
+    def image_description_set(self, image_hash: str, description: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO image_descriptions (image_hash, description, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(image_hash) DO UPDATE SET
+                    description=excluded.description,
+                    updated_at=excluded.updated_at
+                """,
+                (image_hash, description, now),
+            )

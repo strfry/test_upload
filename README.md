@@ -20,6 +20,7 @@ export TELEGRAM_SESSION="scambaiter"   # optional
 
 export HF_TOKEN="..."
 export HF_MODEL="..."
+export HF_VISION_MODEL="..."          # optional, fallback: HF_MODEL
 export HF_BASE_URL="https://..."       # optional
 export HF_MAX_TOKENS="350"             # optional, längere Modellantworten erlauben
 ```
@@ -74,6 +75,8 @@ Verfügbare Bot-Kommandos:
 - `/kvlist <scammer_chat_id>` – listet Keys für einen Scammer
 
 Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (z.B. `sprache`) automatisch als Keys für den jeweiligen Scammer aktualisiert.
+Eingehende Bildnachrichten vom Scammer werden automatisch mit `HF_VISION_MODEL` ausführlich und wohlwollend beschrieben und als Marker (`[Bild gesendet: ...]`) in den Chatverlauf für die Textgenerierung eingefügt.
+Die Bildbeschreibung wird per Bild-Hash in der SQLite-DB (`image_descriptions`) gecacht, damit jedes identische Bild nur einmal an das Vision-Modell geschickt wird.
 Wenn `sprache` pro Scammer gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
 
 ## Projektstruktur

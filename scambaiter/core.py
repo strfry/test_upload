@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -19,6 +21,10 @@ from telethon.tl.types import DialogFilter
 from telethon.utils import get_peer_id
 
 from scambaiter.config import AppConfig
+from scambaiter.storage import AnalysisStore
+
+
+IMAGE_MARKER_PREFIX = "[Bild gesendet"
 
 SYSTEM_PROMPT = (
     "Du bist eine Scambaiting-AI in der Rolle einer potenziellen Scam-Zielperson. "
@@ -57,9 +63,26 @@ class ModelOutput:
     metadata: dict[str, str]
 
 
+def _normalize_text_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+            elif isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+        return "\n".join(parts)
+    return ""
+
+
 class ScambaiterCore:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, store: AnalysisStore | None = None) -> None:
         self.config = config
+        self.store = store
         self.client = TelegramClient(config.telegram_session, config.telegram_api_id, config.telegram_api_hash)
         self.hf_client = InferenceClient(api_key=config.hf_token, base_url=config.hf_base_url)
 
@@ -106,11 +129,9 @@ class ScambaiterCore:
             messages = await self.client.get_messages(dialog.entity, limit=self.config.history_limit)
             lines: list[str] = []
             for message in reversed(messages):
-                text = message.message or ""
-                if not text.strip():
-                    continue
-                sender = "Ich" if message.sender_id == my_id else dialog.title
-                lines.append(f"[{self._fmt_dt(message.date)}] {sender}: {text}")
+                line = await self._format_message_line(message, my_id=my_id, dialog_title=dialog.title)
+                if line:
+                    lines.append(line)
 
             if lines:
                 contexts.append(ChatContext(chat_id=dialog.id, title=dialog.title, lines=lines))
@@ -118,12 +139,161 @@ class ScambaiterCore:
         self._debug(f"Unbeantwortete Chats gefunden: {len(contexts)}")
         return contexts
 
+    async def build_chat_context(self, chat_id: int) -> ChatContext | None:
+        me = await self.client.get_me()
+        my_id = me.id
+        entity = await self.client.get_entity(chat_id)
+        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
+        messages = await self.client.get_messages(entity, limit=self.config.history_limit)
+
+        lines: list[str] = []
+        for message in reversed(messages):
+            line = await self._format_message_line(message, my_id=my_id, dialog_title=title)
+            if line:
+                lines.append(line)
+
+        if not lines:
+            return None
+
+        return ChatContext(chat_id=chat_id, title=title, lines=lines)
+
     def build_user_prompt(self, context: ChatContext) -> str:
         history = "\n".join(context.lines)
         return (
             f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n\n"
             f"Chatverlauf:\n{history}"
         )
+
+    def build_prompt_debug_summary(self, context: ChatContext, max_lines: int = 5) -> str:
+        image_lines = [line for line in context.lines if IMAGE_MARKER_PREFIX in line]
+        head_lines = context.lines[:max_lines]
+        tail_lines = context.lines[-max_lines:] if len(context.lines) > max_lines else []
+
+        parts = [
+            f"Chat: {context.title} ({context.chat_id})",
+            f"Zeilen gesamt: {len(context.lines)}",
+            f"Bildzeilen: {len(image_lines)}",
+        ]
+
+        if image_lines:
+            parts.append("Bildzeilen (gekürzt):")
+            for line in image_lines[:max_lines]:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        if head_lines:
+            parts.append("Anfang des Verlaufs:")
+            for line in head_lines:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        if tail_lines:
+            parts.append("Ende des Verlaufs:")
+            for line in tail_lines:
+                parts.append("- " + truncate_for_log(line, max_len=220))
+
+        return "\n".join(parts)
+
+    async def describe_recent_images_for_chat(self, chat_id: int, limit: int = 3) -> list[str]:
+        messages = await self.client.get_messages(chat_id, limit=max(20, limit * 10))
+        descriptions: list[str] = []
+
+        for message in messages:
+            is_photo = bool(getattr(message, "photo", None))
+            document = getattr(message, "document", None)
+            mime_type = getattr(document, "mime_type", "") if document else ""
+            is_image_document = bool(mime_type and mime_type.startswith("image/"))
+            if not is_photo and not is_image_document:
+                continue
+
+            image_bytes = await self.client.download_media(message, file=bytes)
+            if not image_bytes:
+                continue
+
+            description = await self.describe_image(image_bytes)
+            if description:
+                marker = "photo" if is_photo else f"document:{mime_type}"
+                descriptions.append(
+                    f"msg_id={message.id} ({marker}): {truncate_for_log(description, max_len=300)}"
+                )
+            if len(descriptions) >= limit:
+                break
+
+        return descriptions
+
+
+    async def describe_image(self, image_bytes: bytes) -> str | None:
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        if self.store:
+            cached = self.store.image_description_get(image_hash)
+            if cached and cached.description.strip():
+                cached_description = extract_image_description(cached.description)
+                if cached_description:
+                    if cached_description != cached.description:
+                        self.store.image_description_set(image_hash, cached_description)
+                    return cached_description
+
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        completion = self.hf_client.chat.completions.create(
+            model=self.config.hf_vision_model,
+            max_tokens=720,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are an image captioning assistant. "
+                                "Return final answer only in this exact format: "
+                                "DESCRIPTION: <2-4 complete sentences>. "
+                                "Use concrete observable details, keep a benevolent tone, no speculation. "
+                                "Do not include analysis, planning, bullets, or meta text."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                    ],
+                }
+            ],
+        )
+        content = completion.choices[0].message.content
+        raw_description = _normalize_text_content(content).strip()
+        description = extract_image_description(raw_description)
+        if not description:
+            self._debug(f"Ungültige Bildbeschreibung verworfen: {truncate_for_log(raw_description, max_len=600)}")
+            return None
+
+        if self.store:
+            self.store.image_description_set(image_hash, description)
+        return description
+
+    async def _format_message_line(self, message, my_id: int, dialog_title: str) -> str | None:
+        text = (message.message or "").strip()
+        sender = "Ich" if message.sender_id == my_id else dialog_title
+
+        document = getattr(message, "document", None)
+        mime_type = getattr(document, "mime_type", "") if document else ""
+        has_image = bool(getattr(message, "photo", None)) or bool(mime_type and mime_type.startswith("image/"))
+
+        if has_image and message.sender_id != my_id:
+            marker = IMAGE_MARKER_PREFIX + "]"
+            try:
+                image_bytes = await self.client.download_media(message, file=bytes)
+                if image_bytes:
+                    description = await self.describe_image(image_bytes)
+                    if description:
+                        marker = f"{IMAGE_MARKER_PREFIX}: {description}]"
+                else:
+                    self._debug(f"Keine Bilddaten heruntergeladen (msg_id={message.id}).")
+            except Exception as exc:
+                self._debug(f"Bildbeschreibung fehlgeschlagen (msg_id={message.id}): {exc}")
+
+            if text:
+                return f"[{self._fmt_dt(message.date)}] {sender}: {marker} {text}"
+            return f"[{self._fmt_dt(message.date)}] {sender}: {marker}"
+
+        if text:
+            return f"[{self._fmt_dt(message.date)}] {sender}: {text}"
+
+        return None
 
     def generate_suggestion(self, context: ChatContext, suggestion_callback: Callable[[str], str] | None = None) -> str:
         return self.generate_output(context, suggestion_callback=suggestion_callback).suggestion
@@ -156,7 +326,8 @@ class ScambaiterCore:
             f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
         )
         self._debug(f"System-Prompt: {truncate_for_log(system_prompt)}")
-        self._debug(f"User-Prompt: {truncate_for_log(user_prompt)}")
+        self._debug(f"User-Prompt: {truncate_for_log(user_prompt, max_len=3000)}")
+        self._debug("Prompt-Zusammenfassung:\n" + self.build_prompt_debug_summary(context))
 
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
             messages = [
@@ -182,8 +353,9 @@ class ScambaiterCore:
                 max_tokens=self.config.hf_max_tokens,
                 messages=messages,
             )
-            raw = completion.choices[0].message.content
-            suggestion = parser(raw)
+            content = completion.choices[0].message.content
+            raw = _normalize_text_content(content)
+            suggestion = parser(raw).strip()
             analysis = extract_analysis(raw)
             metadata = extract_metadata(raw)
 
@@ -219,10 +391,16 @@ class ScambaiterCore:
                 f"[WARN] Nachricht für {context.title} ({context.chat_id}) nicht gesendet: extrahierter Text wirkt wie Denkprozess."
             )
             return False
+        if not suggestion.strip():
+            print(f"[WARN] Leerer Antwortvorschlag für {context.title} (ID: {context.chat_id}) - Nachricht wird nicht gesendet.")
+            return False
         await self.send_message_with_optional_delete(context, suggestion)
         return True
 
     async def send_message_with_optional_delete(self, context: ChatContext, message: str) -> None:
+        if not message.strip():
+            print(f"[WARN] Leere Nachricht für {context.title} (ID: {context.chat_id}) verworfen.")
+            return
         sent = await self.client.send_message(context.chat_id, message)
         print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
         if self.config.delete_after_seconds > 0:
@@ -281,6 +459,57 @@ def strip_wrapping_quotes(text: str) -> str:
                 changed = True
                 break
     return cleaned
+
+
+def extract_image_description(text: str) -> str | None:
+    cleaned = strip_think_segments(text)
+
+    # Prefer explicit markers if the model follows instructions.
+    marker_match = re.search(r"(?:^|\n)\s*(?:BESCHREIBUNG|DESCRIPTION)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if marker_match:
+        cleaned = marker_match.group(1).strip()
+
+    # If the model emits preamble + draft in one line, keep only the draft tail.
+    drafting_match = re.search(r"(?:drafting|entwurf|final(?: answer)?|beschreibung)\s*:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if drafting_match:
+        cleaned = drafting_match.group(1).strip()
+
+    raw_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not raw_lines:
+        return None
+
+    filtered: list[str] = []
+    reject_patterns = (
+        r"^(the user wants|let me|looking at the image|now i need|i will|i should|analysis|analyse|reasoning)\b",
+        r"^(description should|bildbeschreibung)\b",
+        r"^(meta|antwort|reply|hinweis|note)\s*:",
+        r"^[\-•*]\s*",
+    )
+    for line in raw_lines:
+        normalized = line.strip().strip('"').strip("'")
+        if not normalized:
+            continue
+
+        # Drop inline reasoning lead-ins before a colon and keep trailing candidate text.
+        if re.search(r"^(looking at the image|analysis|let me|drafting|entwurf)\s*:", normalized, flags=re.IGNORECASE):
+            parts = normalized.split(":", 1)
+            normalized = parts[1].strip() if len(parts) > 1 else ""
+            if not normalized:
+                continue
+
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in reject_patterns):
+            continue
+        filtered.append(normalized)
+
+    if not filtered:
+        return None
+
+    description = " ".join(filtered)
+    description = re.sub(r"\s+", " ", description).strip()
+    description = strip_wrapping_quotes(description)
+    if not description or looks_like_reasoning_output(description):
+        return None
+    return description
 
 
 def extract_final_reply(text: str) -> str:
