@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
+
+REPLY_MARKER_PATTERN = re.compile(r"(?:ANTWORT|ANWORT|REPLY)\s*:", flags=re.IGNORECASE)
+
+MAX_GENERATION_ATTEMPTS = 2
+
 from huggingface_hub import InferenceClient
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -223,26 +228,78 @@ class ScambaiterCore:
         suggestion_callback: Callable[[str], str] | None = None,
         language_hint: str | None = None,
     ) -> ModelOutput:
-        completion = self.hf_client.chat.completions.create(
-            model=self.config.hf_model,
-            max_tokens=self.config.hf_max_tokens,
-            messages=[
-                {"role": "system", "content": self.build_system_prompt(language_hint)},
-                {"role": "user", "content": self.build_user_prompt(context)},
-            ],
+        parser = suggestion_callback or extract_final_reply
+        last_output: ModelOutput | None = None
+        system_prompt = self.build_system_prompt(language_hint)
+        user_prompt = self.build_user_prompt(context)
+
+        self._debug(
+            f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
         )
-        content = completion.choices[0].message.content
-        raw = _normalize_text_content(content)
-        suggestion = (suggestion_callback or extract_final_reply)(raw).strip()
-        analysis = extract_analysis(raw)
-        metadata = extract_metadata(raw)
-        return ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
+        self._debug(f"System-Prompt: {truncate_for_log(system_prompt)}")
+        self._debug(f"User-Prompt: {truncate_for_log(user_prompt)}")
+
+        for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            if attempt > 1:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Deine letzte Antwort war nicht sendefertig. "
+                            "Gib jetzt nur eine einzige natürliche Telegram-Nachricht aus, "
+                            "ohne Analyse, ohne Meta, ohne Denkprozess."
+                        ),
+                    }
+                )
+
+            self._debug(f"Model-Request (Versuch {attempt}): {truncate_for_log(str(messages), max_len=2000)}")
+
+            completion = self.hf_client.chat.completions.create(
+                model=self.config.hf_model,
+                max_tokens=self.config.hf_max_tokens,
+                messages=messages,
+            )
+            content = completion.choices[0].message.content
+            raw = _normalize_text_content(content)
+            suggestion = parser(raw).strip()
+            analysis = extract_analysis(raw)
+            metadata = extract_metadata(raw)
+
+            self._debug(f"Model-Raw-Ausgabe (Versuch {attempt}) für {context.title} ({context.chat_id}): {raw}")
+            self._debug(f"Extrahierte Antwort (Versuch {attempt}) für {context.title} ({context.chat_id}): {suggestion}")
+            if not has_explicit_reply_marker(raw):
+                print(
+                    f"[WARN] Kein ANTWORT/REPLY-Marker in Modellausgabe für {context.title} ({context.chat_id}) "
+                    f"(Versuch {attempt})."
+                )
+
+            current_output = ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
+            last_output = current_output
+            if suggestion and not looks_like_reasoning_output(suggestion):
+                return current_output
+
+            print(
+                f"[WARN] Extrahierte Antwort wirkt wie Denkprozess oder ist leer für {context.title} "
+                f"({context.chat_id}) in Versuch {attempt}: {suggestion}"
+            )
+
+        assert last_output is not None
+        return last_output
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
         if not self.config.send_enabled:
             return False
         if self.config.send_confirm != "SEND":
             print("[WARN] SCAMBAITER_SEND aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'.")
+            return False
+        if looks_like_reasoning_output(suggestion):
+            print(
+                f"[WARN] Nachricht für {context.title} ({context.chat_id}) nicht gesendet: extrahierter Text wirkt wie Denkprozess."
+            )
             return False
         if not suggestion.strip():
             print(f"[WARN] Leerer Antwortvorschlag für {context.title} (ID: {context.chat_id}) - Nachricht wird nicht gesendet.")
@@ -288,6 +345,13 @@ class ScambaiterCore:
         return dt.strftime("%Y-%m-%d %H:%M")
 
 
+
+def truncate_for_log(text: str, max_len: int = 1200) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "... [gekürzt]"
+
+
 def strip_think_segments(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
     return cleaned.replace("<think>", "").replace("</think>", "").strip()
@@ -309,19 +373,43 @@ def strip_wrapping_quotes(text: str) -> str:
 
 def extract_final_reply(text: str) -> str:
     cleaned = strip_think_segments(text)
-    match = re.search(r"(?:ANTWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    match = re.search(r"(?:ANTWORT|ANWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if match:
         reply = match.group(1).strip()
-        reply = re.split(r"\n(?:ANALYSE|HINWEIS|NOTE)\s*:", reply, maxsplit=1, flags=re.IGNORECASE)[0]
+        reply = re.split(
+            r"\n(?:ANALYSE|HINWEIS|NOTE|META|ANTWORT|ANWORT|REPLY)\s*:",
+            reply,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
         return strip_wrapping_quotes(reply)
 
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     filtered = [
         line
         for line in lines
-        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT)\s*:", line, flags=re.IGNORECASE)
+        if not re.match(r"^(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT|META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE)
     ]
-    return strip_wrapping_quotes("\n".join(filtered).strip())
+    if not filtered:
+        return ""
+    return strip_wrapping_quotes(filtered[-1].strip())
+
+
+
+
+def has_explicit_reply_marker(text: str) -> bool:
+    return REPLY_MARKER_PATTERN.search(strip_think_segments(text)) is not None
+
+
+def looks_like_reasoning_output(text: str) -> bool:
+    stripped = text.strip().lower()
+    if not stripped:
+        return True
+    reasoning_patterns = (
+        r"^(analyse|analysis|gedanke|thinking|thought|chain[- ]of[- ]thought|schritt\s*\d+)\b",
+        r"\b(ich denke|let me think|i should|zuerst|danach|abschließend)\b",
+    )
+    return any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in reasoning_patterns)
 
 
 def extract_analysis(text: str) -> str | None:
@@ -343,7 +431,7 @@ def extract_analysis(text: str) -> str | None:
         return None
 
     for line in lines[start_idx + 1 :]:
-        if re.match(r"^\s*(?:META|ANTWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
+        if re.match(r"^\s*(?:META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
             break
         collected.append(line.strip())
 
