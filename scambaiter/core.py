@@ -225,7 +225,11 @@ class ScambaiterCore:
         if self.store:
             cached = self.store.image_description_get(image_hash)
             if cached and cached.description.strip():
-                return cached.description.strip()
+                cached_description = extract_image_description(cached.description)
+                if cached_description:
+                    if cached_description != cached.description:
+                        self.store.image_description_set(image_hash, cached_description)
+                    return cached_description
 
         encoded = base64.b64encode(image_bytes).decode("ascii")
         completion = self.hf_client.chat.completions.create(
@@ -239,7 +243,9 @@ class ScambaiterCore:
                             "type": "text",
                             "text": (
                                 "Beschreibe das Bild ausführlich, konkret und wohlwollend auf Deutsch. "
-                                "Nutze 2-4 Sätze mit gut beobachtbaren Details ohne Spekulationen."
+                                "Nutze 2-4 Sätze mit gut beobachtbaren Details ohne Spekulationen. "
+                                "Antworte ausschließlich im Format: BESCHREIBUNG: <dein Text>. "
+                                "Keine Analyse, keine Bulletpoints, kein Denkprozess."
                             ),
                         },
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
@@ -248,8 +254,10 @@ class ScambaiterCore:
             ],
         )
         content = completion.choices[0].message.content
-        description = _normalize_text_content(content).strip()
+        raw_description = _normalize_text_content(content).strip()
+        description = extract_image_description(raw_description)
         if not description:
+            self._debug(f"Ungültige Bildbeschreibung verworfen: {truncate_for_log(raw_description, max_len=600)}")
             return None
 
         if self.store:
@@ -450,6 +458,42 @@ def strip_wrapping_quotes(text: str) -> str:
                 changed = True
                 break
     return cleaned
+
+
+def extract_image_description(text: str) -> str | None:
+    cleaned = strip_think_segments(text)
+    marker_match = re.search(r"(?:^|\n)\s*(?:BESCHREIBUNG|DESCRIPTION)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if marker_match:
+        cleaned = marker_match.group(1).strip()
+
+    raw_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not raw_lines:
+        return None
+
+    filtered: list[str] = []
+    reject_patterns = (
+        r"^(the user wants|let me|now i need|i will|i should|draft|analysis|analyse)\b",
+        r"^(description should|bildbeschreibung|beschreibung)\b",
+        r"^(meta|antwort|reply|hinweis|note)\s*:",
+        r"^[\-•*]\s*",
+    )
+    for line in raw_lines:
+        normalized = line.strip().strip('"').strip("'")
+        if not normalized:
+            continue
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in reject_patterns):
+            continue
+        filtered.append(normalized)
+
+    if not filtered:
+        filtered = [raw_lines[-1].strip()]
+
+    description = " ".join(filtered)
+    description = re.sub(r"\s+", " ", description).strip()
+    description = strip_wrapping_quotes(description)
+    if not description or looks_like_reasoning_output(description):
+        return None
+    return description
 
 
 def extract_final_reply(text: str) -> str:
