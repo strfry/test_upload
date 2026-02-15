@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -14,6 +16,10 @@ from telethon.tl.types import DialogFilter
 from telethon.utils import get_peer_id
 
 from scambaiter.config import AppConfig
+from scambaiter.storage import AnalysisStore
+
+
+IMAGE_MARKER_PREFIX = "[Bild gesendet"
 
 SYSTEM_PROMPT = (
     "Du bist eine Scambaiting-AI in der Rolle einer potenziellen Scam-Zielperson. "
@@ -53,8 +59,9 @@ class ModelOutput:
 
 
 class ScambaiterCore:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, store: AnalysisStore | None = None) -> None:
         self.config = config
+        self.store = store
         self.client = TelegramClient(config.telegram_session, config.telegram_api_id, config.telegram_api_hash)
         self.hf_client = InferenceClient(api_key=config.hf_token, base_url=config.hf_base_url)
 
@@ -101,11 +108,9 @@ class ScambaiterCore:
             messages = await self.client.get_messages(dialog.entity, limit=self.config.history_limit)
             lines: list[str] = []
             for message in reversed(messages):
-                text = message.message or ""
-                if not text.strip():
-                    continue
-                sender = "Ich" if message.sender_id == my_id else dialog.title
-                lines.append(f"[{self._fmt_dt(message.date)}] {sender}: {text}")
+                line = await self._format_message_line(message, my_id=my_id, dialog_title=dialog.title)
+                if line:
+                    lines.append(line)
 
             if lines:
                 contexts.append(ChatContext(chat_id=dialog.id, title=dialog.title, lines=lines))
@@ -119,6 +124,66 @@ class ScambaiterCore:
             f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n\n"
             f"Chatverlauf:\n{history}"
         )
+
+    async def describe_image(self, image_bytes: bytes) -> str | None:
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        if self.store:
+            cached = self.store.image_description_get(image_hash)
+            if cached and cached.description.strip():
+                return cached.description.strip()
+
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        completion = self.hf_client.chat.completions.create(
+            model=self.config.hf_vision_model,
+            max_tokens=240,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Beschreibe das Bild ausführlich, konkret und wohlwollend auf Deutsch. "
+                                "Nutze 2-4 Sätze mit gut beobachtbaren Details ohne Spekulationen."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                    ],
+                }
+            ],
+        )
+        content = completion.choices[0].message.content
+        description = content.strip() if isinstance(content, str) else ""
+        if not description:
+            return None
+
+        if self.store:
+            self.store.image_description_set(image_hash, description)
+        return description
+
+    async def _format_message_line(self, message, my_id: int, dialog_title: str) -> str | None:
+        text = (message.message or "").strip()
+        sender = "Ich" if message.sender_id == my_id else dialog_title
+
+        if getattr(message, "photo", None) and message.sender_id != my_id:
+            marker = IMAGE_MARKER_PREFIX + "]"
+            try:
+                image_bytes = await self.client.download_media(message, file=bytes)
+                if image_bytes:
+                    description = await self.describe_image(image_bytes)
+                    if description:
+                        marker = f"{IMAGE_MARKER_PREFIX}: {description}]"
+            except Exception as exc:
+                self._debug(f"Bildbeschreibung fehlgeschlagen (msg_id={message.id}): {exc}")
+
+            if text:
+                return f"[{self._fmt_dt(message.date)}] {sender}: {marker} {text}"
+            return f"[{self._fmt_dt(message.date)}] {sender}: {marker}"
+
+        if text:
+            return f"[{self._fmt_dt(message.date)}] {sender}: {text}"
+
+        return None
 
     def generate_suggestion(self, context: ChatContext, suggestion_callback: Callable[[str], str] | None = None) -> str:
         return self.generate_output(context, suggestion_callback=suggestion_callback).suggestion

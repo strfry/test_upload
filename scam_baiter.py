@@ -51,8 +51,8 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
 
 async def run() -> None:
     config = load_config()
-    core = ScambaiterCore(config)
     store = AnalysisStore(config.analysis_db_path)
+    core = ScambaiterCore(config, store=store)
     await core.start()
     try:
         if not config.bot_token:

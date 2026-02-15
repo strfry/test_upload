@@ -11,6 +11,7 @@ class AppConfig:
     telegram_session: str
     hf_token: str
     hf_model: str
+    hf_vision_model: str
     hf_base_url: str | None
     hf_max_tokens: int
     folder_name: str
@@ -57,6 +58,7 @@ def load_config() -> AppConfig:
         telegram_session=os.getenv("TELEGRAM_SESSION", "scambaiter"),
         hf_token=require_env("HF_TOKEN"),
         hf_model=require_env("HF_MODEL"),
+        hf_vision_model=os.getenv("HF_VISION_MODEL") or require_env("HF_MODEL"),
         hf_base_url=os.getenv("HF_BASE_URL"),
         hf_max_tokens=env_int("HF_MAX_TOKENS", 350),
         folder_name=os.getenv("SCAMBAITER_FOLDER_NAME", "Scammers"),
