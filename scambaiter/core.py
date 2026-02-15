@@ -58,6 +58,22 @@ class ModelOutput:
     metadata: dict[str, str]
 
 
+def _normalize_text_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+            elif isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+        return "\n".join(parts)
+    return ""
+
+
 class ScambaiterCore:
     def __init__(self, config: AppConfig, store: AnalysisStore | None = None) -> None:
         self.config = config
@@ -153,7 +169,7 @@ class ScambaiterCore:
             ],
         )
         content = completion.choices[0].message.content
-        description = content.strip() if isinstance(content, str) else ""
+        description = _normalize_text_content(content).strip()
         if not description:
             return None
 
@@ -215,8 +231,9 @@ class ScambaiterCore:
                 {"role": "user", "content": self.build_user_prompt(context)},
             ],
         )
-        raw = completion.choices[0].message.content
-        suggestion = (suggestion_callback or extract_final_reply)(raw)
+        content = completion.choices[0].message.content
+        raw = _normalize_text_content(content)
+        suggestion = (suggestion_callback or extract_final_reply)(raw).strip()
         analysis = extract_analysis(raw)
         metadata = extract_metadata(raw)
         return ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
@@ -227,10 +244,16 @@ class ScambaiterCore:
         if self.config.send_confirm != "SEND":
             print("[WARN] SCAMBAITER_SEND aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'.")
             return False
+        if not suggestion.strip():
+            print(f"[WARN] Leerer Antwortvorschlag für {context.title} (ID: {context.chat_id}) - Nachricht wird nicht gesendet.")
+            return False
         await self.send_message_with_optional_delete(context, suggestion)
         return True
 
     async def send_message_with_optional_delete(self, context: ChatContext, message: str) -> None:
+        if not message.strip():
+            print(f"[WARN] Leere Nachricht für {context.title} (ID: {context.chat_id}) verworfen.")
+            return
         sent = await self.client.send_message(context.chat_id, message)
         print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
         if self.config.delete_after_seconds > 0:
