@@ -234,7 +234,7 @@ class ScambaiterCore:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         completion = self.hf_client.chat.completions.create(
             model=self.config.hf_vision_model,
-            max_tokens=240,
+            max_tokens=360,
             messages=[
                 {
                     "role": "user",
@@ -242,10 +242,11 @@ class ScambaiterCore:
                         {
                             "type": "text",
                             "text": (
-                                "Beschreibe das Bild ausführlich, konkret und wohlwollend auf Deutsch. "
-                                "Nutze 2-4 Sätze mit gut beobachtbaren Details ohne Spekulationen. "
-                                "Antworte ausschließlich im Format: BESCHREIBUNG: <dein Text>. "
-                                "Keine Analyse, keine Bulletpoints, kein Denkprozess."
+                                "You are an image captioning assistant. "
+                                "Return final answer only in German and only in this exact format: "
+                                "BESCHREIBUNG: <2-4 complete German sentences>. "
+                                "Use concrete observable details, keep a benevolent tone, no speculation. "
+                                "Do not include analysis, planning, bullets, or meta text."
                             ),
                         },
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
@@ -462,9 +463,16 @@ def strip_wrapping_quotes(text: str) -> str:
 
 def extract_image_description(text: str) -> str | None:
     cleaned = strip_think_segments(text)
+
+    # Prefer explicit markers if the model follows instructions.
     marker_match = re.search(r"(?:^|\n)\s*(?:BESCHREIBUNG|DESCRIPTION)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if marker_match:
         cleaned = marker_match.group(1).strip()
+
+    # If the model emits preamble + draft in one line, keep only the draft tail.
+    drafting_match = re.search(r"(?:drafting|entwurf|final(?: answer)?|beschreibung)\s*:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if drafting_match:
+        cleaned = drafting_match.group(1).strip()
 
     raw_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     if not raw_lines:
@@ -472,8 +480,8 @@ def extract_image_description(text: str) -> str | None:
 
     filtered: list[str] = []
     reject_patterns = (
-        r"^(the user wants|let me|now i need|i will|i should|draft|analysis|analyse)\b",
-        r"^(description should|bildbeschreibung|beschreibung)\b",
+        r"^(the user wants|let me|looking at the image|now i need|i will|i should|analysis|analyse|reasoning)\b",
+        r"^(description should|bildbeschreibung)\b",
         r"^(meta|antwort|reply|hinweis|note)\s*:",
         r"^[\-•*]\s*",
     )
@@ -481,12 +489,20 @@ def extract_image_description(text: str) -> str | None:
         normalized = line.strip().strip('"').strip("'")
         if not normalized:
             continue
+
+        # Drop inline reasoning lead-ins before a colon and keep trailing candidate text.
+        if re.search(r"^(looking at the image|analysis|let me|drafting|entwurf)\s*:", normalized, flags=re.IGNORECASE):
+            parts = normalized.split(":", 1)
+            normalized = parts[1].strip() if len(parts) > 1 else ""
+            if not normalized:
+                continue
+
         if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in reject_patterns):
             continue
         filtered.append(normalized)
 
     if not filtered:
-        filtered = [raw_lines[-1].strip()]
+        return None
 
     description = " ".join(filtered)
     description = re.sub(r"\s+", " ", description).strip()
