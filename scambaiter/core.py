@@ -367,7 +367,20 @@ class ScambaiterCore:
                 max_tokens=self.config.hf_max_tokens,
                 messages=messages,
             )
-            content = completion.choices[0].message.content
+            choice = completion.choices[0]
+            finish_reason = (getattr(choice, "finish_reason", None) or "").strip().lower()
+            usage = getattr(completion, "usage", None)
+            if usage is not None:
+                self._debug(f"Model-Usage (Versuch {attempt}): {usage}")
+            if finish_reason:
+                self._debug(f"Model-Finish-Reason (Versuch {attempt}): {finish_reason}")
+            if finish_reason == "length":
+                print(
+                    f"[WARN] Modellausgabe für {context.title} ({context.chat_id}) "
+                    f"wurde durch Token-Limit abgeschnitten (HF_MAX_TOKENS={self.config.hf_max_tokens})."
+                )
+
+            content = choice.message.content
             raw = _normalize_text_content(content)
             suggestion = parser(raw).strip()
             analysis = extract_analysis(raw)
