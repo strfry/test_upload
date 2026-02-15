@@ -234,7 +234,7 @@ class ScambaiterCore:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         completion = self.hf_client.chat.completions.create(
             model=self.config.hf_vision_model,
-            max_tokens=360,
+            max_tokens=720,
             messages=[
                 {
                     "role": "user",
@@ -243,8 +243,8 @@ class ScambaiterCore:
                             "type": "text",
                             "text": (
                                 "You are an image captioning assistant. "
-                                "Return final answer only in German and only in this exact format: "
-                                "BESCHREIBUNG: <2-4 complete German sentences>. "
+                                "Return final answer only in this exact format: "
+                                "DESCRIPTION: <2-4 complete sentences>. "
                                 "Use concrete observable details, keep a benevolent tone, no speculation. "
                                 "Do not include analysis, planning, bullets, or meta text."
                             ),
