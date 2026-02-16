@@ -225,9 +225,13 @@ class ScambaiterCore:
 
         return "\n".join(parts)
 
-    async def describe_recent_images_for_chat(self, chat_id: int, limit: int = 3) -> list[str]:
+    async def _collect_recent_chat_images(
+        self,
+        chat_id: int,
+        limit: int = 3,
+    ) -> list[tuple[int, str, bytes, str]]:
         messages = await self.client.get_messages(chat_id, limit=max(20, limit * 10))
-        descriptions: list[str] = []
+        images: list[tuple[int, str, bytes, str]] = []
 
         for message in messages:
             is_photo = bool(getattr(message, "photo", None))
@@ -242,15 +246,36 @@ class ScambaiterCore:
                 continue
 
             description = await self.describe_image(image_bytes)
-            if description:
-                marker = "photo" if is_photo else f"document:{mime_type}"
-                descriptions.append(
-                    f"msg_id={message.id} ({marker}): {truncate_for_log(description, max_len=300)}"
-                )
-            if len(descriptions) >= limit:
+            if not description:
+                continue
+
+            marker = "photo" if is_photo else f"document:{mime_type}"
+            images.append((int(message.id), marker, image_bytes, description))
+            if len(images) >= limit:
                 break
 
-        return descriptions
+        return images
+
+    async def describe_recent_images_for_chat(self, chat_id: int, limit: int = 3) -> list[str]:
+        images = await self._collect_recent_chat_images(chat_id, limit=limit)
+        return [
+            f"msg_id={msg_id} ({marker}): {truncate_for_log(description, max_len=300)}"
+            for msg_id, marker, _image_bytes, description in images
+        ]
+
+    async def get_recent_images_with_captions_for_control_channel(
+        self,
+        chat_id: int,
+        limit: int = 3,
+    ) -> list[tuple[bytes, str]]:
+        images = await self._collect_recent_chat_images(chat_id, limit=limit)
+        return [
+            (
+                image_bytes,
+                f"Chat {chat_id} | msg_id={msg_id} ({marker})\nCaption: {description}",
+            )
+            for msg_id, marker, image_bytes, description in images
+        ]
 
     async def describe_image(self, image_bytes: bytes) -> str | None:
         image_hash = hashlib.sha256(image_bytes).hexdigest()

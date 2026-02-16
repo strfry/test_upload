@@ -236,6 +236,7 @@ class AnalysisStore:
             )
         return known_chats
 
+
     def kv_set(self, scammer_chat_id: int, key: str, value: str) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         with self._connect() as conn:
