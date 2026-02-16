@@ -181,21 +181,56 @@ class ScambaiterCore:
 
         return ChatContext(chat_id=chat_id, title=title, lines=lines)
 
-    def build_user_prompt(self, context: ChatContext, prompt_kv_state: dict[str, str] | None = None) -> str:
-        history = "\n".join(context.lines)
-        prompt = (
-            f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id})\n\n"
-            f"Chatverlauf:\n{history}"
-        )
+    def build_conversation_messages(
+        self,
+        context: ChatContext,
+        prompt_kv_state: dict[str, str] | None = None,
+    ) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = [
+            {
+                "role": "user",
+                "content": (
+                    f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id}). "
+                    "Die folgenden Nachrichten sind chronologisch sortiert."
+                ),
+            }
+        ]
+
         if prompt_kv_state:
             kv_lines = "\n".join(f"- {key}={value}" for key, value in sorted(prompt_kv_state.items()))
-            prompt += (
-                "\n\n"
-                "System-Kontext (KV-Whitelist, nur zur internen Steuerung):\n"
-                f"{kv_lines}\n"
-                "Diese KV-Werte sind Kontext, aber nicht wortwörtlich in ANTWORT zu zitieren."
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "System-Kontext (KV-Whitelist, nur zur internen Steuerung):\n"
+                        f"{kv_lines}\n"
+                        "Diese KV-Werte sind Kontext, aber nicht wortwörtlich in ANTWORT zu zitieren."
+                    ),
+                }
             )
-        return prompt
+
+        for line in context.lines:
+            parsed = self._parse_context_line(line, context.title)
+            if parsed is None:
+                messages.append({"role": "user", "content": line})
+                continue
+            role, content = parsed
+            messages.append({"role": role, "content": content})
+
+        return messages
+
+    @staticmethod
+    def _parse_context_line(line: str, dialog_title: str) -> tuple[str, str] | None:
+        match = re.match(r"^\[(?P<dt>[^\]]+)\]\s*(?P<sender>[^:]+):\s*(?P<text>.*)$", line)
+        if not match:
+            return None
+
+        sender = match.group("sender").strip().lower()
+        role = "assistant" if sender == "ich" else "user"
+        text = match.group("text").strip()
+        dt = match.group("dt").strip()
+        speaker = "Ich" if role == "assistant" else dialog_title
+        return role, f"[{dt}] {speaker}: {text}"
 
     def build_prompt_debug_summary(self, context: ChatContext, max_lines: int = 5) -> str:
         image_lines = [line for line in context.lines if IMAGE_MARKER_PREFIX in line]
@@ -356,17 +391,16 @@ class ScambaiterCore:
         return self.generate_output(context, suggestion_callback=suggestion_callback).suggestion
 
     @staticmethod
-    def build_system_prompt(language_hint: str | None = None) -> str:
-        prompt = SYSTEM_PROMPT
+    def build_language_system_prompt(language_hint: str | None = None) -> str | None:
         if not language_hint:
-            return prompt
+            return None
 
         lang = language_hint.strip().lower()
         if lang in {"en", "english", "englisch"}:
-            return prompt + " You must respond exclusively in English."
+            return "You must respond exclusively in English."
         if lang in {"de", "deutsch", "german"}:
-            return prompt + " Du antwortest immer auf Deutsch."
-        return prompt
+            return "Du antwortest immer auf Deutsch."
+        return None
 
     def generate_output(
         self,
@@ -378,21 +412,25 @@ class ScambaiterCore:
     ) -> ModelOutput:
         parser = suggestion_callback or extract_final_reply
         last_output: ModelOutput | None = None
-        system_prompt = self.build_system_prompt(language_hint)
-        user_prompt = self.build_user_prompt(context, prompt_kv_state=prompt_kv_state)
+        language_system_prompt = self.build_language_system_prompt(language_hint)
+        conversation_messages = self.build_conversation_messages(context, prompt_kv_state=prompt_kv_state)
 
         self._debug(
             f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
         )
-        self._debug(f"System-Prompt: {truncate_for_log(system_prompt)}")
-        self._debug(f"User-Prompt: {truncate_for_log(user_prompt, max_len=3000)}")
+        self._debug(f"System-Prompt (Basis): {truncate_for_log(SYSTEM_PROMPT)}")
+        if language_system_prompt:
+            self._debug(f"System-Prompt (Sprache): {truncate_for_log(language_system_prompt)}")
+        self._debug(f"Conversation-Messages: {truncate_for_log(str(conversation_messages), max_len=3000)}")
         self._debug("Prompt-Zusammenfassung:\n" + self.build_prompt_debug_summary(context))
 
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": SYSTEM_PROMPT},
             ]
+            if language_system_prompt:
+                messages.append({"role": "system", "content": language_system_prompt})
+            messages.extend(conversation_messages)
             if attempt > 1:
                 messages.append(
                     {
@@ -732,5 +770,4 @@ def extract_metadata(text: str) -> dict[str, str]:
             metadata[key] = value
 
     return metadata
-
 
