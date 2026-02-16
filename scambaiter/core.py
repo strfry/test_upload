@@ -10,8 +10,6 @@ from datetime import datetime
 from typing import Callable
 
 
-REPLY_MARKER_PATTERN = re.compile(r"(?:ANTWORT|ANWORT|REPLY)\s*:", flags=re.IGNORECASE)
-
 MAX_GENERATION_ATTEMPTS = 2
 
 from huggingface_hub import InferenceClient
@@ -36,17 +34,19 @@ PROMPT_KV_KEYS = (
     "typ",
 )
 
-SYSTEM_PROMPT = (
-    "Du bist eine Scambaiting-AI in der Rolle einer potenziellen Scam-Zielperson. "
-    "Die andere Person im Chat kann ein Scammer sein, muss es aber nicht. Du darfst niemals selbst scammen, "
-    "betrügen, erpressen oder Social-Engineering gegen die andere Person betreiben. "
-    "Dein einziges Ziel ist, den Scammer mit plausiblen, harmlosen Antworten möglichst lange "
-    "in ein Gespräch zu verwickeln. Nutze nur den bereitgestellten Chatverlauf. "
-    "Gib die Ausgabe immer exakt in drei Zeilen aus: 'ANALYSE: ...', 'META: ...' und 'ANTWORT: ...'. "
-    "META muss ein valides JSON-Objekt sein, z.B. 'META: {\"sprache\":\"de\",\"absicht\":\"scam\"}'. "
-    "META muss mindestens die Keys 'sprache' und 'absicht' enthalten. "
-    "Vermeide KI-typische Ausgaben, insbesondere Emojis und den langen Gedankenstrich (-)."
-)
+SYSTEM_PROMPT = """Du bist eine Scambaiting-AI. Deine Rolle: Eine naive, aber freundliche potenzielle Zielperson.
+Ziel: Verwickle das Gegenüber in ein langes, harmloses Gespräch.
+Regel: Kein eigenes Scamming/Social Engineering. Nutze keine Emojis oder Gedankenstriche.
+
+Antworte AUSSCHLIESSLICH im folgenden JSON-Format:
+{
+  "analysis": "Kurze Einschätzung: Ist es ein Scammer? Worauf will er hinaus?",
+  "meta": {
+    "sprache": "de/en/...",
+    "absicht": "Einschätzung der Intention des Gegenübers"
+  },
+  "reply": "Deine Antwort-Nachricht an die Person (plausibel, alltagsnah, ohne KI-Stil)"
+}"""
 
 
 @dataclass
@@ -70,6 +70,32 @@ class ModelOutput:
     suggestion: str
     analysis: str | None
     metadata: dict[str, str]
+
+
+def parse_structured_model_output(text: str) -> ModelOutput | None:
+    cleaned = strip_think_segments(text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    reply = str(data.get("reply", "")).strip()
+    analysis_value = data.get("analysis")
+    analysis = str(analysis_value).strip() if isinstance(analysis_value, str) else None
+
+    metadata: dict[str, str] = {}
+    meta_value = data.get("meta")
+    if isinstance(meta_value, dict):
+        for key, value in meta_value.items():
+            k = str(key).strip().lower()
+            v = str(value).strip()
+            if k and v:
+                metadata[k] = v
+
+    return ModelOutput(raw=text, suggestion=reply, analysis=analysis or None, metadata=metadata)
 
 
 def _normalize_text_content(content: object) -> str:
@@ -387,8 +413,8 @@ class ScambaiterCore:
 
         return None
 
-    def generate_suggestion(self, context: ChatContext, suggestion_callback: Callable[[str], str] | None = None) -> str:
-        return self.generate_output(context, suggestion_callback=suggestion_callback).suggestion
+    def generate_suggestion(self, context: ChatContext) -> str:
+        return self.generate_output(context).suggestion
 
     @staticmethod
     def build_language_system_prompt(language_hint: str | None = None) -> str | None:
@@ -405,12 +431,10 @@ class ScambaiterCore:
     def generate_output(
         self,
         context: ChatContext,
-        suggestion_callback: Callable[[str], str] | None = None,
         language_hint: str | None = None,
         prompt_kv_state: dict[str, str] | None = None,
         on_warning: Callable[[str], None] | None = None,
     ) -> ModelOutput:
-        parser = suggestion_callback or extract_final_reply
         last_output: ModelOutput | None = None
         language_system_prompt = self.build_language_system_prompt(language_hint)
         conversation_messages = self.build_conversation_messages(context, prompt_kv_state=prompt_kv_state)
@@ -437,8 +461,8 @@ class ScambaiterCore:
                         "role": "user",
                         "content": (
                             "Deine letzte Antwort war nicht sendefertig. "
-                            "Gib jetzt nur eine einzige natürliche Telegram-Nachricht aus, "
-                            "ohne Analyse, ohne Meta, ohne Denkprozess."
+                            "Gib jetzt ausschließlich ein valides JSON-Objekt zurück "
+                            "mit den Feldern analysis, meta und reply. Keine Zusatztexte."
                         ),
                     }
                 )
@@ -449,6 +473,7 @@ class ScambaiterCore:
                 model=self.config.hf_model,
                 max_tokens=self.config.hf_max_tokens,
                 messages=messages,
+                response_format={"type": "json_object"},
             )
             choice = completion.choices[0]
             finish_reason = (getattr(choice, "finish_reason", None) or "").strip().lower()
@@ -468,17 +493,20 @@ class ScambaiterCore:
 
             content = choice.message.content
             raw = _normalize_text_content(content)
-            suggestion = parser(raw).strip()
-            analysis = extract_analysis(raw)
-            metadata = extract_metadata(raw)
+            structured = parse_structured_model_output(raw)
+            if structured is None:
+                print(
+                    f"[WARN] Keine valide JSON-Ausgabe für {context.title} ({context.chat_id}) in Versuch {attempt}."
+                )
+                last_output = ModelOutput(raw=raw, suggestion="", analysis=None, metadata={})
+                continue
+
+            suggestion = structured.suggestion.strip()
+            analysis = structured.analysis
+            metadata = structured.metadata
 
             self._debug(f"Model-Raw-Ausgabe (Versuch {attempt}) für {context.title} ({context.chat_id}): {raw}")
             self._debug(f"Extrahierte Antwort (Versuch {attempt}) für {context.title} ({context.chat_id}): {suggestion}")
-            if not has_explicit_reply_marker(raw):
-                print(
-                    f"[WARN] Kein ANTWORT/REPLY-Marker in Modellausgabe für {context.title} ({context.chat_id}) "
-                    f"(Versuch {attempt})."
-                )
 
             current_output = ModelOutput(
                 raw=raw,
@@ -495,7 +523,8 @@ class ScambaiterCore:
                 f"({context.chat_id}) in Versuch {attempt}: {suggestion}"
             )
 
-        assert last_output is not None
+        if last_output is None:
+            return ModelOutput(raw="", suggestion="", analysis=None, metadata={})
         return last_output
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
@@ -630,67 +659,6 @@ def extract_image_description(text: str) -> str | None:
     return description
 
 
-def extract_final_reply(text: str) -> str:
-    cleaned = strip_think_segments(text)
-    match = re.search(r"(?:ANTWORT|ANWORT|REPLY)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if match:
-        reply = match.group(1).strip()
-        reply = re.split(
-            r"\n(?:ANALYSE|HINWEIS|NOTE|META|ANTWORT|ANWORT|REPLY)\s*:",
-            reply,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-        return strip_wrapping_quotes(reply)
-
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    if not lines:
-        return ""
-
-    section_header = re.compile(
-        r"^\s*(ANALYSE|HINWEIS|NOTE|GEDANKE|THOUGHT|META|ANTWORT|ANWORT|REPLY)\s*:\s*(.*)$",
-        flags=re.IGNORECASE,
-    )
-    reply_sections = {"antwort", "anwort", "reply"}
-    current_section: str | None = None
-    reply_lines: list[str] = []
-    unsectioned_lines: list[str] = []
-
-    for line in lines:
-        header_match = section_header.match(line)
-        if header_match:
-            current_section = header_match.group(1).strip().lower()
-            trailing = header_match.group(2).strip()
-            if current_section in reply_sections and trailing:
-                reply_lines.append(trailing)
-            continue
-
-        if current_section in reply_sections:
-            reply_lines.append(line)
-        elif current_section is None:
-            unsectioned_lines.append(line)
-
-    if reply_lines:
-        return strip_wrapping_quotes("\n".join(reply_lines).strip())
-
-    if not unsectioned_lines:
-        return ""
-
-    # Drop boilerplate lead-ins if the model omitted explicit markers.
-    leadin_pattern = re.compile(
-        r"^(hier ist|here is|antwort|reply|finale?\s+antwort|final\s+answer)\b",
-        flags=re.IGNORECASE,
-    )
-    filtered_unsectioned = [line for line in unsectioned_lines if not leadin_pattern.match(line)]
-    candidate_lines = filtered_unsectioned or unsectioned_lines
-    return strip_wrapping_quotes("\n".join(candidate_lines).strip())
-
-
-
-
-def has_explicit_reply_marker(text: str) -> bool:
-    return REPLY_MARKER_PATTERN.search(strip_think_segments(text)) is not None
-
 
 def looks_like_reasoning_output(text: str) -> bool:
     stripped = text.strip().lower()
@@ -703,71 +671,3 @@ def looks_like_reasoning_output(text: str) -> bool:
         r"^(let me think|i should|zuerst|first|danach|then|abschließend|finally)\b",
     )
     return any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in reasoning_patterns)
-
-
-def extract_analysis(text: str) -> str | None:
-    cleaned = strip_think_segments(text)
-    lines = cleaned.splitlines()
-    start_idx: int | None = None
-    collected: list[str] = []
-
-    for idx, line in enumerate(lines):
-        match = re.match(r"^\s*ANALYSE\s*:\s*(.*)$", line, flags=re.IGNORECASE)
-        if match:
-            start_idx = idx
-            first = match.group(1).strip()
-            if first:
-                collected.append(first)
-            break
-
-    if start_idx is None:
-        return None
-
-    for line in lines[start_idx + 1 :]:
-        if re.match(r"^\s*(?:META|ANTWORT|ANWORT|REPLY)\s*:", line, flags=re.IGNORECASE):
-            break
-        collected.append(line.strip())
-
-    analysis = "\n".join(part for part in collected if part).strip()
-    analysis = analysis.strip()
-    return analysis or None
-
-
-def extract_metadata(text: str) -> dict[str, str]:
-    cleaned = strip_think_segments(text)
-    metadata: dict[str, str] = {}
-
-    meta_line: str | None = None
-    for line in cleaned.splitlines():
-        line_match = re.match(r"^\s*META\s*:\s*(.*)$", line, flags=re.IGNORECASE)
-        if line_match:
-            meta_line = line_match.group(1).strip()
-            break
-
-    if not meta_line:
-        return metadata
-
-    if meta_line.startswith("{") and meta_line.endswith("}"):
-        try:
-            data = json.loads(meta_line)
-            if isinstance(data, dict):
-                for key, value in data.items():
-                    k = str(key).strip().lower()
-                    v = str(value).strip()
-                    if k and v:
-                        metadata[k] = v
-                return metadata
-        except json.JSONDecodeError:
-            pass
-
-    for part in meta_line.split(";"):
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        key = key.strip().lower()
-        value = value.strip()
-        if key and value:
-            metadata[key] = value
-
-    return metadata
-
