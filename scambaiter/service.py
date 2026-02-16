@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Callable
 
+PendingListener = Callable[[int, "PendingMessage | None"], None]
+
 from scambaiter.core import PROMPT_KV_KEYS, ChatContext, ScambaiterCore, SuggestionResult
 from scambaiter.storage import AnalysisStore
 
@@ -67,6 +69,18 @@ class BackgroundService:
         self._startup_task: asyncio.Task | None = None
         self._known_chats: dict[int, KnownChatEntry] = {}
         self._chat_auto_enabled: set[int] = set()
+        self._pending_listeners: list[PendingListener] = []
+
+    def add_pending_listener(self, listener: PendingListener) -> None:
+        self._pending_listeners.append(listener)
+
+    def _notify_pending_changed(self, chat_id: int) -> None:
+        pending = self._pending_messages.get(chat_id)
+        for listener in list(self._pending_listeners):
+            try:
+                listener(chat_id, pending)
+            except Exception as exc:
+                print(f"[WARN] Pending-Listener fehlgeschlagen für Chat {chat_id}: {exc}")
 
     def list_known_chats(self, limit: int = 50) -> list[KnownChatEntry]:
         items = sorted(self._known_chats.values(), key=lambda item: item.updated_at, reverse=True)
@@ -175,7 +189,6 @@ class BackgroundService:
                     MessageState.GENERATING,
                     MessageState.WAITING,
                     MessageState.SENDING_TYPING,
-                    MessageState.SENT,
                 }:
                     continue
                 await self.schedule_suggestion_generation(
@@ -199,7 +212,7 @@ class BackgroundService:
             return False
 
         existing = self._pending_messages.get(chat_id)
-        if existing and existing.state in {MessageState.WAITING, MessageState.SENDING_TYPING, MessageState.SENT}:
+        if existing and existing.state in {MessageState.WAITING, MessageState.SENDING_TYPING}:
             return False
 
         now = datetime.now()
@@ -212,6 +225,7 @@ class BackgroundService:
             wait_until=None,
             trigger=trigger,
         )
+        self._notify_pending_changed(chat_id)
         task = asyncio.create_task(self._generate_single_chat(chat_id, trigger=trigger, auto_send=auto_send))
         self._chat_tasks[chat_id] = task
         return True
@@ -224,6 +238,7 @@ class BackgroundService:
                 if pending:
                     pending.state = MessageState.ERROR
                     pending.last_error = "Kein Chatkontext verfügbar."
+                    self._notify_pending_changed(chat_id)
                 return
 
             result = await self._generate_for_contexts([context], on_warning=None, trigger=trigger)
@@ -237,6 +252,7 @@ class BackgroundService:
             if pending:
                 pending.state = MessageState.ERROR
                 pending.last_error = str(exc)
+                self._notify_pending_changed(chat_id)
         finally:
             task = self._chat_tasks.get(chat_id)
             if task is asyncio.current_task():
@@ -311,6 +327,7 @@ class BackgroundService:
 
             delay = max(0.0, (pending.wait_until - datetime.now()).total_seconds())
             await asyncio.sleep(delay)
+            await self.core.client.send_read_acknowledge(chat_id)
             await self.trigger_send(chat_id, trigger="auto-timeout")
         except asyncio.CancelledError:
             raise
@@ -342,6 +359,7 @@ class BackgroundService:
             trigger=trigger,
             send_requested=bool(previous and previous.send_requested),
         )
+        self._notify_pending_changed(context.chat_id)
         self._start_waiting_task(context.chat_id)
 
     async def _process_due_messages(self) -> int:
@@ -362,6 +380,7 @@ class BackgroundService:
         if pending.state == MessageState.GENERATING:
             pending.trigger = trigger
             pending.send_requested = True
+            self._notify_pending_changed(chat_id)
             return True
 
         if pending.state not in {MessageState.WAITING, MessageState.ERROR}:
@@ -370,6 +389,7 @@ class BackgroundService:
         self._cancel_chat_task(chat_id)
         pending.state = MessageState.SENDING_TYPING
         pending.trigger = trigger
+        self._notify_pending_changed(chat_id)
         task = asyncio.create_task(self._send_flow(chat_id))
         self._chat_tasks[chat_id] = task
         return True
@@ -382,10 +402,12 @@ class BackgroundService:
             if not pending.suggestion.strip():
                 pending.state = MessageState.ERROR
                 pending.last_error = "Leerer Antwortvorschlag."
+                self._notify_pending_changed(chat_id)
                 return
             if not self.core.config.send_enabled or self.core.config.send_confirm != "SEND":
                 pending.state = MessageState.ERROR
                 pending.last_error = "Senden deaktiviert (SCAMBAITER_SEND/SCAMBAITER_SEND_CONFIRM)."
+                self._notify_pending_changed(chat_id)
                 return
 
             async with self.core.client.action(chat_id, "typing"):
@@ -394,11 +416,13 @@ class BackgroundService:
             sent = await self.core.client.send_message(chat_id, pending.suggestion)
             pending.sent_message_id = sent.id
             pending.state = MessageState.SENT
+            self._notify_pending_changed(chat_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             pending.state = MessageState.ERROR
             pending.last_error = str(exc)
+            self._notify_pending_changed(chat_id)
         finally:
             task = self._chat_tasks.get(chat_id)
             if task is asyncio.current_task():
@@ -418,6 +442,7 @@ class BackgroundService:
             except asyncio.CancelledError:
                 pass
             pending.state = MessageState.CANCELLED
+            self._notify_pending_changed(chat_id)
             if previous_state == MessageState.GENERATING:
                 return "Vorschlagserzeugung wurde abgebrochen."
             if previous_state == MessageState.WAITING:
@@ -427,10 +452,12 @@ class BackgroundService:
         if pending.sent_message_id is not None:
             await self.core.client.delete_messages(chat_id, [pending.sent_message_id])
             pending.state = MessageState.CANCELLED
+            self._notify_pending_changed(chat_id)
             return f"Gesendete Nachricht {pending.sent_message_id} wurde gelöscht."
 
         if pending.state in {MessageState.WAITING, MessageState.GENERATING}:
             pending.state = MessageState.CANCELLED
+            self._notify_pending_changed(chat_id)
             return "Warte-/Generierungsphase beendet. Nachricht wird nicht gesendet."
 
         return "Kein laufender oder sendbarer Vorgang vorhanden."
@@ -472,6 +499,7 @@ class BackgroundService:
             return
 
         pending.wait_until = datetime.now() + timedelta(seconds=self.interval_seconds) if enabled else None
+        self._notify_pending_changed(chat_id)
         self._start_waiting_task(chat_id)
 
     async def shutdown(self) -> None:

@@ -30,6 +30,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         "scam-verdacht": "Scam-Verdacht",
         "typ": "Typ",
     }
+    infobox_targets: dict[int, set[tuple[int, int]]] = {}
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -161,6 +162,61 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if pending and pending.suggestion:
             lines.append("Vorschlag: " + pending.suggestion)
         return "\n".join(lines)
+
+    async def _register_infobox_target(query, chat_id: int) -> None:
+        message = getattr(query, "message", None)
+        if not message:
+            return
+
+        new_target = (int(message.chat_id), int(message.message_id))
+        previous_targets = infobox_targets.get(chat_id, set())
+        stale_targets = [target for target in previous_targets if target != new_target]
+
+        for stale_chat_id, stale_message_id in stale_targets:
+            try:
+                await app.bot.delete_message(chat_id=stale_chat_id, message_id=stale_message_id)
+            except BadRequest as exc:
+                error_text = str(exc).lower()
+                if "message to delete not found" in error_text or "message can't be deleted" in error_text:
+                    continue
+                raise
+
+        infobox_targets[chat_id] = {new_target}
+
+    async def _push_infobox_update(chat_id: int, heading: str = "ℹ️ Prozess-Update") -> None:
+        targets = infobox_targets.get(chat_id)
+        if not targets:
+            return
+        stale: set[tuple[int, int]] = set()
+        text = _build_process_infobox(chat_id, heading)
+        reply_markup = _chat_actions_keyboard(chat_id)
+        for target_chat_id, target_message_id in list(targets):
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=target_chat_id,
+                    message_id=target_message_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                )
+            except BadRequest as exc:
+                message = str(exc).lower()
+                if "message is not modified" in message:
+                    continue
+                if "message to edit not found" in message or "message can't be edited" in message:
+                    stale.add((target_chat_id, target_message_id))
+                    continue
+                raise
+        for target in stale:
+            targets.discard(target)
+        if not targets:
+            infobox_targets.pop(chat_id, None)
+
+    def _on_pending_changed(event_chat_id: int, _pending: PendingMessage | None) -> None:
+        if event_chat_id not in infobox_targets:
+            return
+        app.create_task(_push_infobox_update(event_chat_id), update=None)
+
+    service.add_pending_listener(_on_pending_changed)
 
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -309,6 +365,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 ),
                 reply_markup=keyboard,
             )
+            await _register_infobox_target(query, chat_id)
             return
 
         if action == "autoon":
@@ -318,6 +375,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 _build_process_infobox(chat_id, "▶️ Auto-Senden für diesen Chat aktiviert."),
                 reply_markup=keyboard,
             )
+            await _register_infobox_target(query, chat_id)
             return
 
         if action == "autooff":
@@ -343,6 +401,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 _build_process_infobox(chat_id, "▶️ Senden ausgelöst (oder nach Generierung vorgemerkt)."),
                 reply_markup=keyboard,
             )
+            await _register_infobox_target(query, chat_id)
             return
 
         if action == "stop":
