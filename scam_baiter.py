@@ -68,12 +68,7 @@ async def run() -> None:
             return
 
         service = BackgroundService(core, interval_seconds=config.auto_interval_seconds, store=store)
-        try:
-            initial_scanned = await service.scan_folder(force=False)
-            if initial_scanned:
-                print(f"Initialer Ordner-Scan: {initial_scanned} Vorschlaege erzeugt.")
-        except Exception as exc:
-            print(f"[WARN] Initialer Ordner-Scan fehlgeschlagen: {exc}")
+        service.start_startup_bootstrap()
         bot_me = await Bot(config.bot_token).get_me()
         control_chat_id = await core.resolve_control_chat_id(bot_me.username)
         bot_app = create_bot_app(

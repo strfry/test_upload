@@ -62,7 +62,7 @@ python scam_baiter.py
 Hinweis: Der Control-Chat wird beim Start automatisch über die Telegram-App-API ermittelt. Dazu wird ein Dialog mit dem Bot-Username gesucht; wenn gefunden, wird die eigene User-ID als erlaubter Bot-Chat verwendet. Wenn kein Dialog gefunden wird, bricht der Start mit Fehler ab.
 
 Beim Start sendet der Bot außerdem automatisch eine Begrüßungs-/Befehlsübersicht in diesen erlaubten Chat.
-Beim Start im BotAPI-Modus wird einmalig ein Ordner-Scan ausgeführt, um fehlende Vorschläge vorzubelegen.
+Beim Start im BotAPI-Modus wird der Ordner asynchron über die Telegram-API eingelesen; Vorschlagsgenerierung läuft dabei separat im Hintergrund.
 
 Verfügbare Bot-Kommandos:
 

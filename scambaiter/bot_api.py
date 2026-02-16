@@ -212,25 +212,23 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
         await _guarded_reply(update, "Starte Ordner-Scan für unbeantwortete Chats...")
         created = await service.scan_folder(force=False)
-        await _guarded_reply(update, f"Scan abgeschlossen. Neue Vorschlaege: {created}")
+        known_count = len(service.list_known_chats(limit=500))
+        await _guarded_reply(update, f"Scan abgeschlossen. Neue Vorschlaege: {created}, bekannte Chats im Ordner: {known_count}")
 
     async def chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
-        if not service.store:
-            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
-            return
 
-        known_chats = service.store.list_known_chats(limit=50)
+        known_chats = service.list_known_chats(limit=50)
         if not known_chats:
-            created = await service.scan_folder(force=False)
-            known_chats = service.store.list_known_chats(limit=50)
+            await service.refresh_known_chats_from_folder()
+            known_chats = service.list_known_chats(limit=50)
             if not known_chats:
-                await _guarded_reply(update, "Keine Chats in der Datenbank gefunden.")
+                await _guarded_reply(update, "Keine Chats im konfigurierten Ordner gefunden.")
                 return
-            await _guarded_reply(update, f"Initialer Scan abgeschlossen. Neue Vorschlaege: {created}")
 
         service.start_unanswered_prefetch()
+        service.start_known_chats_refresh()
 
         for item in known_chats:
             kv_data: dict[str, str] = {}

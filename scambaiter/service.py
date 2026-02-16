@@ -42,6 +42,14 @@ class PendingMessage:
     send_requested: bool = False
 
 
+
+
+@dataclass
+class KnownChatEntry:
+    chat_id: int
+    title: str
+    updated_at: datetime
+
 class BackgroundService:
     def __init__(self, core: ScambaiterCore, interval_seconds: int, store: AnalysisStore | None = None) -> None:
         self.core = core
@@ -55,18 +63,56 @@ class BackgroundService:
         # Pro Chat gibt es genau einen aktiven Hintergrundtask (generating ODER sending).
         self._chat_tasks: dict[int, asyncio.Task] = {}
         self._unanswered_prefetch_task: asyncio.Task | None = None
+        self._known_chats_refresh_task: asyncio.Task | None = None
+        self._startup_task: asyncio.Task | None = None
+        self._known_chats: dict[int, KnownChatEntry] = {}
         self._chat_auto_enabled: set[int] = set()
 
+    def list_known_chats(self, limit: int = 50) -> list[KnownChatEntry]:
+        items = sorted(self._known_chats.values(), key=lambda item: item.updated_at, reverse=True)
+        return items[:limit]
+
+    async def refresh_known_chats_from_folder(self) -> int:
+        async with self._run_lock:
+            folder_chat_ids = await self.core.get_folder_chat_ids()
+            now = datetime.now()
+            async for dialog in self.core.client.iter_dialogs():
+                if dialog.id not in folder_chat_ids:
+                    continue
+                updated_at = getattr(getattr(dialog, "message", None), "date", None) or now
+                self._known_chats[dialog.id] = KnownChatEntry(
+                    chat_id=int(dialog.id),
+                    title=str(dialog.title),
+                    updated_at=updated_at,
+                )
+            return len(self._known_chats)
+
+    def start_known_chats_refresh(self) -> bool:
+        if self._known_chats_refresh_task and not self._known_chats_refresh_task.done():
+            return False
+        self._known_chats_refresh_task = asyncio.create_task(self.refresh_known_chats_from_folder())
+        return True
+
+    def start_startup_bootstrap(self) -> bool:
+        if self._startup_task and not self._startup_task.done():
+            return False
+
+        async def _bootstrap() -> None:
+            try:
+                await self.refresh_known_chats_from_folder()
+                self.start_unanswered_prefetch()
+            except Exception as exc:
+                print(f"[WARN] Startup-Bootstrap fehlgeschlagen: {exc}")
+
+        self._startup_task = asyncio.create_task(_bootstrap())
+        return True
+
     async def scan_folder(self, force: bool = False) -> int:
-        """Scan folder chats, register known chats, and create suggestions for unanswered ones."""
+        """Scan folder chats, include answered chats in known list, generate unanswered suggestions."""
+        await self.refresh_known_chats_from_folder()
         async with self._run_lock:
             folder_chat_ids = await self.core.get_folder_chat_ids()
             unanswered_contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
-            for chat_id in folder_chat_ids:
-                title = await self._resolve_chat_title(chat_id)
-                if self.store:
-                    self.store.upsert_known_chat(chat_id, title)
-
             contexts_to_generate = list(unanswered_contexts)
             if not force:
                 contexts_to_generate = [
@@ -78,16 +124,6 @@ class BackgroundService:
             results = await self._generate_for_contexts(contexts_to_generate, on_warning=None, trigger="manual-scan")
             self.last_results = results + self.last_results
             return len(results)
-
-    async def _resolve_chat_title(self, chat_id: int) -> str:
-        try:
-            entity = await self.core.client.get_entity(chat_id)
-            title = getattr(entity, "title", None) or getattr(entity, "first_name", None)
-            if title:
-                return str(title)
-        except Exception:
-            pass
-        return str(chat_id)
 
 
     async def run_once(
@@ -439,6 +475,22 @@ class BackgroundService:
         self._start_waiting_task(chat_id)
 
     async def shutdown(self) -> None:
+        if self._startup_task and not self._startup_task.done():
+            self._startup_task.cancel()
+            try:
+                await self._startup_task
+            except asyncio.CancelledError:
+                pass
+            self._startup_task = None
+
+        if self._known_chats_refresh_task and not self._known_chats_refresh_task.done():
+            self._known_chats_refresh_task.cancel()
+            try:
+                await self._known_chats_refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._known_chats_refresh_task = None
+
         if self._unanswered_prefetch_task and not self._unanswered_prefetch_task.done():
             self._unanswered_prefetch_task.cancel()
             try:

@@ -83,15 +83,6 @@ class AnalysisStore:
                 )
                 """
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS known_chats (
-                    chat_id INTEGER PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
@@ -213,39 +204,21 @@ class AnalysisStore:
                     SELECT k.scammer_chat_id AS chat_id, MAX(k.updated_at) AS updated_at
                     FROM key_values_by_scammer k
                     GROUP BY k.scammer_chat_id
-                ),
-                known AS (
-                    SELECT kc.chat_id, kc.title, kc.updated_at FROM known_chats kc
-
-                    UNION ALL
-
-                    SELECT la.chat_id,
-                           la.title,
-                           COALESCE(lk.updated_at, la.updated_at) AS updated_at
-                    FROM latest_analyses la
-                    LEFT JOIN latest_kv lk ON lk.chat_id = la.chat_id
-
-                    UNION ALL
-
-                    SELECT lk.chat_id,
-                           CAST(lk.chat_id AS TEXT) AS title,
-                           lk.updated_at
-                    FROM latest_kv lk
-                    WHERE lk.chat_id NOT IN (SELECT chat_id FROM latest_analyses)
-                ),
-                ranked AS (
-                    SELECT chat_id,
-                           title,
-                           updated_at,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY chat_id
-                               ORDER BY updated_at DESC
-                           ) AS rn
-                    FROM known
                 )
-                SELECT chat_id, title, updated_at
-                FROM ranked
-                WHERE rn = 1
+                SELECT la.chat_id,
+                       la.title,
+                       COALESCE(lk.updated_at, la.updated_at) AS updated_at
+                FROM latest_analyses la
+                LEFT JOIN latest_kv lk ON lk.chat_id = la.chat_id
+
+                UNION ALL
+
+                SELECT lk.chat_id,
+                       CAST(lk.chat_id AS TEXT) AS title,
+                       lk.updated_at
+                FROM latest_kv lk
+                WHERE lk.chat_id NOT IN (SELECT chat_id FROM latest_analyses)
+
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
@@ -263,17 +236,6 @@ class AnalysisStore:
             )
         return known_chats
 
-    def upsert_known_chat(self, chat_id: int, title: str) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO known_chats (chat_id, title, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, updated_at=excluded.updated_at
-                """,
-                (chat_id, title, now),
-            )
 
     def kv_set(self, scammer_chat_id: int, key: str, value: str) -> None:
         now = datetime.now().isoformat(timespec="seconds")
