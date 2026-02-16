@@ -154,6 +154,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         lines.append(f"Trigger: {pending.trigger}")
         return "\n".join(lines)
 
+    def _build_process_infobox(chat_id: int, heading: str) -> str:
+        pending = service.get_pending_message(chat_id)
+        lines = [heading, f"Chat-ID: {chat_id}", f"Auto-Senden: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}"]
+        lines.append(_format_pending_state(pending))
+        if pending and pending.suggestion:
+            lines.append("Vorschlag: " + pending.suggestion)
+        return "\n".join(lines)
+
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
@@ -291,16 +299,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 return
 
             warning_line = f"\n⚠️ {runtime_warnings[-1]}" if runtime_warnings else ""
-            pending_state = _format_pending_state(service.get_pending_message(chat_id))
+            info = _build_process_infobox(chat_id, "✅ Generierung abgeschlossen")
             await _safe_edit_message(
                 query,
                 (
-                    f"{base_text}\n\n"
-                    "✅ Generierung abgeschlossen\n"
+                    f"{info}\n"
                     f"Chats: {summary.chat_count}\n"
                     f"Gesendet: {summary.sent_count}\n"
-                    f"Zeit: {summary.finished_at:%Y-%m-%d %H:%M:%S}\n\n"
-                    f"{pending_state}"
+                    f"Zeit: {summary.finished_at:%Y-%m-%d %H:%M:%S}"
                     f"{warning_line}"
                 ),
                 reply_markup=keyboard,
@@ -311,7 +317,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             service.set_chat_auto(chat_id, enabled=True)
             await _safe_edit_message(
                 query,
-                f"Chat {chat_id}\n\n▶️ Auto-Senden für diesen Chat aktiviert.\n{_format_pending_state(service.get_pending_message(chat_id))}",
+                _build_process_infobox(chat_id, "▶️ Auto-Senden für diesen Chat aktiviert."),
                 reply_markup=keyboard,
             )
             return
@@ -320,7 +326,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             service.set_chat_auto(chat_id, enabled=False)
             await _safe_edit_message(
                 query,
-                f"Chat {chat_id}\n\n⏸ Auto-Senden für diesen Chat deaktiviert.\n{_format_pending_state(service.get_pending_message(chat_id))}",
+                _build_process_infobox(chat_id, "⏸ Auto-Senden für diesen Chat deaktiviert."),
                 reply_markup=keyboard,
             )
             return
@@ -330,13 +336,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             if not started:
                 await _safe_edit_message(
                     query,
-                    f"Chat {chat_id}\n\n⚠️ Kein sendbarer Zustand vorhanden.\n{_format_pending_state(service.get_pending_message(chat_id))}",
+                    _build_process_infobox(chat_id, "⚠️ Kein sendbarer Zustand vorhanden."),
                     reply_markup=keyboard,
                 )
                 return
             await _safe_edit_message(
                 query,
-                f"Chat {chat_id}\n\n▶️ Senden ausgelöst (oder nach Generierung vorgemerkt).\n{_format_pending_state(service.get_pending_message(chat_id))}",
+                _build_process_infobox(chat_id, "▶️ Senden ausgelöst (oder nach Generierung vorgemerkt)."),
                 reply_markup=keyboard,
             )
             return
@@ -345,7 +351,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             result = await service.abort_send(chat_id)
             await _safe_edit_message(
                 query,
-                f"Chat {chat_id}\n\n⏹ {result}\n{_format_pending_state(service.get_pending_message(chat_id))}",
+                _build_process_infobox(chat_id, f"⏹ {result}"),
                 reply_markup=keyboard,
             )
             return
