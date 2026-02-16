@@ -68,6 +68,12 @@ async def run() -> None:
             return
 
         service = BackgroundService(core, interval_seconds=config.auto_interval_seconds, store=store)
+        try:
+            initial_scanned = await service.scan_folder(force=False)
+            if initial_scanned:
+                print(f"Initialer Ordner-Scan: {initial_scanned} Vorschlaege erzeugt.")
+        except Exception as exc:
+            print(f"[WARN] Initialer Ordner-Scan fehlgeschlagen: {exc}")
         bot_me = await Bot(config.bot_token).get_me()
         control_chat_id = await core.resolve_control_chat_id(bot_me.username)
         bot_app = create_bot_app(
@@ -77,7 +83,7 @@ async def run() -> None:
         )
         print(
             "BotAPI aktiv. verfügbare Kommandos: "
-            "/status /runonce /chats /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
+            "/status /runonce /scan /chats /last /history /kvset /kvget /kvdel /kvlist"
         )
         await bot_app.initialize()
         await bot_app.start()
@@ -86,14 +92,14 @@ async def run() -> None:
             chat_id=control_chat_id,
             text=(
                 "Scambaiter Bot gestartet.\n"
-                "Kommandos: /status /runonce /chats /startauto /stopauto /last /history /kvset /kvget /kvdel /kvlist"
+                "Kommandos: /status /runonce /scan /chats /last /history /kvset /kvget /kvdel /kvlist"
             ),
         )
         try:
             while True:
                 await asyncio.sleep(3600)
         finally:
-            await service.stop_auto()
+            await service.shutdown()
             await bot_app.updater.stop()
             await bot_app.stop()
             await bot_app.shutdown()

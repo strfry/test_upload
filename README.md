@@ -62,15 +62,24 @@ python scam_baiter.py
 Hinweis: Der Control-Chat wird beim Start automatisch über die Telegram-App-API ermittelt. Dazu wird ein Dialog mit dem Bot-Username gesucht; wenn gefunden, wird die eigene User-ID als erlaubter Bot-Chat verwendet. Wenn kein Dialog gefunden wird, bricht der Start mit Fehler ab.
 
 Beim Start sendet der Bot außerdem automatisch eine Begrüßungs-/Befehlsübersicht in diesen erlaubten Chat.
+Beim Start im BotAPI-Modus wird einmalig ein Ordner-Scan ausgeführt, um fehlende Vorschläge vorzubelegen.
 
 Verfügbare Bot-Kommandos:
 
-- `/status` – zeigt Auto-Status und letzten Lauf
+- `/status` – zeigt den letzten Lauf und die Anzahl aktiver Nachrichtenprozesse
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
-- `/chats` – zeigt klickbare Buttons für Chats aus der DB für Einzellauf (`run:<chat_id>`) oder KV-Anzeige (`kv:<chat_id>`)
-- `/startauto` – startet den Auto-Modus
-- `/stopauto` – stoppt den Auto-Modus
+- `/scan` – scannt den konfigurierten Ordner und erzeugt fehlende Vorschläge für unbeantwortete Chats
+- `/chats` – zeigt klickbare Buttons pro Chat: `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `KV`
+  - **Generate** erzeugt immer einen neuen Antwort-Vorschlag und setzt den Nachrichtenprozess auf **Wartephase**
+  - Die Chat-Übersicht zeigt den aktuellen Vorschlag direkt pro Chat an
+  - Fehlt ein Vorschlag, wird der Chat sofort angezeigt und der Status `Vorschlag wird erzeugt` eingeblendet
+  - **Send** löst das Senden aus (manueller Trigger)
+  - **Stop** bricht den laufenden Prozess ab; falls die Nachricht bereits versendet wurde, wird sie gelöscht
+  - **Auto an** aktiviert das automatische Senden nach Wartezeit nur für diesen Chat
+  - **Auto aus** deaktiviert das automatische Senden für diesen Chat (Wartephase bleibt unbegrenzt)
+  - **Bilder** postet die letzten Chat-Bilder mit KI-Caption in den Kontrollkanal
+  - Mit **Auto an** läuft die Wartephase dieses Chats mit Timeout (`SCAMBAITER_AUTO_INTERVAL_SECONDS`), mit **Auto aus** unbegrenzt
 - `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick
 - `/history` – zeigt die letzten persistent gespeicherten Analysen inkl. Metadaten (lange Ausgaben werden in mehrere Nachrichten aufgeteilt)
 - `/kvset <scammer_chat_id> <key> <value>` – setzt/überschreibt einen Key für einen Scammer
@@ -93,3 +102,14 @@ Zur Trennung der Concerns wurde der Code aufgeteilt:
 - `scambaiter/service.py`: Hintergrund-Loop + Laufstatus
 - `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos
 - `scambaiter/storage.py`: SQLite-Persistenz für Analysen + Scammer-spezifischen Key-Value-Store
+
+
+- Für unbeantwortete Chats wird beim Öffnen von `/chats` asynchron ein Vorschlag vorgezogen, damit die Chatliste sofort erscheint.
+
+Nachrichtenzustände im BotInterface:
+- `generating`: Vorschlag wird gerade erzeugt
+- `waiting`: Vorschlag erzeugt, wartet auf manuellen Send-Trigger oder Auto-Timeout
+- `sending_typing`: Senden läuft, inkl. Tippbenachrichtigung
+- `sent`: Nachricht wurde gesendet
+- `cancelled`: Vorgang per Stop abgebrochen (inkl. ggf. Löschung beim Empfänger)
+- `error`: Senden fehlgeschlagen oder nicht möglich
