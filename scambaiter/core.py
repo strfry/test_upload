@@ -138,16 +138,13 @@ class ScambaiterCore:
 
         raise ValueError(f'Telegram-Ordner "{self.config.folder_name}" wurde nicht gefunden.')
 
-    async def collect_unanswered_chats(self, folder_chat_ids: set[int]) -> list[ChatContext]:
+    async def collect_folder_chats(self, folder_chat_ids: set[int]) -> list[ChatContext]:
         me = await self.client.get_me()
         my_id = me.id
         contexts: list[ChatContext] = []
 
         async for dialog in self.client.iter_dialogs():
             if dialog.id not in folder_chat_ids or dialog.message is None:
-                continue
-
-            if getattr(dialog.message, "sender_id", None) == my_id:
                 continue
 
             messages = await self.client.get_messages(dialog.entity, limit=self.config.history_limit)
@@ -160,7 +157,7 @@ class ScambaiterCore:
             if lines:
                 contexts.append(ChatContext(chat_id=dialog.id, title=dialog.title, lines=lines))
 
-        self._debug(f"Unbeantwortete Chats gefunden: {len(contexts)}")
+        self._debug(f"Chats im Ordner gefunden: {len(contexts)}")
         return contexts
 
     async def build_chat_context(self, chat_id: int) -> ChatContext | None:

@@ -64,7 +64,7 @@ class BackgroundService:
         self._pending_messages: dict[int, PendingMessage] = {}
         # Pro Chat gibt es genau einen aktiven Hintergrundtask (generating ODER sending).
         self._chat_tasks: dict[int, asyncio.Task] = {}
-        self._unanswered_prefetch_task: asyncio.Task | None = None
+        self._folder_prefetch_task: asyncio.Task | None = None
         self._known_chats_refresh_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
         self._known_chats: dict[int, KnownChatEntry] = {}
@@ -114,7 +114,7 @@ class BackgroundService:
         async def _bootstrap() -> None:
             try:
                 await self.refresh_known_chats_from_folder()
-                self.start_unanswered_prefetch()
+                self.start_folder_prefetch()
             except Exception as exc:
                 print(f"[WARN] Startup-Bootstrap fehlgeschlagen: {exc}")
 
@@ -122,12 +122,12 @@ class BackgroundService:
         return True
 
     async def scan_folder(self, force: bool = False) -> int:
-        """Scan folder chats, include answered chats in known list, generate unanswered suggestions."""
+        """Scan folder chats and generate suggestions."""
         await self.refresh_known_chats_from_folder()
         async with self._run_lock:
             folder_chat_ids = await self.core.get_folder_chat_ids()
-            unanswered_contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
-            contexts_to_generate = list(unanswered_contexts)
+            folder_contexts = await self.core.collect_folder_chats(folder_chat_ids)
+            contexts_to_generate = list(folder_contexts)
             if not force:
                 contexts_to_generate = [
                     ctx for ctx in contexts_to_generate if ctx.chat_id not in self._pending_messages
@@ -156,7 +156,7 @@ class BackgroundService:
                         process_contexts.append(context)
             else:
                 folder_chat_ids = await self.core.get_folder_chat_ids()
-                contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
+                contexts = await self.core.collect_folder_chats(folder_chat_ids)
                 process_contexts = [ctx for ctx in contexts if self._should_process_context(ctx)]
 
             results = await self._generate_for_contexts(process_contexts, on_warning=on_warning, trigger="suggestion-generated")
@@ -172,17 +172,17 @@ class BackgroundService:
             self.last_summary = summary
             return summary
 
-    def start_unanswered_prefetch(self) -> bool:
+    def start_folder_prefetch(self) -> bool:
         """Start async prefetch without blocking /chats response."""
-        if self._unanswered_prefetch_task and not self._unanswered_prefetch_task.done():
+        if self._folder_prefetch_task and not self._folder_prefetch_task.done():
             return False
-        self._unanswered_prefetch_task = asyncio.create_task(self._prefetch_unanswered_suggestions())
+        self._folder_prefetch_task = asyncio.create_task(self._prefetch_folder_suggestions())
         return True
 
-    async def _prefetch_unanswered_suggestions(self) -> None:
+    async def _prefetch_folder_suggestions(self) -> None:
         try:
             folder_chat_ids = await self.core.get_folder_chat_ids()
-            contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
+            contexts = await self.core.collect_folder_chats(folder_chat_ids)
             for ctx in contexts:
                 pending = self._pending_messages.get(ctx.chat_id)
                 if pending and pending.state in {
@@ -198,7 +198,7 @@ class BackgroundService:
                     auto_send=False,
                 )
         except Exception as exc:
-            print(f"[WARN] Prefetch unbeantworteter Chats fehlgeschlagen: {exc}")
+            print(f"[WARN] Prefetch der Ordner-Chats fehlgeschlagen: {exc}")
 
     async def schedule_suggestion_generation(
         self,
@@ -519,13 +519,13 @@ class BackgroundService:
                 pass
             self._known_chats_refresh_task = None
 
-        if self._unanswered_prefetch_task and not self._unanswered_prefetch_task.done():
-            self._unanswered_prefetch_task.cancel()
+        if self._folder_prefetch_task and not self._folder_prefetch_task.done():
+            self._folder_prefetch_task.cancel()
             try:
-                await self._unanswered_prefetch_task
+                await self._folder_prefetch_task
             except asyncio.CancelledError:
                 pass
-            self._unanswered_prefetch_task = None
+            self._folder_prefetch_task = None
 
         for task in list(self._chat_tasks.values()):
             if not task.done():

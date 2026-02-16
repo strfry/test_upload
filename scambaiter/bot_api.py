@@ -266,7 +266,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
-        await _guarded_reply(update, "Starte Ordner-Scan für unbeantwortete Chats...")
+        await _guarded_reply(update, "Starte Ordner-Scan...")
         created = await service.scan_folder(force=False)
         known_count = len(service.list_known_chats(limit=500))
         await _guarded_reply(update, f"Scan abgeschlossen. Neue Vorschlaege: {created}, bekannte Chats im Ordner: {known_count}")
@@ -283,7 +283,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await _guarded_reply(update, "Keine Chats im konfigurierten Ordner gefunden.")
                 return
 
-        service.start_unanswered_prefetch()
+        service.start_folder_prefetch()
         service.start_known_chats_refresh()
 
         for item in known_chats:

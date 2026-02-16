@@ -20,13 +20,13 @@ from scambaiter.storage import AnalysisStore
 
 async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
     folder_chat_ids = await core.get_folder_chat_ids()
-    contexts = await core.collect_unanswered_chats(folder_chat_ids)
+    contexts = await core.collect_folder_chats(folder_chat_ids)
 
     if not contexts:
-        print("Keine unbeantworteten Chats im Ordner gefunden.")
+        print("Keine Chats im Ordner gefunden.")
         return
 
-    print(f"Gefundene unbeantwortete Chats: {len(contexts)}\n")
+    print(f"Gefundene Chats im Ordner: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
         language_hint = None
         prompt_kv_state: dict[str, str] = {}
