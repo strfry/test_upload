@@ -481,7 +481,9 @@ class BackgroundService:
 
     @staticmethod
     def _fingerprint_context(context: ChatContext) -> str:
-        joined = "\n".join(context.lines)
+        joined = "\n".join(
+            f"{msg.timestamp.isoformat()}|{msg.role}|{msg.sender}|{msg.text}" for msg in context.messages
+        )
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 

@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Literal
 
 
 REPLY_MARKER_PATTERN = re.compile(r"(?:ANTWORT|ANWORT|REPLY)\s*:", flags=re.IGNORECASE)
@@ -53,7 +53,15 @@ SYSTEM_PROMPT = (
 class ChatContext:
     chat_id: int
     title: str
-    lines: list[str]
+    messages: list["ChatMessage"]
+
+
+@dataclass
+class ChatMessage:
+    timestamp: datetime
+    sender: str
+    role: Literal["assistant", "user"]
+    text: str
 
 
 @dataclass
@@ -148,14 +156,14 @@ class ScambaiterCore:
                 continue
 
             messages = await self.client.get_messages(dialog.entity, limit=self.config.history_limit)
-            lines: list[str] = []
+            chat_messages: list[ChatMessage] = []
             for message in reversed(messages):
-                line = await self._format_message_line(message, my_id=my_id, dialog_title=dialog.title)
-                if line:
-                    lines.append(line)
+                chat_message = await self._format_message_line(message, my_id=my_id, dialog_title=dialog.title)
+                if chat_message:
+                    chat_messages.append(chat_message)
 
-            if lines:
-                contexts.append(ChatContext(chat_id=dialog.id, title=dialog.title, lines=lines))
+            if chat_messages:
+                contexts.append(ChatContext(chat_id=dialog.id, title=dialog.title, messages=chat_messages))
 
         self._debug(f"Chats im Ordner gefunden: {len(contexts)}")
         return contexts
@@ -167,16 +175,16 @@ class ScambaiterCore:
         title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
         messages = await self.client.get_messages(entity, limit=self.config.history_limit)
 
-        lines: list[str] = []
+        chat_messages: list[ChatMessage] = []
         for message in reversed(messages):
-            line = await self._format_message_line(message, my_id=my_id, dialog_title=title)
-            if line:
-                lines.append(line)
+            chat_message = await self._format_message_line(message, my_id=my_id, dialog_title=title)
+            if chat_message:
+                chat_messages.append(chat_message)
 
-        if not lines:
+        if not chat_messages:
             return None
 
-        return ChatContext(chat_id=chat_id, title=title, lines=lines)
+        return ChatContext(chat_id=chat_id, title=title, messages=chat_messages)
 
     def build_conversation_messages(
         self,
@@ -206,37 +214,23 @@ class ScambaiterCore:
                 }
             )
 
-        for line in context.lines:
-            parsed = self._parse_context_line(line, context.title)
-            if parsed is None:
-                messages.append({"role": "user", "content": line})
-                continue
-            role, content = parsed
-            messages.append({"role": role, "content": content})
+        for item in context.messages:
+            timestamp = self._fmt_dt(item.timestamp)
+            speaker = "Ich" if item.role == "assistant" else item.sender
+            content = f"[{timestamp}] {speaker}: {item.text}"
+            messages.append({"role": item.role, "content": content})
 
         return messages
 
-    @staticmethod
-    def _parse_context_line(line: str, dialog_title: str) -> tuple[str, str] | None:
-        match = re.match(r"^\[(?P<dt>[^\]]+)\]\s*(?P<sender>[^:]+):\s*(?P<text>.*)$", line)
-        if not match:
-            return None
-
-        sender = match.group("sender").strip().lower()
-        role = "assistant" if sender == "ich" else "user"
-        text = match.group("text").strip()
-        dt = match.group("dt").strip()
-        speaker = "Ich" if role == "assistant" else dialog_title
-        return role, f"[{dt}] {speaker}: {text}"
-
     def build_prompt_debug_summary(self, context: ChatContext, max_lines: int = 5) -> str:
-        image_lines = [line for line in context.lines if IMAGE_MARKER_PREFIX in line]
-        head_lines = context.lines[:max_lines]
-        tail_lines = context.lines[-max_lines:] if len(context.lines) > max_lines else []
+        rendered_messages = [self.render_chat_message(item) for item in context.messages]
+        image_lines = [line for line in rendered_messages if IMAGE_MARKER_PREFIX in line]
+        head_lines = rendered_messages[:max_lines]
+        tail_lines = rendered_messages[-max_lines:] if len(rendered_messages) > max_lines else []
 
         parts = [
             f"Chat: {context.title} ({context.chat_id})",
-            f"Zeilen gesamt: {len(context.lines)}",
+            f"Zeilen gesamt: {len(rendered_messages)}",
             f"Bildzeilen: {len(image_lines)}",
         ]
 
@@ -256,6 +250,11 @@ class ScambaiterCore:
                 parts.append("- " + truncate_for_log(line, max_len=220))
 
         return "\n".join(parts)
+
+    @staticmethod
+    def render_chat_message(message: ChatMessage) -> str:
+        ts = ScambaiterCore._fmt_dt(message.timestamp)
+        return f"[{ts}] {message.sender}: {message.text}"
 
     async def _collect_recent_chat_images(
         self,
@@ -354,9 +353,11 @@ class ScambaiterCore:
             self.store.image_description_set(image_hash, description)
         return description
 
-    async def _format_message_line(self, message, my_id: int, dialog_title: str) -> str | None:
+    async def _format_message_line(self, message, my_id: int, dialog_title: str) -> ChatMessage | None:
         text = (message.message or "").strip()
-        sender = "Ich" if message.sender_id == my_id else dialog_title
+        is_own_message = message.sender_id == my_id
+        sender = "Ich" if is_own_message else dialog_title
+        role: Literal["assistant", "user"] = "assistant" if is_own_message else "user"
 
         document = getattr(message, "document", None)
         mime_type = getattr(document, "mime_type", "") if document else ""
@@ -376,11 +377,11 @@ class ScambaiterCore:
                 self._debug(f"Bildbeschreibung fehlgeschlagen (msg_id={message.id}): {exc}")
 
             if text:
-                return f"[{self._fmt_dt(message.date)}] {sender}: {marker} {text}"
-            return f"[{self._fmt_dt(message.date)}] {sender}: {marker}"
+                return ChatMessage(timestamp=message.date, sender=sender, role=role, text=f"{marker} {text}")
+            return ChatMessage(timestamp=message.date, sender=sender, role=role, text=marker)
 
         if text:
-            return f"[{self._fmt_dt(message.date)}] {sender}: {text}"
+            return ChatMessage(timestamp=message.date, sender=sender, role=role, text=text)
 
         return None
 
