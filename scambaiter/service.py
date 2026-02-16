@@ -58,17 +58,37 @@ class BackgroundService:
         self._chat_auto_enabled: set[int] = set()
 
     async def scan_folder(self, force: bool = False) -> int:
-        """Scan folder chats and persist fresh suggestions for unanswered chats."""
+        """Scan folder chats, register known chats, and create suggestions for unanswered ones."""
         async with self._run_lock:
             folder_chat_ids = await self.core.get_folder_chat_ids()
-            contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
+            unanswered_contexts = await self.core.collect_unanswered_chats(folder_chat_ids)
+            for chat_id in folder_chat_ids:
+                title = await self._resolve_chat_title(chat_id)
+                if self.store:
+                    self.store.upsert_known_chat(chat_id, title)
+
+            contexts_to_generate = list(unanswered_contexts)
             if not force:
-                contexts = [ctx for ctx in contexts if ctx.chat_id not in self._pending_messages]
-            if not contexts:
+                contexts_to_generate = [
+                    ctx for ctx in contexts_to_generate if ctx.chat_id not in self._pending_messages
+                ]
+            if not contexts_to_generate:
                 return 0
-            results = await self._generate_for_contexts(contexts, on_warning=None, trigger="manual-scan")
+
+            results = await self._generate_for_contexts(contexts_to_generate, on_warning=None, trigger="manual-scan")
             self.last_results = results + self.last_results
             return len(results)
+
+    async def _resolve_chat_title(self, chat_id: int) -> str:
+        try:
+            entity = await self.core.client.get_entity(chat_id)
+            title = getattr(entity, "title", None) or getattr(entity, "first_name", None)
+            if title:
+                return str(title)
+        except Exception:
+            pass
+        return str(chat_id)
+
 
     async def run_once(
         self,

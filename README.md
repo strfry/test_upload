@@ -69,7 +69,7 @@ Verfügbare Bot-Kommandos:
 - `/status` – zeigt den letzten Lauf und die Anzahl aktiver Nachrichtenprozesse
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
-- `/scan` – scannt den konfigurierten Ordner und erzeugt fehlende Vorschläge für unbeantwortete Chats
+- `/scan` – scannt den konfigurierten Ordner, registriert auch beantwortete Chats und erzeugt fehlende Vorschläge für unbeantwortete Chats
 - `/chats` – zeigt klickbare Buttons pro Chat: `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `KV`
   - **Generate** erzeugt immer einen neuen Antwort-Vorschlag und setzt den Nachrichtenprozess auf **Wartephase**
   - Die Chat-Übersicht zeigt den aktuellen Vorschlag direkt pro Chat an
