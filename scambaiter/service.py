@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable
 
 from scambaiter.core import PROMPT_KV_KEYS, ChatContext, ScambaiterCore, SuggestionResult
 from scambaiter.storage import AnalysisStore
@@ -29,7 +30,11 @@ class BackgroundService:
         self.last_results: list[SuggestionResult] = []
         self._context_fingerprints: dict[int, str] = {}
 
-    async def run_once(self, target_chat_ids: set[int] | None = None) -> RunSummary:
+    async def run_once(
+        self,
+        target_chat_ids: set[int] | None = None,
+        on_warning: Callable[[int, str], None] | None = None,
+    ) -> RunSummary:
         async with self._run_lock:
             started = datetime.now()
             sent_count = 0
@@ -61,6 +66,11 @@ class BackgroundService:
                     context,
                     language_hint=language_hint,
                     prompt_kv_state=prompt_kv_state,
+                    on_warning=(
+                        (lambda message, chat_id=context.chat_id: on_warning(chat_id, message))
+                        if on_warning
+                        else None
+                    ),
                 )
                 results.append(
                     SuggestionResult(

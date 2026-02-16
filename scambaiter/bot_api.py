@@ -90,6 +90,17 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         except ValueError:
             return None
 
+    def _chat_actions_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("▶️ Run", callback_data=f"run:{chat_id}"),
+                    InlineKeyboardButton("🗂 KV", callback_data=f"kv:{chat_id}"),
+                ]
+            ]
+        )
+
+
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
@@ -153,14 +164,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             kv_data: dict[str, str] = {}
             if service.store:
                 kv_data = service.store.kv_get_many(item.chat_id, base_info_keys)
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("▶️ Run", callback_data=f"run:{item.chat_id}"),
-                        InlineKeyboardButton("🗂 KV", callback_data=f"kv:{item.chat_id}"),
-                    ]
-                ]
-            )
+            keyboard = _chat_actions_keyboard(item.chat_id)
             if update.message:
                 summary = _format_chat_overview(item.chat_id, item.title, item.updated_at, kv_data)
                 await update.message.reply_text(
@@ -187,11 +191,47 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         if action == "run":
-            await query.edit_message_text(f"Starte Einzellauf für {chat_id}...")
-            summary = await service.run_once(target_chat_ids={chat_id})
-            await context.bot.send_message(
-                chat_id=allowed_chat_id,
-                text=f"Einzellauf fuer {chat_id} abgeschlossen. Chats: {summary.chat_count}, gesendet: {summary.sent_count}",
+            base_text = ""
+            if query.message and query.message.text:
+                base_text = query.message.text
+            else:
+                base_text = f"Chat {chat_id}"
+
+            keyboard = _chat_actions_keyboard(chat_id)
+            await query.edit_message_text(
+                f"{base_text}\n\n⏳ Starte Einzellauf...",
+                reply_markup=keyboard,
+            )
+
+            runtime_warnings: list[str] = []
+
+            def _on_run_warning(event_chat_id: int, message: str) -> None:
+                if event_chat_id == chat_id:
+                    runtime_warnings.append(message)
+
+            try:
+                summary = await service.run_once(target_chat_ids={chat_id}, on_warning=_on_run_warning)
+            except Exception as exc:
+                await query.edit_message_text(
+                    f"{base_text}\n\n❌ Einzellauf fehlgeschlagen: {exc}",
+                    reply_markup=keyboard,
+                )
+                return
+
+            warning_line = ""
+            if runtime_warnings:
+                warning_line = f"\n⚠️ {runtime_warnings[-1]}"
+
+            await query.edit_message_text(
+                (
+                    f"{base_text}\n\n"
+                    "✅ Einzellauf abgeschlossen\n"
+                    f"Chats: {summary.chat_count}\n"
+                    f"Gesendet: {summary.sent_count}\n"
+                    f"Zeit: {summary.finished_at:%Y-%m-%d %H:%M:%S}"
+                    f"{warning_line}"
+                ),
+                reply_markup=keyboard,
             )
             return
 
@@ -383,4 +423,3 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app.add_handler(CommandHandler("testimagedesc", test_image_desc))
     app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(run|kv):"))
     return app
-

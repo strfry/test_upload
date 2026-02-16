@@ -349,6 +349,7 @@ class ScambaiterCore:
         suggestion_callback: Callable[[str], str] | None = None,
         language_hint: str | None = None,
         prompt_kv_state: dict[str, str] | None = None,
+        on_warning: Callable[[str], None] | None = None,
     ) -> ModelOutput:
         parser = suggestion_callback or extract_final_reply
         last_output: ModelOutput | None = None
@@ -394,10 +395,13 @@ class ScambaiterCore:
             if finish_reason:
                 self._debug(f"Model-Finish-Reason (Versuch {attempt}): {finish_reason}")
             if finish_reason == "length":
-                print(
-                    f"[WARN] Modellausgabe für {context.title} ({context.chat_id}) "
-                    f"wurde durch Token-Limit abgeschnitten (HF_MAX_TOKENS={self.config.hf_max_tokens})."
+                warning_message = (
+                    f"Token-Limit erreicht: Ausgabe für {context.title} ({context.chat_id}) "
+                    f"wurde abgeschnitten (HF_MAX_TOKENS={self.config.hf_max_tokens})."
                 )
+                print(f"[WARN] {warning_message}")
+                if on_warning:
+                    on_warning(warning_message)
 
             content = choice.message.content
             raw = _normalize_text_content(content)
@@ -413,7 +417,12 @@ class ScambaiterCore:
                     f"(Versuch {attempt})."
                 )
 
-            current_output = ModelOutput(raw=raw, suggestion=suggestion, analysis=analysis, metadata=metadata)
+            current_output = ModelOutput(
+                raw=raw,
+                suggestion=suggestion,
+                analysis=analysis,
+                metadata=metadata,
+            )
             last_output = current_output
             if suggestion and not looks_like_reasoning_output(suggestion):
                 return current_output
