@@ -1,0 +1,36 @@
+{
+  "chat_id": 7000000003,
+  "title": "NO-REPEAT-VALIDATOR-CONTACT",
+  "messages": [
+    {
+      "ts_utc": "2026-02-17T21:20:00Z",
+      "role": "user",
+      "sender": "Scammer",
+      "text": "You must contact George to continue."
+    },
+    {
+      "ts_utc": "2026-02-17T21:21:00Z",
+      "role": "assistant",
+      "sender": "self",
+      "text": "I am already in contact with George."
+    },
+    {
+      "ts_utc": "2026-02-17T21:22:00Z",
+      "role": "user",
+      "sender": "Scammer",
+      "text": "Okay then proceed with staking."
+    }
+  ],
+  "prompt_context": {
+    "messenger": "telegram",
+    "now_utc": "2026-02-17T21:23:00Z",
+    "previous_analysis": {
+      "validator_contact_known": true,
+      "validator_name": "George",
+      "ask_again_guard": {
+        "validator_contact": true
+      }
+    }
+  },
+  "language_hint": "en"
+}

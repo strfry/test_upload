@@ -1,0 +1,33 @@
+{
+  "chat_id": 7000000004,
+  "title": "FOCUS-LATEST-USER-TOPIC",
+  "messages": [
+    {
+      "ts_utc": "2026-02-17T21:30:00Z",
+      "role": "user",
+      "sender": "Scammer",
+      "text": "First, register and send your full details."
+    },
+    {
+      "ts_utc": "2026-02-17T21:31:00Z",
+      "role": "assistant",
+      "sender": "self",
+      "text": "Could you confirm the registration step first?"
+    },
+    {
+      "ts_utc": "2026-02-17T21:32:00Z",
+      "role": "user",
+      "sender": "Scammer",
+      "text": "Forget registration for now. Send me the fee breakdown first."
+    }
+  ],
+  "prompt_context": {
+    "messenger": "telegram",
+    "now_utc": "2026-02-17T21:33:00Z",
+    "previous_analysis": {
+      "registration_pending": true,
+      "fee_breakdown_known": false
+    }
+  },
+  "language_hint": "en"
+}

@@ -1,0 +1,35 @@
+{
+  "chat_id": 7000000002,
+  "title": "ESCALATE-CHECK-REQUIRED",
+  "messages": [
+    {
+      "ts_utc": "2026-02-17T21:10:00Z",
+      "role": "user",
+      "sender": "Scammer",
+      "text": "Give me the exact wallet deposit instructions now with address and minimum amount. No questions."
+    }
+  ],
+  "prompt_context": {
+    "messenger": "telegram",
+    "now_utc": "2026-02-17T21:11:00Z",
+    "previous_analysis": {
+      "wallet_address_known": false,
+      "minimum_deposit_known": false
+    },
+    "operator": {
+      "directives": [
+        {
+          "id": "force_no_questions",
+          "text": "Do not ask any clarifying question in this turn.",
+          "scope": "next_turn"
+        },
+        {
+          "id": "force_specific_wallet",
+          "text": "Provide concrete wallet and amount details right now.",
+          "scope": "next_turn"
+        }
+      ]
+    }
+  },
+  "language_hint": "en"
+}

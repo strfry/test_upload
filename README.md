@@ -100,6 +100,8 @@ Zur Trennung der Concerns wurde der Code aufgeteilt:
 - `scambaiter/service.py`: Hintergrund-Loop + Laufstatus
 - `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos
 - `scambaiter/storage.py`: SQLite-Persistenz für Analysen und Bildbeschreibungen
+- `scripts/prompt_runner.py`: lokaler Prompt-Runner (Prompt/Raw/Parsed) für schnelle Iteration
+- `scripts/loop_analyzer.py`: analysiert gepastete Verläufe auf Loop-Muster (Wiederholungsfragen/Themen-Drift)
 
 
 - Für unbeantwortete Chats wird beim Öffnen von `/chats` asynchron ein Vorschlag vorgezogen, damit die Chatliste sofort erscheint.
@@ -111,3 +113,57 @@ Nachrichtenzustände im BotInterface:
 - `sent`: Nachricht wurde gesendet
 - `cancelled`: Vorgang per Stop abgebrochen (inkl. ggf. Löschung beim Empfänger)
 - `error`: Senden fehlgeschlagen oder nicht möglich
+
+## Prompt-Runner
+
+Lokaler Testlauf für Prompt/Modelausgabe:
+
+```bash
+python scripts/prompt_runner.py --chat-id 123456789 --show-prompt
+```
+
+Ohne Telegram-Verbindung (kollidiert nicht mit laufendem Bot), mit Fixture-Datei:
+
+```bash
+python scripts/prompt_runner.py --input-json ./case.json --show-prompt
+```
+
+Nur Prompt ansehen, ohne Modell-Request:
+
+```bash
+python scripts/prompt_runner.py --input-json ./case.json --show-prompt --preview-only
+```
+
+Request-Body für externen Model-Call exportieren (z.B. auf einem Host mit Internet):
+
+```bash
+python scripts/prompt_runner.py \
+  --input-json ./case.json \
+  --preview-only \
+  --dump-request-json /tmp/hf_request.json \
+  --print-curl
+```
+
+Gesprächs-Loop analysieren (JSON-Case):
+
+```bash
+python scripts/loop_analyzer.py --input-json docs/prompt_cases/no_repeat_validator_contact.json
+```
+
+Gesprächs-Loop analysieren (Paste-Textdatei):
+
+```bash
+python scripts/loop_analyzer.py \
+  --transcript-file ./transcript.txt \
+  --assistant-sender "Me" \
+  --output-json /tmp/loop_report.json
+```
+
+Hinweis: Für Telegram-Kopierformat (`Name, [Datum Uhrzeit]`) den eigenen Sendernamen per
+`--assistant-sender` angeben (bei Bedarf mehrfach).
+
+Direkt ins Tool pasten bis EOF (Ctrl+D):
+
+```bash
+python scripts/loop_analyzer.py --transcript-stdin --assistant-sender "Me"
+```
