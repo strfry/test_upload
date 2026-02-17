@@ -12,9 +12,8 @@ class StoredAnalysis:
     chat_id: int
     title: str
     suggestion: str
-    analysis: str | None
+    analysis: dict[str, object] | None
     metadata: dict[str, str]
-
 
 
 @dataclass
@@ -23,18 +22,11 @@ class StoredImageDescription:
     description: str
     updated_at: datetime
 
+
 @dataclass
 class StoredKnownChat:
     chat_id: int
     title: str
-    updated_at: datetime
-
-
-@dataclass
-class StoredKeyValue:
-    scammer_chat_id: int
-    key: str
-    value: str
     updated_at: datetime
 
 
@@ -62,18 +54,6 @@ class AnalysisStore:
                 """
             )
             self._ensure_column(conn, "analyses", "metadata_json", "TEXT")
-            self._ensure_column(conn, "analyses", "language", "TEXT")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS key_values_by_scammer (
-                    scammer_chat_id INTEGER NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (scammer_chat_id, key)
-                )
-                """
-            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS image_descriptions (
@@ -83,6 +63,8 @@ class AnalysisStore:
                 )
                 """
             )
+            self._drop_legacy_kv_table(conn)
+            self._purge_legacy_analysis_rows(conn)
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
@@ -91,16 +73,39 @@ class AnalysisStore:
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
+    @staticmethod
+    def _drop_legacy_kv_table(conn: sqlite3.Connection) -> None:
+        conn.execute("DROP TABLE IF EXISTS key_values_by_scammer")
+
+    @staticmethod
+    def _purge_legacy_analysis_rows(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("SELECT id, analysis FROM analyses WHERE analysis IS NOT NULL").fetchall()
+        for row_id, analysis_text in rows:
+            if not isinstance(analysis_text, str):
+                conn.execute("DELETE FROM analyses WHERE id = ?", (row_id,))
+                continue
+            cleaned = analysis_text.strip()
+            if not cleaned:
+                continue
+            try:
+                parsed = json.loads(cleaned)
+            except json.JSONDecodeError:
+                conn.execute("DELETE FROM analyses WHERE id = ?", (row_id,))
+                continue
+            if not isinstance(parsed, dict):
+                conn.execute("DELETE FROM analyses WHERE id = ?", (row_id,))
+
     def save(
         self,
         *,
         chat_id: int,
         title: str,
         suggestion: str,
-        analysis: str | None,
+        analysis: dict[str, object] | None,
         metadata: dict[str, str],
     ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
+        analysis_json = json.dumps(analysis, ensure_ascii=False) if isinstance(analysis, dict) else None
         with self._connect() as conn:
             conn.execute(
                 """
@@ -112,53 +117,16 @@ class AnalysisStore:
                     chat_id,
                     title,
                     suggestion,
-                    analysis,
+                    analysis_json,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
-            )
-            self._upsert_kv_snapshot(
-                conn,
-                scammer_chat_id=chat_id,
-                suggestion=suggestion,
-                analysis=analysis,
-                metadata=metadata,
-                now=now,
-            )
-
-    def _upsert_kv_snapshot(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        scammer_chat_id: int,
-        suggestion: str,
-        analysis: str | None,
-        metadata: dict[str, str],
-        now: str,
-    ) -> None:
-        kv_items = dict(metadata)
-        kv_items["antwort"] = suggestion
-        if analysis:
-            kv_items["analyse"] = analysis
-
-        for key, value in kv_items.items():
-            key = str(key).strip().lower()
-            value = str(value).strip()
-            if not key or not value:
-                continue
-            conn.execute(
-                """
-                INSERT INTO key_values_by_scammer (scammer_chat_id, key, value, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(scammer_chat_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                """,
-                (scammer_chat_id, key, value, now),
             )
 
     def latest(self, limit: int = 5) -> list[StoredAnalysis]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT created_at, chat_id, title, suggestion, analysis, metadata_json, language
+                SELECT created_at, chat_id, title, suggestion, analysis, metadata_json
                 FROM analyses
                 ORDER BY id DESC
                 LIMIT ?
@@ -168,17 +136,85 @@ class AnalysisStore:
         return [
             StoredAnalysis(
                 created_at=datetime.fromisoformat(row[0]),
-                chat_id=row[1],
-                title=row[2],
-                suggestion=row[3],
-                analysis=row[4],
-                metadata=self._decode_metadata(row[5], row[6]),
+                chat_id=int(row[1]),
+                title=str(row[2]),
+                suggestion=str(row[3]),
+                analysis=self._decode_analysis(row[4]),
+                metadata=self._decode_metadata(row[5]),
+            )
+            for row in rows
+        ]
+
+    def latest_for_chat(self, chat_id: int) -> StoredAnalysis | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT created_at, chat_id, title, suggestion, analysis, metadata_json
+                FROM analyses
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (chat_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return StoredAnalysis(
+            created_at=datetime.fromisoformat(row[0]),
+            chat_id=int(row[1]),
+            title=str(row[2]),
+            suggestion=str(row[3]),
+            analysis=self._decode_analysis(row[4]),
+            metadata=self._decode_metadata(row[5]),
+        )
+
+    def update_latest_analysis(self, chat_id: int, analysis: dict[str, object]) -> bool:
+        serialized = json.dumps(analysis, ensure_ascii=False)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM analyses WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute("UPDATE analyses SET analysis = ? WHERE id = ?", (serialized, int(row[0])))
+            return True
+
+    def list_known_chats(self, limit: int = 50) -> list[StoredKnownChat]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT a.chat_id, a.title, MAX(a.created_at) AS updated_at
+                FROM analyses a
+                GROUP BY a.chat_id
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            StoredKnownChat(
+                chat_id=int(row[0]),
+                title=str(row[1]),
+                updated_at=datetime.fromisoformat(row[2]),
             )
             for row in rows
         ]
 
     @staticmethod
-    def _decode_metadata(metadata_json: str | None, legacy_language: str | None = None) -> dict[str, str]:
+    def _decode_analysis(value: str | None) -> dict[str, object] | None:
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+        return None
+
+    @staticmethod
+    def _decode_metadata(metadata_json: str | None) -> dict[str, str]:
         metadata: dict[str, str] = {}
         if metadata_json:
             try:
@@ -187,119 +223,7 @@ class AnalysisStore:
                     metadata = {str(k): str(v) for k, v in data.items()}
             except json.JSONDecodeError:
                 pass
-        if legacy_language and "sprache" not in metadata:
-            metadata["sprache"] = legacy_language
         return metadata
-
-    def list_known_chats(self, limit: int = 50) -> list[StoredKnownChat]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                WITH latest_analyses AS (
-                    SELECT a.chat_id, a.title, MAX(a.created_at) AS updated_at
-                    FROM analyses a
-                    GROUP BY a.chat_id
-                ),
-                latest_kv AS (
-                    SELECT k.scammer_chat_id AS chat_id, MAX(k.updated_at) AS updated_at
-                    FROM key_values_by_scammer k
-                    GROUP BY k.scammer_chat_id
-                )
-                SELECT la.chat_id,
-                       la.title,
-                       COALESCE(lk.updated_at, la.updated_at) AS updated_at
-                FROM latest_analyses la
-                LEFT JOIN latest_kv lk ON lk.chat_id = la.chat_id
-
-                UNION ALL
-
-                SELECT lk.chat_id,
-                       CAST(lk.chat_id AS TEXT) AS title,
-                       lk.updated_at
-                FROM latest_kv lk
-                WHERE lk.chat_id NOT IN (SELECT chat_id FROM latest_analyses)
-
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-        known_chats: list[StoredKnownChat] = []
-        for row in rows:
-            known_chats.append(
-                StoredKnownChat(
-                    chat_id=int(row[0]),
-                    title=str(row[1]),
-                    updated_at=datetime.fromisoformat(row[2]),
-                )
-            )
-        return known_chats
-
-
-    def kv_set(self, scammer_chat_id: int, key: str, value: str) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO key_values_by_scammer (scammer_chat_id, key, value, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(scammer_chat_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                """,
-                (scammer_chat_id, key, value, now),
-            )
-
-    def kv_get(self, scammer_chat_id: int, key: str) -> StoredKeyValue | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT scammer_chat_id, key, value, updated_at
-                FROM key_values_by_scammer
-                WHERE scammer_chat_id = ? AND key = ?
-                """,
-                (scammer_chat_id, key),
-            ).fetchone()
-        if not row:
-            return None
-        return StoredKeyValue(scammer_chat_id=row[0], key=row[1], value=row[2], updated_at=datetime.fromisoformat(row[3]))
-
-    def kv_delete(self, scammer_chat_id: int, key: str) -> bool:
-        with self._connect() as conn:
-            result = conn.execute(
-                "DELETE FROM key_values_by_scammer WHERE scammer_chat_id = ? AND key = ?",
-                (scammer_chat_id, key),
-            )
-            return result.rowcount > 0
-
-    def kv_list(self, scammer_chat_id: int, limit: int = 20) -> list[StoredKeyValue]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT scammer_chat_id, key, value, updated_at
-                FROM key_values_by_scammer
-                WHERE scammer_chat_id = ?
-                ORDER BY key ASC
-                LIMIT ?
-                """,
-                (scammer_chat_id, limit),
-            ).fetchall()
-        return [
-            StoredKeyValue(scammer_chat_id=row[0], key=row[1], value=row[2], updated_at=datetime.fromisoformat(row[3]))
-            for row in rows
-        ]
-
-    def kv_get_many(self, scammer_chat_id: int, keys: list[str]) -> dict[str, str]:
-        cleaned = [key.strip().lower() for key in keys if key.strip()]
-        if not cleaned:
-            return {}
-        placeholders = ",".join("?" for _ in cleaned)
-        query = (
-            "SELECT key, value FROM key_values_by_scammer "
-            f"WHERE scammer_chat_id = ? AND key IN ({placeholders})"
-        )
-        with self._connect() as conn:
-            rows = conn.execute(query, (scammer_chat_id, *cleaned)).fetchall()
-        return {str(row[0]): str(row[1]) for row in rows}
 
     def image_description_get(self, image_hash: str) -> StoredImageDescription | None:
         with self._connect() as conn:

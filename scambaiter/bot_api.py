@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -15,26 +16,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     menu_message_len = 3900
     card_caption_len = 1024
     chats_page_size = 8
-    base_info_keys = [
-        "sprache",
-        "scamtyp",
-        "kontakt",
-        "kontakt_art",
-        "betrüger_art",
-        "betrueger_art",
-        "scam-verdacht",
-        "typ",
-    ]
-    base_info_labels = {
-        "sprache": "Sprache",
-        "scamtyp": "Scamtyp",
-        "kontakt": "Kontakt",
-        "kontakt_art": "Kontakt",
-        "betrüger_art": "Betrüger-Art",
-        "betrueger_art": "Betrüger-Art",
-        "scam-verdacht": "Scam-Verdacht",
-        "typ": "Typ",
-    }
+    queue_page_size = 8
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
 
     def _authorized(update: Update) -> bool:
@@ -92,11 +74,24 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return value
         return value[: max_len - 3].rstrip() + "..."
 
+    def _analysis_summary_parts(analysis_data: dict[str, object] | None, limit: int = 4) -> list[str]:
+        if not analysis_data:
+            return []
+        parts: list[str] = []
+        for key, value in analysis_data.items():
+            if isinstance(value, (dict, list)):
+                continue
+            rendered = _truncate_value(str(value), max_len=40)
+            parts.append(f"{key}={rendered}")
+            if len(parts) >= limit:
+                break
+        return parts
+
     def _format_chat_overview(
         chat_id: int,
         title: str,
         updated_at: object,
-        kv_data: dict[str, str],
+        analysis_data: dict[str, object] | None,
         suggestion: str | None,
         pending: PendingMessage | None,
     ) -> str:
@@ -108,20 +103,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             lines.append(_format_pending_state(pending))
         if suggestion:
             lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=900))
-        if kv_data:
-            seen_labels: set[str] = set()
-            parts: list[str] = []
-            for key in base_info_keys:
-                value = kv_data.get(key)
-                if not value:
-                    continue
-                label = base_info_labels.get(key, key)
-                if label in seen_labels:
-                    continue
-                seen_labels.add(label)
-                parts.append(f"{label}={_truncate_value(value)}")
-            if parts:
-                lines.append("Info: " + ", ".join(parts))
+        parts = _analysis_summary_parts(analysis_data)
+        if parts:
+            lines.append("Analysis: " + ", ".join(parts))
         return "\n".join(lines)
 
     def _parse_chat_id_arg(args: list[str]) -> int | None:
@@ -137,7 +121,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             [
                 [
                     InlineKeyboardButton("Generate", callback_data=f"ma:g:{chat_id}:{page}"),
-                    InlineKeyboardButton("Send", callback_data=f"ma:s:{chat_id}:{page}"),
+                    InlineKeyboardButton("Queue Run", callback_data=f"ma:q:{chat_id}:{page}"),
                     InlineKeyboardButton("Stop", callback_data=f"ma:x:{chat_id}:{page}"),
                 ],
                 [
@@ -146,7 +130,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 ],
                 [
                     InlineKeyboardButton("Bilder", callback_data=f"ma:i:{chat_id}:{page}"),
-                    InlineKeyboardButton("KV", callback_data=f"ma:k:{chat_id}:{page}"),
+                    InlineKeyboardButton("Analysis", callback_data=f"ma:k:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("Zurueck", callback_data=f"ml:{page}"),
@@ -218,7 +202,65 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             nav_row.append(InlineKeyboardButton(">>", callback_data=f"ml:{page + 1}"))
         if nav_row:
             rows.append(nav_row)
-        rows.append([InlineKeyboardButton("Refresh", callback_data=f"ml:{page}")])
+        rows.append(
+            [
+                InlineKeyboardButton("Refresh", callback_data=f"ml:{page}"),
+                InlineKeyboardButton("Queue", callback_data="mq:0"),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    def _queue_menu_text(page: int) -> str:
+        pending_items = service.list_pending_messages()
+        total_pages = max(1, math.ceil(len(pending_items) / queue_page_size))
+        page = max(0, min(page, total_pages - 1))
+        start = page * queue_page_size
+        current_slice = pending_items[start : start + queue_page_size]
+
+        lines = [f"Queue ({len(pending_items)}) | Seite {page + 1}/{total_pages}"]
+        if not current_slice:
+            lines.append("Keine aktiven Prozesse in der Queue.")
+            return _limit_message("\n".join(lines))
+
+        for index, item in enumerate(current_slice, start=start + 1):
+            action_types = [str(action.get("type", "?")) for action in (item.action_queue or [])]
+            actions = ",".join(action_types[:4]) if action_types else "-"
+            if len(action_types) > 4:
+                actions = actions + ",..."
+            schema = _truncate_value(item.schema, max_len=24) if item.schema else "-"
+            lines.append(
+                f"{index}. [{_state_icon(item.chat_id)}] {item.title} ({item.chat_id}) | "
+                f"{item.state.value} | Actions: {actions} | schema: {schema}"
+            )
+
+        lines.append("Mit den Chat-Buttons unten in die Detailansicht springen.")
+        return _limit_message("\n".join(lines))
+
+    def _queue_menu_keyboard(page: int) -> InlineKeyboardMarkup:
+        pending_items = service.list_pending_messages()
+        total_pages = max(1, math.ceil(len(pending_items) / queue_page_size))
+        page = max(0, min(page, total_pages - 1))
+        start = page * queue_page_size
+        current_slice = pending_items[start : start + queue_page_size]
+
+        rows: list[list[InlineKeyboardButton]] = []
+        for item in current_slice:
+            label = f"[{_state_icon(item.chat_id)}] {_truncate_value(item.title, max_len=28)}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"mc:{item.chat_id}:0")])
+
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("<<", callback_data=f"mq:{page - 1}"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(">>", callback_data=f"mq:{page + 1}"))
+        if nav_row:
+            rows.append(nav_row)
+        rows.append(
+            [
+                InlineKeyboardButton("Queue Refresh", callback_data=f"mq:{page}"),
+                InlineKeyboardButton("Zu Chats", callback_data="ml:0"),
+            ]
+        )
         return InlineKeyboardMarkup(rows)
 
     def _format_pending_state(pending: PendingMessage | None) -> str:
@@ -242,6 +284,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             lines.append(f"Gesendete msg_id: {pending.sent_message_id}")
         if pending.last_error:
             lines.append(f"Fehler: {pending.last_error}")
+        action_queue = pending.action_queue or []
+        if action_queue:
+            lines.append("Actions:")
+            for idx, action in enumerate(action_queue, start=1):
+                lines.append(f"{idx}. {_format_action(action)}")
+        else:
+            lines.append("Actions: -")
         lines.append(f"Trigger: {pending.trigger or '-'}")
         return "\n".join(lines)
 
@@ -257,15 +306,25 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             MessageState.ERROR: "Fehler",
         }
         label = state_labels.get(pending.state, pending.state.value)
+        action_queue = pending.action_queue or []
+        action_hint = f", Actions={len(action_queue)}" if action_queue else ", Actions=0"
         if pending.state == MessageState.WAITING and pending.wait_until is not None:
-            return f"{label} bis {pending.wait_until:%H:%M:%S} | Trigger: {pending.trigger or '-'}"
-        return f"{label} | Trigger: {pending.trigger or '-'}"
+            return f"{label} bis {pending.wait_until:%H:%M:%S}{action_hint} | Trigger: {pending.trigger or '-'}"
+        return f"{label}{action_hint} | Trigger: {pending.trigger or '-'}"
+
+    def _format_action(action: dict[str, object]) -> str:
+        action_type = str(action.get("type", "?"))
+        fields = [f"{k}={v}" for k, v in action.items() if k != "type"]
+        if not fields:
+            return action_type
+        rendered = ", ".join(_truncate_value(str(item), max_len=48) for item in fields)
+        return f"{action_type} ({rendered})"
 
     async def _render_chat_detail(
         chat_id: int,
         page: int,
         heading: str | None = None,
-        ensure_suggestion: bool = True,
+        ensure_suggestion: bool = False,
         compact: bool = False,
     ) -> tuple[str, InlineKeyboardMarkup]:
         known = _find_known_chat(chat_id)
@@ -273,20 +332,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         title = known.title if known else (pending.title if pending else str(chat_id))
         updated_at = known.updated_at if known else (pending.created_at if pending else None)
 
-        kv_data: dict[str, str] = {}
-        if service.store:
-            kv_data = service.store.kv_get_many(chat_id, base_info_keys + ["antwort"])
+        latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+        analysis_data = latest_entry.analysis if latest_entry else None
 
-        if ensure_suggestion and not pending and not kv_data.get("antwort"):
-            await service.schedule_suggestion_generation(
-                chat_id=chat_id,
-                title=title,
-                trigger="chat-detail-open",
-                auto_send=False,
-            )
-            pending = service.get_pending_message(chat_id)
-
-        suggestion = pending.suggestion if (pending and pending.suggestion) else kv_data.get("antwort")
+        suggestion = pending.suggestion if (pending and pending.suggestion) else (latest_entry.suggestion if latest_entry else None)
         if compact:
             lines: list[str] = []
             if heading:
@@ -298,22 +347,16 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             lines.append(f"Auto: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}")
             if suggestion:
                 lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=320))
-            info_parts: list[str] = []
-            for key in base_info_keys:
-                value = kv_data.get(key)
-                if not value:
-                    continue
-                label = base_info_labels.get(key, key)
-                part = f"{label}={_truncate_value(value, max_len=28)}"
-                if part not in info_parts:
-                    info_parts.append(part)
-                if len(info_parts) >= 4:
-                    break
+            info_parts = _analysis_summary_parts(analysis_data, limit=4)
             if info_parts:
-                lines.append("Info: " + ", ".join(info_parts))
+                lines.append("Analysis: " + ", ".join(info_parts))
+            if pending and pending.action_queue:
+                lines.append("Queue:")
+                for idx, action in enumerate((pending.action_queue or [])[:3], start=1):
+                    lines.append(f"{idx}. {_truncate_value(_format_action(action), max_len=90)}")
             text = _limit_caption("\n".join(lines))
         else:
-            body = _format_chat_overview(chat_id, title, updated_at, kv_data, suggestion, pending)
+            body = _format_chat_overview(chat_id, title, updated_at, analysis_data, suggestion, pending)
             text = f"{heading}\n\n{body}" if heading else body
             text = _limit_message(text)
         return text, _chat_detail_keyboard(chat_id, page)
@@ -323,7 +366,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         chat_id: int,
         page: int,
         heading: str | None = None,
-        ensure_suggestion: bool = True,
+        ensure_suggestion: bool = False,
     ):
         caption, keyboard = await _render_chat_detail(
             chat_id,
@@ -431,13 +474,16 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _guarded_reply(update, "Noch kein Lauf ausgeführt.")
             return
         pending_count = service.pending_count()
+        warnings = service.get_general_warnings(limit=3)
+        warning_line = "Warnungen: -" if not warnings else "Warnungen: " + " | ".join(warnings)
         await _guarded_reply(
             update,
             (
                 f"Letzter Lauf: {summary.finished_at:%Y-%m-%d %H:%M:%S}\n"
                 f"Gefundene Chats: {summary.chat_count}\n"
                 f"Gesendete Nachrichten: {summary.sent_count}\n"
-                f"Nachrichtenprozesse: {pending_count}"
+                f"Nachrichtenprozesse: {pending_count}\n"
+                f"{warning_line}"
             ),
         )
 
@@ -514,6 +560,25 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
+        if data.startswith("mq:"):
+            try:
+                page = int(data.split(":")[1])
+            except (ValueError, IndexError):
+                await _safe_edit_message(query, "Ungueltige Aktion.")
+                return
+            text = _queue_menu_text(page)
+            keyboard = _queue_menu_keyboard(page)
+            message = getattr(query, "message", None)
+            if message and getattr(message, "photo", None):
+                await context.bot.send_message(chat_id=allowed_chat_id, text=text, reply_markup=keyboard)
+                try:
+                    await context.bot.delete_message(chat_id=int(message.chat_id), message_id=int(message.message_id))
+                except BadRequest:
+                    pass
+            else:
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+            return
+
         if data.startswith("mc:"):
             try:
                 _prefix, chat_id_raw, page_raw = data.split(":")
@@ -524,7 +589,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 return
             message = getattr(query, "message", None)
             if message and getattr(message, "photo", None):
-                text, keyboard = await _render_chat_detail(chat_id, page, ensure_suggestion=True, compact=True)
+                text, keyboard = await _render_chat_detail(chat_id, page, ensure_suggestion=False, compact=True)
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 await _register_infobox_target(message, chat_id, page, render_mode="card")
                 return
@@ -532,7 +597,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 context,
                 chat_id=chat_id,
                 page=page,
-                ensure_suggestion=True,
+                ensure_suggestion=False,
             )
             await _register_infobox_target(card_message, chat_id, page, render_mode="card")
             return
@@ -553,7 +618,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         action_map = {
             "generate": "g",
-            "send": "s",
+            "send": "q",
             "stop": "x",
             "autoon": "on",
             "autooff": "off",
@@ -639,14 +704,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
-        if action == "s":
-            started = await service.trigger_send(chat_id, trigger="bot-send-button")
+        if action == "q":
+            started = await service.trigger_send(chat_id, trigger="bot-queue-run-button")
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             if not started:
                 text, keyboard = await _render_chat_detail(
                     chat_id,
                     page,
-                    heading="Kein sendbarer Zustand vorhanden.",
+                    heading="Keine ausführbare Queue vorhanden.",
                     ensure_suggestion=False,
                     compact=is_card,
                 )
@@ -655,7 +720,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             text, keyboard = await _render_chat_detail(
                 chat_id,
                 page,
-                heading="Senden ausgeloest (oder vorgemerkt).",
+                heading="Queue-Ausführung ausgelöst (bis zum derzeit sichtbaren Queue-Ende).",
                 ensure_suggestion=False,
                 compact=is_card,
             )
@@ -717,25 +782,25 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
-            items = service.store.kv_list(chat_id, limit=20)
-            if not items:
+            latest_entry = service.store.latest_for_chat(chat_id)
+            if not latest_entry or not latest_entry.analysis:
                 text, keyboard = await _render_chat_detail(
                     chat_id,
                     page,
-                    heading="Keine Keys gespeichert.",
+                    heading="Keine Analysis gespeichert.",
                     ensure_suggestion=False,
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
-            lines = [f"- {item.key}={item.value}" for item in items]
+            rendered = _limit_message(json.dumps(latest_entry.analysis, ensure_ascii=False, indent=2), max_len=2200)
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading="KV Store", ensure_suggestion=False, compact=is_card
+                chat_id, page, heading="Analysis-Objekt", ensure_suggestion=False, compact=is_card
             )
             if is_card:
-                text = _limit_caption(text + "\n" + "\n".join(lines[:6]))
+                text = _limit_caption(text + "\n" + rendered[:700])
             else:
-                text = _limit_message(text + "\n\n" + "\n".join(lines))
+                text = _limit_message(text + "\n\n" + rendered)
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
@@ -768,94 +833,59 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             if item.metadata:
                 parts.append("Meta=" + ",".join(f"{k}={v}" for k, v in item.metadata.items()))
             if item.analysis:
-                parts.append(f"Analyse={item.analysis}")
+                parts.append("Analyse=" + json.dumps(item.analysis, ensure_ascii=False))
             blocks.append("\n".join(parts))
         await _guarded_reply_chunks(update, "Persistierte Analysen:\n\n" + "\n\n".join(blocks))
 
-    async def kv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update):
-            return
-        if not service.store:
-            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
-            return
-        if len(context.args) < 3:
-            await _guarded_reply(update, "Nutzung: /kvset <scammer_chat_id> <key> <value>")
-            return
-        try:
-            scammer_chat_id = int(context.args[0])
-        except ValueError:
-            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
-            return
-        key = context.args[1].strip().lower()
-        value = " ".join(context.args[2:]).strip()
-        if not key or not value:
-            await _guarded_reply(update, "Nutzung: /kvset <scammer_chat_id> <key> <value>")
-            return
-        service.store.kv_set(scammer_chat_id, key, value)
-        await _guarded_reply(update, f"Gespeichert fuer {scammer_chat_id}: {key}={value}")
-
-    async def kv_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update):
-            return
-        if not service.store:
-            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
-            return
-        if len(context.args) != 2:
-            await _guarded_reply(update, "Nutzung: /kvget <scammer_chat_id> <key>")
-            return
-        try:
-            scammer_chat_id = int(context.args[0])
-        except ValueError:
-            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
-            return
-        key = context.args[1].strip().lower()
-        item = service.store.kv_get(scammer_chat_id, key)
-        if not item:
-            await _guarded_reply(update, "Key nicht gefunden.")
-            return
-        await _guarded_reply(
-            update,
-            f"[{item.scammer_chat_id}] {item.key}={item.value} (updated {item.updated_at:%Y-%m-%d %H:%M:%S})",
-        )
-
-    async def kv_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update):
-            return
-        if not service.store:
-            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
-            return
-        if len(context.args) != 2:
-            await _guarded_reply(update, "Nutzung: /kvdel <scammer_chat_id> <key>")
-            return
-        try:
-            scammer_chat_id = int(context.args[0])
-        except ValueError:
-            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
-            return
-        key = context.args[1].strip().lower()
-        deleted = service.store.kv_delete(scammer_chat_id, key)
-        await _guarded_reply(update, "Geloescht." if deleted else "Key nicht gefunden.")
-
-    async def kv_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def analysis_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
         if not service.store:
             await _guarded_reply(update, "Keine Datenbank konfiguriert.")
             return
         if len(context.args) != 1:
-            await _guarded_reply(update, "Nutzung: /kvlist <scammer_chat_id>")
+            await _guarded_reply(update, "Nutzung: /analysisget <scammer_chat_id>")
             return
         try:
             scammer_chat_id = int(context.args[0])
         except ValueError:
             await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
             return
-        items = service.store.kv_list(scammer_chat_id, limit=20)
-        if not items:
-            await _guarded_reply(update, "Keine Keys fuer diesen Scammer gespeichert.")
+        entry = service.store.latest_for_chat(scammer_chat_id)
+        if not entry:
+            await _guarded_reply(update, "Keine Analyse fuer diesen Chat gefunden.")
             return
-        lines = [f"- {item.key}={item.value}" for item in items]
-        await _guarded_reply(update, f"KV Store fuer {scammer_chat_id}:\n" + "\n".join(lines))
+        analysis_json = json.dumps(entry.analysis or {}, ensure_ascii=False, indent=2)
+        await _guarded_reply_chunks(update, f"Analyse fuer {scammer_chat_id}:\n{analysis_json}")
+
+    async def analysis_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            return
+        if len(context.args) < 2:
+            await _guarded_reply(update, "Nutzung: /analysisset <scammer_chat_id> <json_objekt>")
+            return
+        try:
+            scammer_chat_id = int(context.args[0])
+        except ValueError:
+            await _guarded_reply(update, "scammer_chat_id muss eine Zahl sein.")
+            return
+        raw_json = " ".join(context.args[1:]).strip()
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            await _guarded_reply(update, f"Ungueltiges JSON: {exc}")
+            return
+        if not isinstance(parsed, dict):
+            await _guarded_reply(update, "analysis muss ein JSON-Objekt sein.")
+            return
+        updated = service.store.update_latest_analysis(scammer_chat_id, parsed)
+        if not updated:
+            await _guarded_reply(update, "Keine Analyse fuer diesen Chat gefunden.")
+            return
+        await _guarded_reply(update, f"Analyse fuer {scammer_chat_id} aktualisiert.")
 
     async def prompt_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -887,10 +917,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app.add_handler(CommandHandler("chats", chats))
     app.add_handler(CommandHandler("last", last))
     app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("kvset", kv_set))
-    app.add_handler(CommandHandler("kvget", kv_get))
-    app.add_handler(CommandHandler("kvdel", kv_del))
-    app.add_handler(CommandHandler("kvlist", kv_list))
+    app.add_handler(CommandHandler("analysisget", analysis_get))
+    app.add_handler(CommandHandler("analysisset", analysis_set))
     app.add_handler(CommandHandler("promptpreview", prompt_preview))
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mc|ma|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|generate|send|stop|autoon|autooff|img|kv):"))
     return app

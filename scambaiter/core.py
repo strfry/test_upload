@@ -5,12 +5,14 @@ import base64
 import hashlib
 import json
 import re
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Literal
 
 
 MAX_GENERATION_ATTEMPTS = 2
+MAX_REPAIR_SOURCE_CHARS = 12000
 
 from huggingface_hub import InferenceClient
 from telethon import TelegramClient
@@ -23,30 +25,70 @@ from scambaiter.storage import AnalysisStore
 
 
 IMAGE_MARKER_PREFIX = "[Bild gesendet"
-PROMPT_KV_KEYS = (
-    "sprache",
-    "messenger",
-    "absicht",
-    "kontakt",
-    "kontakt_art",
-    "betrüger_art",
-    "scam-verdacht",
-    "typ",
-)
 
 SYSTEM_PROMPT = """Du bist eine Scambaiting-AI. Deine Rolle: Eine naive, aber freundliche potenzielle Zielperson.
-Ziel: Verwickle das Gegenüber in ein langes, harmloses Gespräch.
-Regel: Kein eigenes Scamming/Social Engineering. Nutze keine Emojis oder Gedankenstriche.
+Du bist ein autonomer Generator für Scambaiting-Antworten.
 
-Antworte AUSSCHLIESSLICH im folgenden JSON-Format:
-{
-  "analysis": "Kurze Einschätzung: Ist es ein Scammer? Worauf will er hinaus?",
-  "meta": {
-    "sprache": "de/en/...",
-    "absicht": "Einschätzung der Intention des Gegenübers"
-  },
-  "reply": "Deine Antwort-Nachricht an die Person (plausibel, alltagsnah, ohne KI-Stil)"
-}"""
+AUSGABEVERTRAG:
+- Gib ausschließlich ein einzelnes gültiges JSON-Objekt aus.
+- Kein Markdown. Kein Fließtext außerhalb des JSON.
+- Keine zusätzlichen Kommentare oder Erklärungen.
+- Erlaubte Top-Level-Keys:
+  - schema
+  - analysis
+  - message
+  - actions
+- schema MUSS exakt "scambait.llm.v1" sein.
+
+PFLICHTFELDER:
+- schema (String, exakt "scambait.llm.v1")
+- analysis (Objekt, kein String)
+- message.text (String, max. 4000 Zeichen)
+- actions (Array, max. 10 Elemente)
+
+STRUKTURREGELN:
+- message.text enthält die tatsächlich zu sendende Nachricht.
+- send_message bedeutet: sende message.text.
+- Keine zusätzlichen Keys erzeugen.
+- Keine nicht spezifizierten Felder erfinden.
+
+ERLAUBTE ACTION-TYPEN:
+- simulate_typing (benötigt duration_seconds)
+- delay_send (benötigt delay_seconds)
+- send_message (optional reply_to)
+- edit_message (benötigt message_id und new_text)
+- noop
+- escalate_to_human (benötigt reason)
+
+ACTION-GRENZEN:
+- duration_seconds: 0–60
+- delay_seconds: 0–86400
+
+REFERENZREGELN:
+- Nachrichten können über "message_id" referenziert werden.
+- reply_to muss auf eine existierende message_id aus der Konversation verweisen.
+- Erfinde keine neuen message_id-Werte.
+
+ZEITINFORMATION:
+- Nachrichten können ein Feld "ts_utc" (ISO-8601) enthalten.
+- Nutze Zeitabstände optional zur Einschätzung von Dringlichkeit oder natürlichem Antwortverhalten.
+- Führe keine komplexe Datumsberechnung durch.
+
+SPRACHE:
+- Verwende ausschließlich die Sprache aus dem Eingabefeld "language".
+- Die JSON-Struktur und Feldnamen bleiben unverändert.
+
+SICHERHEITSREGELN:
+- Niemals echtes Geld senden oder zusagen.
+- Keine echten persönlichen Daten preisgeben.
+- Keine illegalen Anleitungen geben.
+- Keine Schadsoftware oder Credential-Erfassung unterstützen.
+
+FALLBACK:
+- Wenn keine sichere oder regelkonforme Antwort möglich ist:
+  Verwende escalate_to_human.
+
+Gib ausschließlich gültiges JSON zurück."""
 
 
 @dataclass
@@ -68,16 +110,18 @@ class ChatMessage:
 class SuggestionResult:
     context: ChatContext
     suggestion: str
-    analysis: str | None = None
+    analysis: dict[str, object] | None = None
     metadata: dict[str, str] | None = None
+    actions: list[dict[str, object]] | None = None
 
 
 @dataclass
 class ModelOutput:
     raw: str
     suggestion: str
-    analysis: str | None
+    analysis: dict[str, object] | None
     metadata: dict[str, str]
+    actions: list[dict[str, object]]
 
 
 def parse_structured_model_output(text: str) -> ModelOutput | None:
@@ -90,20 +134,114 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
     if not isinstance(data, dict):
         return None
 
-    reply = str(data.get("reply", "")).strip()
+    allowed_top_level_keys = {"schema", "analysis", "message", "actions"}
+    if any(str(key) not in allowed_top_level_keys for key in data.keys()):
+        return None
+
+    schema_value = data.get("schema")
+    if not isinstance(schema_value, str) or schema_value.strip() != "scambait.llm.v1":
+        return None
+
+    message_value = data.get("message")
+    if not isinstance(message_value, dict):
+        return None
+    if any(str(key) != "text" for key in message_value.keys()):
+        return None
+    text_value = message_value.get("text")
+    if not isinstance(text_value, str):
+        return None
+    reply = text_value.strip()
+    if not reply or len(reply) > 4000:
+        return None
+
+    actions_value = data.get("actions")
+    if not isinstance(actions_value, list) or not actions_value or len(actions_value) > 10:
+        return None
+
+    normalized_actions: list[dict[str, object]] = []
+    for action in actions_value:
+        if not isinstance(action, dict):
+            return None
+        action_type = action.get("type")
+        if not isinstance(action_type, str):
+            return None
+
+        if action_type == "simulate_typing":
+            expected = {"type", "duration_seconds"}
+            if set(action.keys()) != expected:
+                return None
+            duration = action.get("duration_seconds")
+            if not isinstance(duration, (int, float)) or duration < 0 or duration > 60:
+                return None
+            normalized_actions.append({"type": "simulate_typing", "duration_seconds": float(duration)})
+        elif action_type == "delay_send":
+            expected = {"type", "delay_seconds"}
+            if set(action.keys()) != expected:
+                return None
+            delay = action.get("delay_seconds")
+            if not isinstance(delay, (int, float)) or delay < 0 or delay > 86400:
+                return None
+            normalized_actions.append({"type": "delay_send", "delay_seconds": float(delay)})
+        elif action_type == "send_message":
+            expected = {"type", "reply_to"}
+            keys = set(action.keys())
+            if keys != {"type"} and keys != expected:
+                return None
+            entry: dict[str, object] = {"type": "send_message"}
+            if "reply_to" in action:
+                reply_to = action.get("reply_to")
+                if not isinstance(reply_to, (str, int)):
+                    return None
+                entry["reply_to"] = reply_to
+            normalized_actions.append(entry)
+        elif action_type == "edit_message":
+            expected = {"type", "message_id", "new_text"}
+            if set(action.keys()) != expected:
+                return None
+            if not isinstance(action.get("new_text"), str):
+                return None
+            message_id = action.get("message_id")
+            if not isinstance(message_id, (str, int)):
+                return None
+            normalized_actions.append(
+                {
+                    "type": "edit_message",
+                    "message_id": message_id,
+                    "new_text": action.get("new_text", ""),
+                }
+            )
+        elif action_type == "noop":
+            if set(action.keys()) != {"type"}:
+                return None
+            normalized_actions.append({"type": "noop"})
+        elif action_type == "escalate_to_human":
+            expected = {"type", "reason"}
+            if set(action.keys()) != expected:
+                return None
+            if not isinstance(action.get("reason"), str) or not action.get("reason").strip():
+                return None
+            normalized_actions.append({"type": "escalate_to_human", "reason": action.get("reason", "").strip()})
+        else:
+            return None
+
     analysis_value = data.get("analysis")
-    analysis = str(analysis_value).strip() if isinstance(analysis_value, str) else None
+    if not isinstance(analysis_value, dict):
+        return None
+    analysis: dict[str, object] = analysis_value
 
     metadata: dict[str, str] = {}
-    meta_value = data.get("meta")
-    if isinstance(meta_value, dict):
-        for key, value in meta_value.items():
-            k = str(key).strip().lower()
-            v = str(value).strip()
-            if k and v:
-                metadata[k] = v
+    for top_level_key in ("schema",):
+        top_level_value = data.get(top_level_key)
+        if isinstance(top_level_value, str) and top_level_value.strip():
+            metadata[top_level_key] = top_level_value.strip()
 
-    return ModelOutput(raw=text, suggestion=reply, analysis=analysis or None, metadata=metadata)
+    return ModelOutput(
+        raw=text,
+        suggestion=reply,
+        analysis=analysis or None,
+        metadata=metadata,
+        actions=normalized_actions,
+    )
 
 
 def _normalize_text_content(content: object) -> str:
@@ -232,7 +370,7 @@ class ScambaiterCore:
     def build_conversation_messages(
         self,
         context: ChatContext,
-        prompt_kv_state: dict[str, str] | None = None,
+        prompt_context: dict[str, object] | None = None,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
             {
@@ -244,15 +382,14 @@ class ScambaiterCore:
             }
         ]
 
-        if prompt_kv_state:
-            kv_lines = "\n".join(f"- {key}={value}" for key, value in sorted(prompt_kv_state.items()))
+        if prompt_context:
+            context_json = json.dumps(prompt_context, ensure_ascii=False, indent=2)
             messages.append(
                 {
                     "role": "user",
                     "content": (
-                        "System-Kontext (KV-Whitelist, nur zur internen Steuerung):\n"
-                        f"{kv_lines}\n"
-                        "Diese KV-Werte sind Kontext, aber nicht wortwörtlich in ANTWORT zu zitieren."
+                        "Strukturierter System-Kontext (nur intern, nicht wortwörtlich zitieren):\n"
+                        f"{context_json}"
                     ),
                 }
             )
@@ -447,12 +584,12 @@ class ScambaiterCore:
         self,
         context: ChatContext,
         language_hint: str | None = None,
-        prompt_kv_state: dict[str, str] | None = None,
+        prompt_context: dict[str, object] | None = None,
         on_warning: Callable[[str], None] | None = None,
     ) -> ModelOutput:
         last_output: ModelOutput | None = None
         language_system_prompt = self.build_language_system_prompt(language_hint)
-        conversation_messages = self.build_conversation_messages(context, prompt_kv_state=prompt_kv_state)
+        conversation_messages = self.build_conversation_messages(context, prompt_context=prompt_context)
 
         self._debug(
             f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
@@ -477,19 +614,46 @@ class ScambaiterCore:
                         "content": (
                             "Deine letzte Antwort war nicht sendefertig. "
                             "Gib jetzt ausschließlich ein valides JSON-Objekt zurück "
-                            "mit den Feldern analysis, meta und reply. Keine Zusatztexte."
+                            "mit schema=\"scambait.llm.v1\", analysis als OBJEKT, "
+                            "message.text als nicht-leerem String und actions als nicht-leerem Array. "
+                            "Keine Zusatztexte."
                         ),
                     }
                 )
 
             self._debug(f"Model-Request (Versuch {attempt}): {truncate_for_log(str(messages), max_len=2000)}")
 
-            completion = self.hf_client.chat.completions.create(
-                model=self.config.hf_model,
-                max_tokens=self.config.hf_max_tokens,
-                messages=messages,
-                response_format={"type": "json_object"},
-            )
+            try:
+                completion = self.hf_client.chat.completions.create(
+                    model=self.config.hf_model,
+                    max_tokens=self.config.hf_max_tokens,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as exc:
+                error_detail = format_model_exception_details(exc)
+                print(
+                    f"[ERROR] Model-Request fehlgeschlagen für {context.title} ({context.chat_id}) "
+                    f"in Versuch {attempt}: {error_detail}"
+                )
+                failed_generation = extract_failed_generation_from_exception(exc)
+                if failed_generation:
+                    repaired = self._attempt_repair_output(
+                        source_text=failed_generation,
+                        language_system_prompt=language_system_prompt,
+                    )
+                    if repaired is not None:
+                        if on_warning:
+                            on_warning(
+                                f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) nach Request-Fehler."
+                            )
+                        return repaired
+                if attempt < MAX_GENERATION_ATTEMPTS:
+                    continue
+                raise RuntimeError(
+                    "Model request failed after retries. "
+                    "Details im Log unter [ERROR] Model-Request fehlgeschlagen."
+                ) from exc
             choice = completion.choices[0]
             finish_reason = (getattr(choice, "finish_reason", None) or "").strip().lower()
             usage = getattr(completion, "usage", None)
@@ -513,7 +677,17 @@ class ScambaiterCore:
                 print(
                     f"[WARN] Keine valide JSON-Ausgabe für {context.title} ({context.chat_id}) in Versuch {attempt}."
                 )
-                last_output = ModelOutput(raw=raw, suggestion="", analysis=None, metadata={})
+                repaired = self._attempt_repair_output(
+                    source_text=raw,
+                    language_system_prompt=language_system_prompt,
+                )
+                if repaired is not None:
+                    if on_warning:
+                        on_warning(
+                            f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) nach invalidem JSON."
+                        )
+                    return repaired
+                last_output = ModelOutput(raw=raw, suggestion="", analysis=None, metadata={}, actions=[])
                 continue
 
             suggestion = structured.suggestion.strip()
@@ -528,6 +702,7 @@ class ScambaiterCore:
                 suggestion=suggestion,
                 analysis=analysis,
                 metadata=metadata,
+                actions=structured.actions,
             )
             last_output = current_output
             if suggestion and not looks_like_reasoning_output(suggestion):
@@ -539,8 +714,66 @@ class ScambaiterCore:
             )
 
         if last_output is None:
-            return ModelOutput(raw="", suggestion="", analysis=None, metadata={})
+            return ModelOutput(raw="", suggestion="", analysis=None, metadata={}, actions=[])
         return last_output
+
+    def _attempt_repair_output(
+        self,
+        source_text: str,
+        language_system_prompt: str | None = None,
+    ) -> ModelOutput | None:
+        candidate = (source_text or "").strip()
+        if not candidate:
+            return None
+        if len(candidate) > MAX_REPAIR_SOURCE_CHARS:
+            candidate = candidate[:MAX_REPAIR_SOURCE_CHARS]
+
+        repair_messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": (
+                    "Du bist ein JSON-Reparaturmodul. "
+                    "Gib exakt ein valides JSON-Objekt im geforderten Schema zurück. "
+                    "Keine Erklärungen, kein Markdown."
+                ),
+            }
+        ]
+        if language_system_prompt:
+            repair_messages.append({"role": "system", "content": language_system_prompt})
+        repair_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Repariere die folgende fehlerhafte Modellausgabe in ein valides JSON-Objekt "
+                    "mit den Top-Level-Feldern schema, analysis, message und actions. "
+                    "schema MUSS exakt \"scambait.llm.v1\" sein. "
+                    "analysis MUSS ein JSON-Objekt sein (kein String). "
+                    "message.text darf nicht leer sein. actions muss mindestens ein Element enthalten "
+                    "(falls nötig: noop).\n\n"
+                    f"Fehlerhafte Ausgabe:\n{candidate}"
+                ),
+            }
+        )
+
+        try:
+            repair_completion = self.hf_client.chat.completions.create(
+                model=self.config.hf_model,
+                max_tokens=self.config.hf_max_tokens,
+                messages=repair_messages,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:
+            print(f"[WARN] Repair-Request fehlgeschlagen: {format_model_exception_details(exc)}")
+            return None
+
+        repair_raw = _normalize_text_content(repair_completion.choices[0].message.content)
+        repaired = parse_structured_model_output(repair_raw)
+        if repaired is None:
+            print(f"[WARN] Repair-Request lieferte weiterhin invalides JSON: {truncate_for_log(repair_raw, max_len=1200)}")
+            return None
+        if not repaired.suggestion or looks_like_reasoning_output(repaired.suggestion):
+            return None
+        return repaired
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
         if not self.config.send_enabled:
@@ -686,3 +919,59 @@ def looks_like_reasoning_output(text: str) -> bool:
         r"^(let me think|i should|zuerst|first|danach|then|abschließend|finally)\b",
     )
     return any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in reasoning_patterns)
+
+
+def _find_key_deep(obj: object, key: str) -> object | None:
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj.get(key)
+        for value in obj.values():
+            found = _find_key_deep(value, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_key_deep(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def extract_failed_generation_from_exception(exc: Exception) -> str | None:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    failed_generation = _find_key_deep(payload, "failed_generation")
+    if isinstance(failed_generation, str):
+        cleaned = failed_generation.strip()
+        return cleaned or None
+    return None
+
+
+def format_model_exception_details(exc: Exception) -> str:
+    parts = [f"{type(exc).__name__}: {exc}"]
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if status is not None:
+            parts.append(f"status_code={status}")
+        try:
+            payload = response.json()
+            failed_generation = _find_key_deep(payload, "failed_generation")
+            if failed_generation:
+                parts.append(f"failed_generation={truncate_for_log(str(failed_generation), max_len=2500)}")
+            parts.append(f"response_json={truncate_for_log(json.dumps(payload, ensure_ascii=False), max_len=2500)}")
+        except Exception:
+            text = getattr(response, "text", None)
+            if text:
+                parts.append(f"response_text={truncate_for_log(str(text), max_len=2500)}")
+
+    stack = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    if stack:
+        parts.append(f"exception_only={truncate_for_log(stack, max_len=800)}")
+    return " | ".join(parts)

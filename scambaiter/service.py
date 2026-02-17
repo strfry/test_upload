@@ -9,7 +9,7 @@ from typing import Callable
 
 PendingListener = Callable[[int, "PendingMessage | None"], None]
 
-from scambaiter.core import PROMPT_KV_KEYS, ChatContext, ScambaiterCore, SuggestionResult
+from scambaiter.core import ChatContext, ScambaiterCore, SuggestionResult
 from scambaiter.storage import AnalysisStore
 
 
@@ -42,6 +42,8 @@ class PendingMessage:
     sent_message_id: int | None = None
     last_error: str | None = None
     send_requested: bool = False
+    action_queue: list[dict[str, object]] | None = None
+    schema: str | None = None
 
 
 
@@ -71,6 +73,11 @@ class BackgroundService:
         self._known_chats: dict[int, KnownChatEntry] = {}
         self._chat_auto_enabled: set[int] = set()
         self._pending_listeners: list[PendingListener] = []
+        self._general_warnings: list[str] = []
+        if self.core.config.hf_max_tokens < 1000:
+            self.add_general_warning(
+                f"HF_MAX_TOKENS={self.core.config.hf_max_tokens} ist niedrig; empfohlen sind >= 1000."
+            )
 
     def add_pending_listener(self, listener: PendingListener) -> None:
         self._pending_listeners.append(listener)
@@ -86,6 +93,19 @@ class BackgroundService:
     def list_known_chats(self, limit: int = 50) -> list[KnownChatEntry]:
         items = sorted(self._known_chats.values(), key=lambda item: item.updated_at, reverse=True)
         return items[:limit]
+
+    def add_general_warning(self, message: str) -> None:
+        text = message.strip()
+        if not text:
+            return
+        if text in self._general_warnings:
+            return
+        self._general_warnings.append(text)
+        if len(self._general_warnings) > 30:
+            self._general_warnings = self._general_warnings[-30:]
+
+    def get_general_warnings(self, limit: int = 5) -> list[str]:
+        return self._general_warnings[-limit:]
 
     async def refresh_known_chats_from_folder(self) -> int:
         async with self._run_lock:
@@ -173,9 +193,22 @@ class BackgroundService:
                     if context:
                         process_contexts.append(context)
             else:
+                if not self._chat_auto_enabled:
+                    summary = RunSummary(
+                        started_at=started,
+                        finished_at=datetime.now(),
+                        chat_count=0,
+                        sent_count=0,
+                    )
+                    self.last_summary = summary
+                    return summary
                 folder_chat_ids = await self.core.get_folder_chat_ids()
                 contexts = await self.core.collect_folder_chats(folder_chat_ids)
-                process_contexts = [ctx for ctx in contexts if self._should_process_context(ctx)]
+                process_contexts = [
+                    ctx
+                    for ctx in contexts
+                    if ctx.chat_id in self._chat_auto_enabled and self._should_process_context(ctx)
+                ]
 
             results = await self._generate_for_contexts(process_contexts, on_warning=on_warning, trigger="suggestion-generated")
             sent_count = await self._process_due_messages()
@@ -199,9 +232,13 @@ class BackgroundService:
 
     async def _prefetch_folder_suggestions(self) -> None:
         try:
+            if not self._chat_auto_enabled:
+                return
             folder_chat_ids = await self.core.get_folder_chat_ids()
             contexts = await self.core.collect_folder_chats(folder_chat_ids)
             for ctx in contexts:
+                if ctx.chat_id not in self._chat_auto_enabled:
+                    continue
                 pending = self._pending_messages.get(ctx.chat_id)
                 if pending and pending.state in {
                     MessageState.GENERATING,
@@ -285,22 +322,20 @@ class BackgroundService:
         results: list[SuggestionResult] = []
         for context in contexts:
             language_hint = None
-            prompt_kv_state: dict[str, str] = {"messenger": "telegram"}
+            prompt_context: dict[str, object] = {"messenger": "telegram"}
             if self.store:
-                lang_item = self.store.kv_get(context.chat_id, "sprache")
-                if lang_item:
-                    language_hint = lang_item.value
-                prompt_kv_state.update(self.store.kv_get_many(context.chat_id, list(PROMPT_KV_KEYS)))
-            prompt_kv_state["messenger"] = "telegram"
+                previous = self.store.latest_for_chat(context.chat_id)
+                previous_analysis = previous.analysis if previous else None
+                language_hint = self._extract_language_hint(previous_analysis)
+                if previous_analysis:
+                    prompt_context["previous_analysis"] = previous_analysis
 
             output = self.core.generate_output(
                 context,
                 language_hint=language_hint,
-                prompt_kv_state=prompt_kv_state,
+                prompt_context=prompt_context,
                 on_warning=(
-                    (lambda message, chat_id=context.chat_id: on_warning(chat_id, message))
-                    if on_warning
-                    else None
+                    (lambda message, chat_id=context.chat_id: self._handle_generation_warning(chat_id, message, on_warning))
                 ),
             )
             result = SuggestionResult(
@@ -308,6 +343,7 @@ class BackgroundService:
                 suggestion=output.suggestion,
                 analysis=output.analysis,
                 metadata=output.metadata,
+                actions=output.actions,
             )
             results.append(result)
 
@@ -320,7 +356,13 @@ class BackgroundService:
                     metadata=output.metadata,
                 )
 
-            self._register_waiting_message(context, output.suggestion, trigger=trigger)
+            self._register_waiting_message(
+                context,
+                output.suggestion,
+                trigger=trigger,
+                action_queue=output.actions,
+                schema=output.metadata.get("schema"),
+            )
         return results
 
     def _cancel_chat_task(self, chat_id: int) -> None:
@@ -354,7 +396,14 @@ class BackgroundService:
             if task is asyncio.current_task():
                 self._chat_tasks.pop(chat_id, None)
 
-    def _register_waiting_message(self, context: ChatContext, suggestion: str, trigger: str) -> None:
+    def _register_waiting_message(
+        self,
+        context: ChatContext,
+        suggestion: str,
+        trigger: str,
+        action_queue: list[dict[str, object]] | None = None,
+        schema: str | None = None,
+    ) -> None:
         if not suggestion.strip():
             return
 
@@ -376,9 +425,31 @@ class BackgroundService:
             wait_until=wait_until,
             trigger=trigger,
             send_requested=bool(previous and previous.send_requested),
+            action_queue=list(action_queue or []),
+            schema=(schema or "").strip() or None,
         )
         self._notify_pending_changed(context.chat_id)
         self._start_waiting_task(context.chat_id)
+
+    @staticmethod
+    def _extract_language_hint(analysis: dict[str, object] | None) -> str | None:
+        if not analysis:
+            return None
+        for key in ("language", "sprache"):
+            value = analysis.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _handle_generation_warning(
+        self,
+        chat_id: int,
+        message: str,
+        on_warning: Callable[[int, str], None] | None,
+    ) -> None:
+        self.add_general_warning(f"Chat {chat_id}: {message}")
+        if on_warning:
+            on_warning(chat_id, message)
 
     async def _process_due_messages(self) -> int:
         # Waiting->Send wird durch _waiting_flow erledigt; dieser Hook bleibt für Kompatibilität.
@@ -428,11 +499,65 @@ class BackgroundService:
                 self._notify_pending_changed(chat_id)
                 return
 
-            async with self.core.client.action(chat_id, "typing"):
-                await asyncio.sleep(2.0)
+            sent_message_id: int | None = None
+            sent = False
+            outgoing_text = pending.suggestion
+            action_queue = list(pending.action_queue or [])
+            if not action_queue:
+                action_queue = [{"type": "simulate_typing", "duration_seconds": 2.0}, {"type": "send_message"}]
 
-            sent = await self.core.client.send_message(chat_id, pending.suggestion)
-            pending.sent_message_id = sent.id
+            for action in action_queue:
+                action_type = str(action.get("type", "")).strip().lower()
+                if action_type == "simulate_typing":
+                    duration = float(action.get("duration_seconds", 0.0))
+                    duration = min(60.0, max(0.0, duration))
+                    async with self.core.client.action(chat_id, "typing"):
+                        await asyncio.sleep(duration)
+                    continue
+
+                if action_type == "delay_send":
+                    delay = float(action.get("delay_seconds", 0.0))
+                    delay = min(86400.0, max(0.0, delay))
+                    await asyncio.sleep(delay)
+                    continue
+
+                if action_type == "send_message":
+                    reply_to = action.get("reply_to")
+                    send_kwargs: dict[str, object] = {}
+                    if isinstance(reply_to, int):
+                        send_kwargs["reply_to"] = reply_to
+                    sent_message = await self.core.client.send_message(chat_id, outgoing_text, **send_kwargs)
+                    sent_message_id = int(sent_message.id)
+                    sent = True
+                    continue
+
+                if action_type == "edit_message":
+                    message_id = action.get("message_id")
+                    new_text = str(action.get("new_text", "")).strip()
+                    if isinstance(message_id, int) and new_text:
+                        try:
+                            await self.core.client.edit_message(chat_id, message_id, new_text)
+                        except Exception:
+                            pass
+                    continue
+
+                if action_type == "noop":
+                    continue
+
+                if action_type == "escalate_to_human":
+                    reason = str(action.get("reason", "")).strip() or "Eskalation durch Action-Plan."
+                    pending.state = MessageState.ERROR
+                    pending.last_error = f"Eskalation erforderlich: {reason}"
+                    self._notify_pending_changed(chat_id)
+                    return
+
+            if not sent:
+                pending.state = MessageState.ERROR
+                pending.last_error = "Action-Queue enthält keine send_message-Aktion."
+                self._notify_pending_changed(chat_id)
+                return
+
+            pending.sent_message_id = sent_message_id
             pending.state = MessageState.SENT
             self._notify_pending_changed(chat_id)
         except asyncio.CancelledError:
@@ -488,6 +613,9 @@ class BackgroundService:
 
     def pending_count(self) -> int:
         return len(self._pending_messages)
+
+    def list_pending_messages(self) -> list[PendingMessage]:
+        return sorted(self._pending_messages.values(), key=lambda item: item.created_at, reverse=True)
 
     def _should_process_context(self, context: ChatContext) -> bool:
         fingerprint = self._fingerprint_context(context)

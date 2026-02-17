@@ -37,7 +37,7 @@ export SCAMBAITER_SEND_CONFIRM="SEND"          # Pflicht, wenn SEND aktiv
 export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30" # optional
 
 export SCAMBAITER_INTERACTIVE="1"              # nur Batch-Modus
-export SCAMBAITER_ANALYSIS_DB_PATH="scambaiter.sqlite3"  # Persistenz für Analysen + Key-Value Store
+export SCAMBAITER_ANALYSIS_DB_PATH="scambaiter.sqlite3"  # Persistenz für Analysen
 ```
 
 ## Batch-Modus
@@ -69,7 +69,7 @@ Verfügbare Bot-Kommandos:
 - `/status` – zeigt den letzten Lauf und die Anzahl aktiver Nachrichtenprozesse
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
-- `/chats` – zeigt ein paginiertes Chat-Menü; pro Chat öffnet sich ein Detailmenü mit den neuesten Infos und Aktionen `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `KV`
+- `/chats` – zeigt ein paginiertes Chat-Menü; pro Chat öffnet sich ein Detailmenü mit den neuesten Infos und Aktionen `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `Analysis`
   - Beim Start im Bot-Modus wird dieses Menü automatisch gepostet
   - Beim Öffnen eines Chats wird eine Profil-Card mit Profilbild (falls vorhanden) als Bot-Nachricht gepostet
   - `Refresh` startet den Hintergrund-Refresh und aktualisiert die Liste ohne blockierenden Vollscan im Handler
@@ -84,15 +84,13 @@ Verfügbare Bot-Kommandos:
   - Mit **Auto an** läuft die Wartephase dieses Chats mit Timeout (`SCAMBAITER_AUTO_INTERVAL_SECONDS`), mit **Auto aus** unbegrenzt
 - `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick
 - `/history` – zeigt die letzten persistent gespeicherten Analysen inkl. Metadaten (lange Ausgaben werden in mehrere Nachrichten aufgeteilt)
-- `/kvset <scammer_chat_id> <key> <value>` – setzt/überschreibt einen Key für einen Scammer
-- `/kvget <scammer_chat_id> <key>` – liest einen Key für einen Scammer
-- `/kvdel <scammer_chat_id> <key>` – löscht einen Key für einen Scammer
-- `/kvlist <scammer_chat_id>` – listet Keys für einen Scammer
+- `/analysisget <scammer_chat_id>` – zeigt das zuletzt gespeicherte Analysis-JSON für einen Chat
+- `/analysisset <scammer_chat_id> <json_objekt>` – überschreibt das zuletzt gespeicherte Analysis-JSON für einen Chat
 
-Hinweis: Nach jedem Lauf werden `analyse`, `antwort` und alle Modell-Metadaten (z.B. `sprache`) automatisch als Keys für den jeweiligen Scammer aktualisiert.
+Hinweis: Nach jedem Lauf wird das vom Modell gelieferte `analysis`-Objekt direkt als JSON gespeichert.
 Eingehende Bildnachrichten vom Scammer werden automatisch mit `HF_VISION_MODEL` ausführlich und wohlwollend beschrieben und als Marker (`[Bild gesendet: ...]`) in den Chatverlauf für die Textgenerierung eingefügt.
 Die Bildbeschreibung wird per Bild-Hash in der SQLite-DB (`image_descriptions`) gecacht, damit jedes identische Bild nur einmal an das Vision-Modell geschickt wird.
-Wenn `sprache` pro Scammer gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
+Wenn in der letzten gespeicherten Analyse ein `language`- oder `sprache`-Feld gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
 
 ## Projektstruktur
 
@@ -103,7 +101,7 @@ Zur Trennung der Concerns wurde der Code aufgeteilt:
 - `scambaiter/core.py`: Telegram- und HF-Kernlogik
 - `scambaiter/service.py`: Hintergrund-Loop + Laufstatus
 - `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos
-- `scambaiter/storage.py`: SQLite-Persistenz für Analysen + Scammer-spezifischen Key-Value-Store
+- `scambaiter/storage.py`: SQLite-Persistenz für Analysen und Bildbeschreibungen
 
 
 - Für unbeantwortete Chats wird beim Öffnen von `/chats` asynchron ein Vorschlag vorgezogen, damit die Chatliste sofort erscheint.

@@ -13,7 +13,7 @@ from telegram import Bot
 
 from scambaiter.bot_api import create_bot_app
 from scambaiter.config import load_config
-from scambaiter.core import PROMPT_KV_KEYS, ScambaiterCore
+from scambaiter.core import ScambaiterCore
 from scambaiter.service import BackgroundService
 from scambaiter.storage import AnalysisStore
 
@@ -29,15 +29,20 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
     print(f"Gefundene Chats im Ordner: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
         language_hint = None
-        prompt_kv_state: dict[str, str] = {}
-        lang_item = store.kv_get(context.chat_id, "sprache")
-        if lang_item:
-            language_hint = lang_item.value
-        prompt_kv_state = store.kv_get_many(context.chat_id, list(PROMPT_KV_KEYS))
+        prompt_context: dict[str, object] = {"messenger": "telegram"}
+        previous = store.latest_for_chat(context.chat_id)
+        previous_analysis = previous.analysis if previous else None
+        if previous_analysis:
+            prompt_context["previous_analysis"] = previous_analysis
+            for key in ("language", "sprache"):
+                value = previous_analysis.get(key)
+                if isinstance(value, str) and value.strip():
+                    language_hint = value.strip()
+                    break
         output = core.generate_output(
             context,
             language_hint=language_hint,
-            prompt_kv_state=prompt_kv_state,
+            prompt_context=prompt_context,
         )
         store.save(
             chat_id=context.chat_id,
@@ -51,6 +56,8 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
         if output.metadata:
             meta = ", ".join(f"{k}={v}" for k, v in output.metadata.items())
             print(f"[Meta] {meta}")
+        if output.analysis:
+            print(f"[Analysis] {output.analysis}")
         print()
         handled = await core.maybe_interactive_console_reply(context, output.suggestion)
         if not handled:
@@ -67,11 +74,9 @@ async def run() -> None:
             await run_batch(core, store)
             return
 
-        service = BackgroundService(core, interval_seconds=config.auto_interval_seconds, store=store)
-        service.start_startup_bootstrap()
-        service.start_periodic_run()
         bot_me = await Bot(config.bot_token).get_me()
         control_chat_id = await core.resolve_control_chat_id(bot_me.username)
+        service = BackgroundService(core, interval_seconds=config.auto_interval_seconds, store=store)
         bot_app = create_bot_app(
             token=config.bot_token,
             service=service,
@@ -79,11 +84,13 @@ async def run() -> None:
         )
         print(
             "BotAPI aktiv. verfügbare Kommandos: "
-            "/status /runonce /chats /last /history /kvset /kvget /kvdel /kvlist"
+            "/status /runonce /chats /last /history /analysisget /analysisset"
         )
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling()
+        service.start_startup_bootstrap()
+        service.start_periodic_run()
         send_start_menu = bot_app.bot_data.get("send_start_menu")
         if callable(send_start_menu):
             await send_start_menu()
@@ -107,5 +114,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
