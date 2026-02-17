@@ -58,7 +58,7 @@ STRUKTURREGELN:
 ERLAUBTE ACTION-TYPEN:
 - mark_read
 - simulate_typing (benötigt duration_seconds)
-- delay_send (benötigt delay_seconds)
+- wait (benötigt value und unit=seconds|minutes)
 - send_message (optional reply_to)
 - edit_message (benötigt message_id und new_text)
 - noop
@@ -66,7 +66,18 @@ ERLAUBTE ACTION-TYPEN:
 
 ACTION-GRENZEN:
 - duration_seconds: 0–60
-- delay_seconds: 0–86400
+- wait.value mit unit=seconds: 0–86400
+- wait.value mit unit=minutes: 0–10080
+- Plane realistische menschliche Antwortzeiten:
+  - vermeide Mikro-Timing (z.B. 1-4 Sekunden bei längeren Nachrichten)
+  - bei längeren Antworten eher spürbare Tippzeit nutzen
+  - wait für längere Pausen (Minuten/Stunden) nutzen
+- Timing-Heuristik (Richtwert):
+  - kurze Nachricht (<120 Zeichen): simulate_typing ca. 4–8s
+  - mittlere Nachricht (120–280 Zeichen): simulate_typing ca. 8–16s
+  - lange Nachricht (>280 Zeichen): simulate_typing ca. 14–28s
+  - wait mit unit=seconds typischerweise 0–15s, nur wenn es natürlich wirkt
+  - wait mit unit=minutes für längere Pausen, z.B. 5, 30, 120, 1440
 
 REFERENZREGELN:
 - Nachrichten können über "message_id" referenziert werden.
@@ -198,14 +209,25 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
             if not isinstance(duration, (int, float)) or duration < 0 or duration > 60:
                 return None
             normalized_actions.append({"type": "simulate_typing", "duration_seconds": float(duration)})
-        elif action_type == "delay_send":
-            expected = {"type", "delay_seconds"}
+        elif action_type == "wait":
+            expected = {"type", "value", "unit"}
             if set(normalized_action.keys()) != expected:
                 return None
-            delay = normalized_action.get("delay_seconds")
-            if not isinstance(delay, (int, float)) or delay < 0 or delay > 86400:
+            value = normalized_action.get("value")
+            unit = normalized_action.get("unit")
+            if not isinstance(value, (int, float)) or not isinstance(unit, str):
                 return None
-            normalized_actions.append({"type": "delay_send", "delay_seconds": float(delay)})
+            normalized_unit = unit.strip().lower()
+            if normalized_unit not in {"seconds", "minutes"}:
+                return None
+            numeric_value = float(value)
+            if numeric_value < 0:
+                return None
+            if normalized_unit == "seconds" and numeric_value > 86400:
+                return None
+            if normalized_unit == "minutes" and numeric_value > 10080:
+                return None
+            normalized_actions.append({"type": "wait", "value": numeric_value, "unit": normalized_unit})
         elif action_type == "send_message":
             expected = {"type", "reply_to"}
             keys = set(normalized_action.keys())
@@ -264,7 +286,7 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
         suggestion=reply,
         analysis=analysis or None,
         metadata=metadata,
-        actions=normalized_actions,
+        actions=normalize_action_timings(normalized_actions, reply),
     )
 
 
@@ -274,7 +296,7 @@ def normalize_action_shape(action: object) -> dict[str, object] | None:
     if "type" in action:
         return dict(action)
 
-    # Accept and normalize legacy malformed shorthand:
+    # Accept and normalize malformed shorthand:
     # {"send_message": {}} -> {"type": "send_message"}
     if len(action) == 1:
         key = next(iter(action.keys()))
@@ -282,7 +304,7 @@ def normalize_action_shape(action: object) -> dict[str, object] | None:
         if isinstance(key, str) and key in {
             "mark_read",
             "simulate_typing",
-            "delay_send",
+            "wait",
             "send_message",
             "edit_message",
             "noop",
@@ -294,6 +316,39 @@ def normalize_action_shape(action: object) -> dict[str, object] | None:
                     normalized[str(k)] = v
             return normalized
     return dict(action)
+
+
+def normalize_action_timings(actions: list[dict[str, object]], message_text: str) -> list[dict[str, object]]:
+    normalized = [dict(action) for action in actions]
+    text_len = len((message_text or "").strip())
+    has_send = any(str(action.get("type")) == "send_message" for action in normalized)
+    if not has_send:
+        return normalized
+
+    # Heuristic for natural typing time based on outgoing message length.
+    suggested_typing = max(6.0, min(28.0, round(text_len / 45.0, 1)))
+
+    for action in normalized:
+        action_type = str(action.get("type", ""))
+        if action_type == "simulate_typing":
+            duration = action.get("duration_seconds")
+            if isinstance(duration, (int, float)) and duration < suggested_typing:
+                print(
+                    "[WARN] Timing normalisiert: simulate_typing von "
+                    f"{duration} auf {suggested_typing} Sekunden erhöht."
+                )
+                action["duration_seconds"] = suggested_typing
+        if action_type == "wait":
+            value = action.get("value")
+            unit = str(action.get("unit", "")).strip().lower()
+            if unit == "seconds" and isinstance(value, (int, float)) and value < 1:
+                print("[WARN] Timing normalisiert: wait(seconds) von " f"{value} auf 1 erhöht.")
+                action["value"] = 1.0
+            if unit == "minutes" and isinstance(value, (int, float)) and value < 0.1:
+                print("[WARN] Timing normalisiert: wait(minutes) von " f"{value} auf 0.1 erhöht.")
+                action["value"] = 0.1
+
+    return normalized
 
 
 def _normalize_text_content(content: object) -> str:
@@ -804,6 +859,8 @@ class ScambaiterCore:
                     "(falls nötig: noop). "
                     "Jede Action muss ein Objekt mit Pflichtfeld \"type\" sein. "
                     "Keine Kurzformen wie {\"send_message\":{}}.\n\n"
+                    "Falls eine Wartezeit geplant ist, nutze die Action \"wait\" mit "
+                    "\"value\" und \"unit\" (seconds|minutes).\n\n"
                     f"Fehlerhafte Ausgabe:\n{candidate}"
                 ),
             }

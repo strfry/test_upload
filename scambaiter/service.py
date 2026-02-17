@@ -548,9 +548,15 @@ class BackgroundService:
                         await asyncio.sleep(duration)
                     continue
 
-                if action_type == "delay_send":
-                    delay = float(action.get("delay_seconds", 0.0))
-                    delay = min(86400.0, max(0.0, delay))
+                if action_type == "wait":
+                    raw_value = action.get("value", 0.0)
+                    raw_unit = str(action.get("unit", "")).strip().lower()
+                    wait_value = float(raw_value) if isinstance(raw_value, (int, float)) else 0.0
+                    if raw_unit == "minutes":
+                        delay = wait_value * 60.0
+                    else:
+                        delay = wait_value
+                    delay = min(604800.0, max(0.0, delay))
                     await asyncio.sleep(delay)
                     continue
 
