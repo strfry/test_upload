@@ -15,9 +15,9 @@ MAX_GENERATION_ATTEMPTS = 2
 MAX_REPAIR_SOURCE_CHARS = 12000
 
 from huggingface_hub import InferenceClient
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetDialogFiltersRequest
-from telethon.tl.types import DialogFilter
+from telethon.tl.types import DialogFilter, UpdateChannelUserTyping, UpdateChatUserTyping, UpdateUserTyping
 from telethon.utils import get_peer_id
 
 from scambaiter.config import AppConfig
@@ -394,12 +394,46 @@ class ScambaiterCore:
         self.store = store
         self.client = TelegramClient(config.telegram_session, config.telegram_api_id, config.telegram_api_hash)
         self.hf_client = InferenceClient(api_key=config.hf_token, base_url=config.hf_base_url)
+        self._recent_typing_by_chat: dict[int, tuple[datetime, str]] = {}
+        self.client.add_event_handler(self._on_raw_event, events.Raw())
 
     async def start(self) -> None:
         await self.client.start()
 
     async def close(self) -> None:
         await self.client.disconnect()
+
+    async def _on_raw_event(self, event) -> None:
+        update = getattr(event, "update", None)
+        if isinstance(update, UpdateUserTyping):
+            chat_id = int(update.user_id)
+            action_name = type(update.action).__name__
+            self._recent_typing_by_chat[chat_id] = (datetime.now(), action_name)
+            return
+        if isinstance(update, UpdateChatUserTyping):
+            chat_id = int(update.chat_id)
+            action_name = type(update.action).__name__
+            self._recent_typing_by_chat[chat_id] = (datetime.now(), action_name)
+            return
+        if isinstance(update, UpdateChannelUserTyping):
+            chat_id = int(update.channel_id)
+            action_name = type(update.action).__name__
+            self._recent_typing_by_chat[chat_id] = (datetime.now(), action_name)
+            return
+
+    def get_recent_typing_hint(self, chat_id: int, max_age_seconds: int = 120) -> dict[str, object] | None:
+        entry = self._recent_typing_by_chat.get(int(chat_id))
+        if not entry:
+            return None
+        ts, action_name = entry
+        age_seconds = int((datetime.now() - ts).total_seconds())
+        if age_seconds < 0 or age_seconds > max_age_seconds:
+            return None
+        return {
+            "kind": "typing_event",
+            "action": action_name,
+            "age_seconds": age_seconds,
+        }
 
     def _debug(self, message: str) -> None:
         if self.config.debug_enabled:

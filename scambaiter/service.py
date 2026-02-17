@@ -352,6 +352,9 @@ class BackgroundService:
             if existing_pending and existing_pending.action_queue:
                 prompt_context["planned_queue"] = existing_pending.action_queue
                 prompt_context["planned_queue_trigger"] = existing_pending.trigger
+            typing_hint = self.core.get_recent_typing_hint(context.chat_id, max_age_seconds=120)
+            if typing_hint:
+                prompt_context["counterparty_live_activity"] = typing_hint
 
             output = self.core.generate_output(
                 context,
