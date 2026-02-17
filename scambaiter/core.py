@@ -887,8 +887,11 @@ class ScambaiterCore:
                     )
                     if repaired is not None:
                         if on_warning:
+                            short_error = truncate_for_log(error_detail, max_len=500)
+                            source_hint = truncate_for_log(failed_generation, max_len=400)
                             on_warning(
-                                f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) nach Request-Fehler."
+                                f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) "
+                                f"nach Request-Fehler. detail={short_error} | source={source_hint}"
                             )
                         return repaired
                 if attempt < MAX_GENERATION_ATTEMPTS:
@@ -926,8 +929,10 @@ class ScambaiterCore:
                 )
                 if repaired is not None:
                     if on_warning:
+                        raw_hint = truncate_for_log(raw, max_len=500)
                         on_warning(
-                            f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) nach invalidem JSON."
+                            f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) "
+                            f"nach invalidem JSON. source={raw_hint}"
                         )
                     return repaired
                 last_output = ModelOutput(raw=raw, suggestion="", analysis=None, metadata={}, actions=[])
