@@ -75,9 +75,9 @@ ACTION-GRENZEN:
   - bei längeren Antworten eher spürbare Tippzeit nutzen
   - wait für längere Pausen (Minuten/Stunden) nutzen
 - Timing-Heuristik (Richtwert):
-  - kurze Nachricht (<120 Zeichen): simulate_typing ca. 4–8s
-  - mittlere Nachricht (120–280 Zeichen): simulate_typing ca. 8–16s
-  - lange Nachricht (>280 Zeichen): simulate_typing ca. 14–28s
+  - kurze Nachricht (<120 Zeichen): simulate_typing ca. 8–22s
+  - mittlere Nachricht (120–280 Zeichen): simulate_typing ca. 16–42s
+  - lange Nachricht (>280 Zeichen): simulate_typing ca. 28–60s
   - wait mit unit=seconds typischerweise 0–15s, nur wenn es natürlich wirkt
   - wait mit unit=minutes für längere Pausen, z.B. 5, 30, 120, 1440
 
@@ -352,8 +352,16 @@ def normalize_action_timings(actions: list[dict[str, object]], message_text: str
     if not has_send:
         return normalized
 
-    # Heuristic for natural typing time based on outgoing message length.
-    suggested_typing = max(6.0, min(28.0, round(text_len / 45.0, 1)))
+    # Heuristic tuned for human-like typing speed in chat.
+    if text_len <= 0:
+        suggested_typing = 6.0
+    elif text_len < 120:
+        suggested_typing = max(8.0, min(22.0, round(text_len / 7.5, 1)))
+    elif text_len <= 280:
+        suggested_typing = max(16.0, min(42.0, round(text_len / 6.5, 1)))
+    else:
+        suggested_typing = max(28.0, min(60.0, round(text_len / 5.8, 1)))
+    suggested_typing = min(60.0, suggested_typing)
 
     for action in normalized:
         action_type = str(action.get("type", ""))
