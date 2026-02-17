@@ -48,6 +48,10 @@ class PendingMessage:
     schema: str | None = None
     escalation_reason: str | None = None
     escalation_notified: bool = False
+    current_action_index: int | None = None
+    current_action_total: int | None = None
+    current_action_label: str | None = None
+    current_action_until: datetime | None = None
 
 
 
@@ -462,6 +466,10 @@ class BackgroundService:
             schema=(schema or "").strip() or None,
             escalation_reason=None,
             escalation_notified=False,
+            current_action_index=None,
+            current_action_total=None,
+            current_action_label=None,
+            current_action_until=None,
         )
         self._notify_pending_changed(context.chat_id)
         self._start_waiting_task(context.chat_id)
@@ -537,6 +545,10 @@ class BackgroundService:
             schema=(latest.metadata.get("schema") if latest.metadata else None),
             escalation_reason=None,
             escalation_notified=False,
+            current_action_index=None,
+            current_action_total=None,
+            current_action_label=None,
+            current_action_until=None,
         )
         self._notify_pending_changed(chat_id)
         return True
@@ -577,8 +589,14 @@ class BackgroundService:
                 await self.core.client.send_read_acknowledge(chat_id)
                 mark_read_done = True
 
-            for action in action_queue:
+            pending.current_action_total = len(action_queue)
+            for idx, action in enumerate(action_queue, start=1):
                 action_type = str(action.get("type", "")).strip().lower()
+                pending.current_action_index = idx
+                pending.current_action_label = action_type
+                pending.current_action_until = None
+                self._notify_pending_changed(chat_id)
+
                 if action_type == "mark_read":
                     await ensure_mark_read()
                     continue
@@ -587,6 +605,8 @@ class BackgroundService:
                     await ensure_mark_read()
                     duration = float(action.get("duration_seconds", 0.0))
                     duration = min(60.0, max(0.0, duration))
+                    pending.current_action_until = datetime.now() + timedelta(seconds=duration)
+                    self._notify_pending_changed(chat_id)
                     async with self.core.client.action(chat_id, "typing"):
                         await asyncio.sleep(duration)
                     continue
@@ -600,6 +620,8 @@ class BackgroundService:
                     else:
                         delay = wait_value
                     delay = min(604800.0, max(0.0, delay))
+                    pending.current_action_until = datetime.now() + timedelta(seconds=delay)
+                    self._notify_pending_changed(chat_id)
                     await asyncio.sleep(delay)
                     continue
 
@@ -610,6 +632,8 @@ class BackgroundService:
                     if isinstance(send_at_utc, str) and send_at_utc.strip():
                         delay = self._seconds_until_utc(send_at_utc)
                         if delay > 0:
+                            pending.current_action_until = datetime.now() + timedelta(seconds=delay)
+                            self._notify_pending_changed(chat_id)
                             await asyncio.sleep(delay)
                     send_kwargs: dict[str, object] = {}
                     if isinstance(reply_to, int):
@@ -649,12 +673,20 @@ class BackgroundService:
 
             pending.sent_message_id = sent_message_id
             pending.state = MessageState.SENT
+            pending.current_action_index = None
+            pending.current_action_total = None
+            pending.current_action_label = None
+            pending.current_action_until = None
             self._notify_pending_changed(chat_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             pending.state = MessageState.ERROR
             pending.last_error = str(exc)
+            pending.current_action_index = None
+            pending.current_action_total = None
+            pending.current_action_label = None
+            pending.current_action_until = None
             self._notify_pending_changed(chat_id)
         finally:
             task = self._chat_tasks.get(chat_id)

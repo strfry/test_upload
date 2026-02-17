@@ -243,9 +243,12 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             for q_idx, action in enumerate((item.action_queue or []), start=1):
                 queue_lines.append(f"{q_idx}. {_truncate_value(_format_action(action, item.suggestion), max_len=130)}")
             actions = " | ".join(queue_lines) if queue_lines else "-"
+            error_part = ""
+            if item.last_error:
+                error_part = " | error: " + _truncate_value(item.last_error, max_len=90)
             lines.append(
                 f"{index}. [{_state_icon(item.chat_id)}] {item.title} ({item.chat_id}) | "
-                f"{item.state.value} | Actions: {actions} | schema: {schema}"
+                f"{item.state.value}{error_part} | Actions: {actions} | schema: {schema}"
             )
 
         lines.append("Mit den Chat-Buttons unten in die Detailansicht springen.")
@@ -300,6 +303,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             lines.append(f"Gesendete msg_id: {pending.sent_message_id}")
         if pending.last_error:
             lines.append(f"Fehler: {pending.last_error}")
+        if pending.current_action_label:
+            progress = "-"
+            if pending.current_action_index and pending.current_action_total:
+                progress = f"{pending.current_action_index}/{pending.current_action_total}"
+            line = f"Aktueller Schritt: {progress} {pending.current_action_label}"
+            if pending.current_action_until is not None:
+                line += f" | bis {pending.current_action_until:%Y-%m-%d %H:%M:%S}"
+            lines.append(line)
         if pending.state == MessageState.ESCALATED and pending.escalation_reason:
             lines.append(f"Frage: {pending.escalation_reason}")
         action_queue = pending.action_queue or []
@@ -327,9 +338,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         label = state_labels.get(pending.state, pending.state.value)
         action_queue = pending.action_queue or []
         action_hint = f", Actions={len(action_queue)}" if action_queue else ", Actions=0"
+        current = ""
+        if pending.current_action_label:
+            current = f", Step={pending.current_action_label}"
+            if pending.current_action_until is not None:
+                current += f" bis {pending.current_action_until:%H:%M:%S}"
         if pending.state == MessageState.WAITING and pending.wait_until is not None:
-            return f"{label} bis {pending.wait_until:%H:%M:%S}{action_hint} | Trigger: {pending.trigger or '-'}"
-        return f"{label}{action_hint} | Trigger: {pending.trigger or '-'}"
+            return f"{label} bis {pending.wait_until:%H:%M:%S}{action_hint}{current} | Trigger: {pending.trigger or '-'}"
+        return f"{label}{action_hint}{current} | Trigger: {pending.trigger or '-'}"
 
     def _format_action(action: dict[str, object], suggestion: str | None = None) -> str:
         action_type = str(action.get("type", "?"))
