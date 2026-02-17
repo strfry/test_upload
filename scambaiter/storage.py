@@ -66,8 +66,6 @@ class AnalysisStore:
                 )
                 """
             )
-            self._drop_legacy_kv_table(conn)
-            self._purge_legacy_analysis_rows(conn)
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
@@ -75,28 +73,6 @@ class AnalysisStore:
         existing = {row[1] for row in rows}
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
-
-    @staticmethod
-    def _drop_legacy_kv_table(conn: sqlite3.Connection) -> None:
-        conn.execute("DROP TABLE IF EXISTS key_values_by_scammer")
-
-    @staticmethod
-    def _purge_legacy_analysis_rows(conn: sqlite3.Connection) -> None:
-        rows = conn.execute("SELECT id, analysis FROM analyses WHERE analysis IS NOT NULL").fetchall()
-        for row_id, analysis_text in rows:
-            if not isinstance(analysis_text, str):
-                conn.execute("DELETE FROM analyses WHERE id = ?", (row_id,))
-                continue
-            cleaned = analysis_text.strip()
-            if not cleaned:
-                continue
-            try:
-                parsed = json.loads(cleaned)
-            except json.JSONDecodeError:
-                conn.execute("DELETE FROM analyses WHERE id = ?", (row_id,))
-                continue
-            if not isinstance(parsed, dict):
-                conn.execute("DELETE FROM analyses WHERE id = ?", (row_id,))
 
     def save(
         self,

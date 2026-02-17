@@ -213,8 +213,10 @@ class BackgroundService:
                     if ctx.chat_id in self._chat_auto_enabled and self._should_process_context(ctx)
                 ]
 
-            results = await self._generate_for_contexts(process_contexts, on_warning=on_warning, trigger="suggestion-generated")
-            sent_count = await self._process_due_messages()
+            results = await self._generate_for_contexts(
+                process_contexts, on_warning=on_warning, trigger="suggestion-generated"
+            )
+            sent_count = 0
 
             summary = RunSummary(
                 started_at=started,
@@ -466,10 +468,6 @@ class BackgroundService:
         self.add_general_warning(f"Chat {chat_id}: {message}")
         if on_warning:
             on_warning(chat_id, message)
-
-    async def _process_due_messages(self) -> int:
-        # Waiting->Send wird durch _waiting_flow erledigt; dieser Hook bleibt für Kompatibilität.
-        return 0
 
     async def trigger_send(self, chat_id: int, trigger: str = "manual") -> bool:
         pending = self._pending_messages.get(chat_id)

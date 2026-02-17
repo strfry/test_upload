@@ -348,7 +348,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         chat_id: int,
         page: int,
         heading: str | None = None,
-        ensure_suggestion: bool = False,
         compact: bool = False,
     ) -> tuple[str, InlineKeyboardMarkup]:
         known = _find_known_chat(chat_id)
@@ -400,13 +399,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         chat_id: int,
         page: int,
         heading: str | None = None,
-        ensure_suggestion: bool = False,
     ):
         caption, keyboard = await _render_chat_detail(
             chat_id,
             page,
             heading=heading,
-            ensure_suggestion=ensure_suggestion,
             compact=True,
         )
         # Telegram photo captions are heavily limited; fall back to text card when content is long.
@@ -470,7 +467,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         for target_chat_id, target_message_id, page, render_mode in list(targets):
             compact = render_mode == "card"
             text, reply_markup = await _render_chat_detail(
-                chat_id, page, heading=heading, ensure_suggestion=False, compact=compact
+                chat_id, page, heading=heading, compact=compact
             )
             try:
                 if render_mode == "card":
@@ -646,7 +643,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 return
             message = getattr(query, "message", None)
             if message and getattr(message, "photo", None):
-                text, keyboard = await _render_chat_detail(chat_id, page, ensure_suggestion=False, compact=True)
+                text, keyboard = await _render_chat_detail(chat_id, page, compact=True)
                 if len(text) > card_caption_len:
                     replacement = await context.bot.send_message(
                         chat_id=allowed_chat_id,
@@ -666,35 +663,20 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 context,
                 chat_id=chat_id,
                 page=page,
-                ensure_suggestion=False,
             )
             await _register_infobox_target(card_message, chat_id, page, render_mode="card")
             return
 
-        action = ""
-        page = 0
         try:
-            if data.startswith("ma:"):
-                _prefix, action, chat_id_raw, page_raw = data.split(":")
-                chat_id = int(chat_id_raw)
-                page = int(page_raw)
-            else:
-                action, chat_id_raw = data.split(":", maxsplit=1)
-                chat_id = int(chat_id_raw)
+            if not data.startswith("ma:"):
+                await _safe_edit_message(query, "Ungueltige Aktion.")
+                return
+            _prefix, action, chat_id_raw, page_raw = data.split(":")
+            chat_id = int(chat_id_raw)
+            page = int(page_raw)
         except (ValueError, IndexError):
             await _safe_edit_message(query, "Ungueltige Aktion.")
             return
-
-        action_map = {
-            "generate": "g",
-            "send": "q",
-            "stop": "x",
-            "autoon": "on",
-            "autooff": "off",
-            "img": "i",
-            "kv": "k",
-        }
-        action = action_map.get(action, action)
 
         if action == "g":
             keyboard = _chat_detail_keyboard(chat_id, page)
@@ -713,7 +695,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     chat_id,
                     page,
                     heading=f"Fehler bei Generierung: {exc}",
-                    ensure_suggestion=False,
                     compact=bool(getattr(getattr(query, "message", None), "photo", None)),
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -727,7 +708,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             )
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading=heading, ensure_suggestion=False, compact=is_card
+                chat_id, page, heading=heading, compact=is_card
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
             message = getattr(query, "message", None)
@@ -751,7 +732,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 chat_id,
                 page,
                 heading="Auto-Senden fuer diesen Chat aktiviert.",
-                ensure_suggestion=False,
                 compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -767,7 +747,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 chat_id,
                 page,
                 heading="Auto-Senden fuer diesen Chat deaktiviert.",
-                ensure_suggestion=False,
                 compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -781,7 +760,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     chat_id,
                     page,
                     heading="Keine ausführbare Queue vorhanden.",
-                    ensure_suggestion=False,
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -790,7 +768,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 chat_id,
                 page,
                 heading="Queue-Ausführung ausgelöst (bis zum derzeit sichtbaren Queue-Ende).",
-                ensure_suggestion=False,
                 compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -803,7 +780,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             result = await service.abort_send(chat_id, trigger="bot-stop-button")
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading=result, ensure_suggestion=False, compact=is_card
+                chat_id, page, heading=result, compact=is_card
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
@@ -818,7 +795,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     chat_id,
                     page,
                     heading="Keine Bilder gefunden oder keine Caption erzeugt.",
-                    ensure_suggestion=False,
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -833,7 +809,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 chat_id,
                 page,
                 heading=f"{len(images)} Bild(er) mit Caption im Kontrollkanal gepostet.",
-                ensure_suggestion=False,
                 compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -846,7 +821,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     chat_id,
                     page,
                     heading="Keine Datenbank konfiguriert.",
-                    ensure_suggestion=False,
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -857,14 +831,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     chat_id,
                     page,
                     heading="Keine Analysis gespeichert.",
-                    ensure_suggestion=False,
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
             rendered = _limit_message(json.dumps(latest_entry.analysis, ensure_ascii=False, indent=2), max_len=2200)
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading="Analysis-Objekt", ensure_suggestion=False, compact=is_card
+                chat_id, page, heading="Analysis-Objekt", compact=is_card
             )
             if is_card:
                 text = _limit_caption(text + "\n" + rendered[:700])
