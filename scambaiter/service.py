@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable
 
@@ -360,6 +360,7 @@ class BackgroundService:
                     title=context.title,
                     suggestion=output.suggestion,
                     analysis=output.analysis,
+                    actions=output.actions,
                     metadata=output.metadata,
                 )
 
@@ -563,6 +564,11 @@ class BackgroundService:
                 if action_type == "send_message":
                     await ensure_mark_read()
                     reply_to = action.get("reply_to")
+                    send_at_utc = action.get("send_at_utc")
+                    if isinstance(send_at_utc, str) and send_at_utc.strip():
+                        delay = self._seconds_until_utc(send_at_utc)
+                        if delay > 0:
+                            await asyncio.sleep(delay)
                     send_kwargs: dict[str, object] = {}
                     if isinstance(reply_to, int):
                         send_kwargs["reply_to"] = reply_to
@@ -686,6 +692,17 @@ class BackgroundService:
             f"{msg.timestamp.isoformat()}|{msg.role}|{msg.sender}|{msg.text}" for msg in context.messages
         )
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _seconds_until_utc(send_at_utc: str) -> float:
+        try:
+            dt = datetime.fromisoformat(send_at_utc.replace("Z", "+00:00"))
+        except ValueError:
+            return 0.0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0.0, (dt.astimezone(timezone.utc) - now).total_seconds())
 
 
     def is_chat_auto_enabled(self, chat_id: int) -> bool:

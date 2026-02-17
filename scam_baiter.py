@@ -49,6 +49,7 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
             title=context.title,
             suggestion=output.suggestion,
             analysis=output.analysis,
+            actions=output.actions,
             metadata=output.metadata,
         )
         print(f"=== Vorschlag {index}: {context.title} (ID: {context.chat_id}) ===")

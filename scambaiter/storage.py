@@ -13,6 +13,7 @@ class StoredAnalysis:
     title: str
     suggestion: str
     analysis: dict[str, object] | None
+    actions: list[dict[str, object]] | None
     metadata: dict[str, str]
 
 
@@ -49,10 +50,12 @@ class AnalysisStore:
                     title TEXT NOT NULL,
                     suggestion TEXT NOT NULL,
                     analysis TEXT,
+                    actions_json TEXT,
                     metadata_json TEXT
                 )
                 """
             )
+            self._ensure_column(conn, "analyses", "actions_json", "TEXT")
             self._ensure_column(conn, "analyses", "metadata_json", "TEXT")
             conn.execute(
                 """
@@ -102,15 +105,17 @@ class AnalysisStore:
         title: str,
         suggestion: str,
         analysis: dict[str, object] | None,
+        actions: list[dict[str, object]] | None,
         metadata: dict[str, str],
     ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         analysis_json = json.dumps(analysis, ensure_ascii=False) if isinstance(analysis, dict) else None
+        actions_json = json.dumps(actions, ensure_ascii=False) if isinstance(actions, list) else None
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO analyses (created_at, chat_id, title, suggestion, analysis, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO analyses (created_at, chat_id, title, suggestion, analysis, actions_json, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -118,6 +123,7 @@ class AnalysisStore:
                     title,
                     suggestion,
                     analysis_json,
+                    actions_json,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             )
@@ -126,7 +132,7 @@ class AnalysisStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT created_at, chat_id, title, suggestion, analysis, metadata_json
+                SELECT created_at, chat_id, title, suggestion, analysis, actions_json, metadata_json
                 FROM analyses
                 ORDER BY id DESC
                 LIMIT ?
@@ -140,7 +146,8 @@ class AnalysisStore:
                 title=str(row[2]),
                 suggestion=str(row[3]),
                 analysis=self._decode_analysis(row[4]),
-                metadata=self._decode_metadata(row[5]),
+                actions=self._decode_actions(row[5]),
+                metadata=self._decode_metadata(row[6]),
             )
             for row in rows
         ]
@@ -149,7 +156,7 @@ class AnalysisStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT created_at, chat_id, title, suggestion, analysis, metadata_json
+                SELECT created_at, chat_id, title, suggestion, analysis, actions_json, metadata_json
                 FROM analyses
                 WHERE chat_id = ?
                 ORDER BY id DESC
@@ -165,7 +172,8 @@ class AnalysisStore:
             title=str(row[2]),
             suggestion=str(row[3]),
             analysis=self._decode_analysis(row[4]),
-            metadata=self._decode_metadata(row[5]),
+            actions=self._decode_actions(row[5]),
+            metadata=self._decode_metadata(row[6]),
         )
 
     def update_latest_analysis(self, chat_id: int, analysis: dict[str, object]) -> bool:
@@ -224,6 +232,22 @@ class AnalysisStore:
             except json.JSONDecodeError:
                 pass
         return metadata
+
+    @staticmethod
+    def _decode_actions(actions_json: str | None) -> list[dict[str, object]] | None:
+        if not actions_json:
+            return None
+        try:
+            parsed = json.loads(actions_json)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, list):
+            return None
+        actions: list[dict[str, object]] = []
+        for item in parsed:
+            if isinstance(item, dict):
+                actions.append({str(k): v for k, v in item.items()})
+        return actions or None
 
     def image_description_get(self, image_hash: str) -> StoredImageDescription | None:
         with self._connect() as conn:

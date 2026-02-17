@@ -59,7 +59,7 @@ ERLAUBTE ACTION-TYPEN:
 - mark_read
 - simulate_typing (benötigt duration_seconds)
 - wait (benötigt value und unit=seconds|minutes)
-- send_message (optional reply_to)
+- send_message (optional reply_to, optional send_at_utc)
 - edit_message (benötigt message_id und new_text)
 - noop
 - escalate_to_human (benötigt reason)
@@ -88,6 +88,7 @@ ZEITINFORMATION:
 - Nachrichten können ein Feld "ts_utc" (ISO-8601) enthalten.
 - Nutze Zeitabstände optional zur Einschätzung von Dringlichkeit oder natürlichem Antwortverhalten.
 - Führe keine komplexe Datumsberechnung durch.
+- Für geplantes Senden kann send_message ein Feld "send_at_utc" (ISO-8601, UTC) enthalten.
 
 QUEUE-KONTEXT:
 - Der Input kann bereits geplante Actions aus einer früheren Planung enthalten (`planned_queue`).
@@ -229,9 +230,9 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
                 return None
             normalized_actions.append({"type": "wait", "value": numeric_value, "unit": normalized_unit})
         elif action_type == "send_message":
-            expected = {"type", "reply_to"}
+            allowed = {"type", "reply_to", "send_at_utc"}
             keys = set(normalized_action.keys())
-            if keys != {"type"} and keys != expected:
+            if not keys.issubset(allowed) or "type" not in keys:
                 return None
             entry: dict[str, object] = {"type": "send_message"}
             if "reply_to" in normalized_action:
@@ -239,6 +240,14 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
                 if not isinstance(reply_to, (str, int)):
                     return None
                 entry["reply_to"] = reply_to
+            if "send_at_utc" in normalized_action:
+                send_at_utc = normalized_action.get("send_at_utc")
+                if not isinstance(send_at_utc, str):
+                    return None
+                normalized_ts = normalize_iso_utc(send_at_utc)
+                if not normalized_ts:
+                    return None
+                entry["send_at_utc"] = normalized_ts
             normalized_actions.append(entry)
         elif action_type == "edit_message":
             expected = {"type", "message_id", "new_text"}
@@ -316,6 +325,18 @@ def normalize_action_shape(action: object) -> dict[str, object] | None:
                     normalized[str(k)] = v
             return normalized
     return dict(action)
+
+
+def normalize_iso_utc(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    candidate = text.replace("Z", "+00:00")
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return text
 
 
 def normalize_action_timings(actions: list[dict[str, object]], message_text: str) -> list[dict[str, object]]:

@@ -87,6 +87,20 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 break
         return parts
 
+    def _has_send_message(actions: list[dict[str, object]] | None) -> bool:
+        return any(str(action.get("type", "")).strip().lower() == "send_message" for action in (actions or []))
+
+    def _display_queue_fallback(suggestion: str | None) -> list[dict[str, object]]:
+        text = (suggestion or "").strip()
+        if not text:
+            return []
+        typing_seconds = max(6.0, min(28.0, round(len(text) / 45.0, 1)))
+        return [
+            {"type": "mark_read"},
+            {"type": "simulate_typing", "duration_seconds": typing_seconds},
+            {"type": "send_message"},
+        ]
+
     def _format_chat_overview(
         chat_id: int,
         title: str,
@@ -101,7 +115,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         lines.append(f"Auto-Senden: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}")
         if pending:
             lines.append(_format_pending_state(pending))
-        if suggestion:
+        if suggestion and not (pending and _has_send_message(pending.action_queue)):
             lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=900))
         parts = _analysis_summary_parts(analysis_data)
         if parts:
@@ -224,11 +238,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return _limit_message("\n".join(lines))
 
         for index, item in enumerate(current_slice, start=start + 1):
-            action_types = [str(action.get("type", "?")) for action in (item.action_queue or [])]
-            actions = ",".join(action_types[:4]) if action_types else "-"
-            if len(action_types) > 4:
-                actions = actions + ",..."
             schema = _truncate_value(item.schema, max_len=24) if item.schema else "-"
+            queue_lines: list[str] = []
+            for q_idx, action in enumerate((item.action_queue or []), start=1):
+                queue_lines.append(f"{q_idx}. {_truncate_value(_format_action(action, item.suggestion), max_len=130)}")
+            actions = " | ".join(queue_lines) if queue_lines else "-"
             lines.append(
                 f"{index}. [{_state_icon(item.chat_id)}] {item.title} ({item.chat_id}) | "
                 f"{item.state.value} | Actions: {actions} | schema: {schema}"
@@ -292,7 +306,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if action_queue:
             lines.append("Actions:")
             for idx, action in enumerate(action_queue, start=1):
-                lines.append(f"{idx}. {_format_action(action)}")
+                lines.append(f"{idx}. {_format_action(action, pending.suggestion)}")
         else:
             lines.append("Actions: -")
         lines.append(f"Trigger: {pending.trigger or '-'}")
@@ -317,8 +331,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return f"{label} bis {pending.wait_until:%H:%M:%S}{action_hint} | Trigger: {pending.trigger or '-'}"
         return f"{label}{action_hint} | Trigger: {pending.trigger or '-'}"
 
-    def _format_action(action: dict[str, object]) -> str:
+    def _format_action(action: dict[str, object], suggestion: str | None = None) -> str:
         action_type = str(action.get("type", "?"))
+        if action_type == "send_message":
+            send_at = action.get("send_at_utc")
+            send_at_part = f", send_at_utc={send_at}" if isinstance(send_at, str) and send_at.strip() else ""
+            text = _truncate_value(suggestion or "", max_len=240) if suggestion else "-"
+            return f"send_message (text={text}{send_at_part})"
         fields = [f"{k}={v}" for k, v in action.items() if k != "type"]
         if not fields:
             return action_type
@@ -341,6 +360,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         analysis_data = latest_entry.analysis if latest_entry else None
 
         suggestion = pending.suggestion if (pending and pending.suggestion) else (latest_entry.suggestion if latest_entry else None)
+        display_actions = (pending.action_queue if pending else None) or (latest_entry.actions if latest_entry else None)
+        if not display_actions:
+            display_actions = _display_queue_fallback(suggestion)
         if compact:
             lines: list[str] = []
             if heading:
@@ -350,18 +372,25 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 lines.append(f"Zuletzt: {updated_at:%Y-%m-%d %H:%M}")
             lines.append(f"Status: {_pending_state_short(pending)}")
             lines.append(f"Auto: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}")
-            if suggestion:
-                lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=320))
             info_parts = _analysis_summary_parts(analysis_data, limit=4)
             if info_parts:
                 lines.append("Analysis: " + ", ".join(info_parts))
-            if pending and pending.action_queue:
+            if display_actions:
                 lines.append("Queue:")
-                for idx, action in enumerate((pending.action_queue or [])[:3], start=1):
-                    lines.append(f"{idx}. {_truncate_value(_format_action(action), max_len=90)}")
+                source_text = pending.suggestion if pending else suggestion
+                for idx, action in enumerate(display_actions, start=1):
+                    lines.append(f"{idx}. {_truncate_value(_format_action(action, source_text), max_len=220)}")
+            if suggestion and not _has_send_message(display_actions):
+                lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=180))
             text = _limit_caption("\n".join(lines))
         else:
             body = _format_chat_overview(chat_id, title, updated_at, analysis_data, suggestion, pending)
+            if display_actions:
+                queue_lines = ["Queue:"]
+                source_text = pending.suggestion if pending else suggestion
+                for idx, action in enumerate(display_actions, start=1):
+                    queue_lines.append(f"{idx}. {_format_action(action, source_text)}")
+                body = body + "\n" + "\n".join(queue_lines)
             text = f"{heading}\n\n{body}" if heading else body
             text = _limit_message(text)
         return text, _chat_detail_keyboard(chat_id, page)
@@ -380,6 +409,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             ensure_suggestion=ensure_suggestion,
             compact=True,
         )
+        # Telegram photo captions are heavily limited; fall back to text card when content is long.
+        if len(caption) > card_caption_len:
+            return await context.bot.send_message(
+                chat_id=allowed_chat_id,
+                text=_limit_message(caption),
+                reply_markup=keyboard,
+            )
         profile_photo = await service.core.get_chat_profile_photo(chat_id)
         if profile_photo:
             return await context.bot.send_photo(
@@ -611,8 +647,20 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             message = getattr(query, "message", None)
             if message and getattr(message, "photo", None):
                 text, keyboard = await _render_chat_detail(chat_id, page, ensure_suggestion=False, compact=True)
-                await _safe_edit_message(query, text, reply_markup=keyboard)
-                await _register_infobox_target(message, chat_id, page, render_mode="card")
+                if len(text) > card_caption_len:
+                    replacement = await context.bot.send_message(
+                        chat_id=allowed_chat_id,
+                        text=_limit_message(text),
+                        reply_markup=keyboard,
+                    )
+                    try:
+                        await context.bot.delete_message(chat_id=int(message.chat_id), message_id=int(message.message_id))
+                    except BadRequest:
+                        pass
+                    await _register_infobox_target(replacement, chat_id, page, render_mode="text")
+                else:
+                    await _safe_edit_message(query, text, reply_markup=keyboard)
+                    await _register_infobox_target(message, chat_id, page, render_mode="card")
                 return
             card_message = await _send_chat_detail_card(
                 context,
