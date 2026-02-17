@@ -179,6 +179,31 @@ class AnalysisStore:
             metadata=self._decode_metadata(row[6]),
         )
 
+    def recent_for_chat(self, chat_id: int, limit: int = 5) -> list[StoredAnalysis]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT created_at, chat_id, title, suggestion, analysis, actions_json, metadata_json
+                FROM analyses
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            ).fetchall()
+        return [
+            StoredAnalysis(
+                created_at=datetime.fromisoformat(row[0]),
+                chat_id=int(row[1]),
+                title=str(row[2]),
+                suggestion=str(row[3]),
+                analysis=self._decode_analysis(row[4]),
+                actions=self._decode_actions(row[5]),
+                metadata=self._decode_metadata(row[6]),
+            )
+            for row in rows
+        ]
+
     def update_latest_analysis(self, chat_id: int, analysis: dict[str, object]) -> bool:
         serialized = json.dumps(analysis, ensure_ascii=False)
         with self._connect() as conn:
