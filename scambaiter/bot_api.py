@@ -209,29 +209,29 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         return InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Generate", callback_data=f"ma:g:{chat_id}:{page}"),
-                    InlineKeyboardButton("Queue Run", callback_data=f"ma:q:{chat_id}:{page}"),
-                    InlineKeyboardButton("Stop", callback_data=f"ma:x:{chat_id}:{page}"),
+                    InlineKeyboardButton("🧠 Generate", callback_data=f"ma:g:{chat_id}:{page}"),
+                    InlineKeyboardButton("▶️ Queue Run", callback_data=f"ma:q:{chat_id}:{page}"),
+                    InlineKeyboardButton("⏹️ Stop", callback_data=f"ma:x:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("Auto an", callback_data=f"ma:on:{chat_id}:{page}"),
-                    InlineKeyboardButton("Auto aus", callback_data=f"ma:off:{chat_id}:{page}"),
+                    InlineKeyboardButton("🤖 Auto an", callback_data=f"ma:on:{chat_id}:{page}"),
+                    InlineKeyboardButton("🛑 Auto aus", callback_data=f"ma:off:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("Bilder", callback_data=f"ma:i:{chat_id}:{page}"),
-                    InlineKeyboardButton("Analysis", callback_data=f"ma:k:{chat_id}:{page}"),
-                    InlineKeyboardButton("Prompt", callback_data=f"ma:p:{chat_id}:{page}"),
+                    InlineKeyboardButton("🖼️ Bilder", callback_data=f"ma:i:{chat_id}:{page}"),
+                    InlineKeyboardButton("📊 Analysis", callback_data=f"ma:k:{chat_id}:{page}"),
+                    InlineKeyboardButton("🧾 Prompt", callback_data=f"ma:p:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("Dir +", callback_data=f"ma:da:{chat_id}:{page}"),
-                    InlineKeyboardButton("Dir -", callback_data=f"ma:dl:{chat_id}:{page}"),
+                    InlineKeyboardButton("➕ Dir", callback_data=f"ma:da:{chat_id}:{page}"),
+                    InlineKeyboardButton("➖ Dir", callback_data=f"ma:dl:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
+                    InlineKeyboardButton("✏️ An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("Zurueck", callback_data=f"ml:{page}"),
-                    InlineKeyboardButton("Aktualisieren", callback_data=f"mc:{chat_id}:{page}"),
+                    InlineKeyboardButton("⬅️ Zurueck", callback_data=f"ml:{page}"),
+                    InlineKeyboardButton("🔄 Aktualisieren", callback_data=f"mc:{chat_id}:{page}"),
                 ],
             ]
         )
@@ -295,15 +295,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             rows.append([InlineKeyboardButton(label, callback_data=f"mc:{item.chat_id}:{page}")])
         nav_row: list[InlineKeyboardButton] = []
         if page > 0:
-            nav_row.append(InlineKeyboardButton("<<", callback_data=f"ml:{page - 1}"))
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"ml:{page - 1}"))
         if page < total_pages - 1:
-            nav_row.append(InlineKeyboardButton(">>", callback_data=f"ml:{page + 1}"))
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"ml:{page + 1}"))
         if nav_row:
             rows.append(nav_row)
         rows.append(
             [
-                InlineKeyboardButton("Refresh", callback_data=f"ml:{page}"),
-                InlineKeyboardButton("Queue", callback_data="mq:0"),
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"ml:{page}"),
+                InlineKeyboardButton("📦 Queue", callback_data="mq:0"),
             ]
         )
         return InlineKeyboardMarkup(rows)
@@ -351,15 +351,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         nav_row: list[InlineKeyboardButton] = []
         if page > 0:
-            nav_row.append(InlineKeyboardButton("<<", callback_data=f"mq:{page - 1}"))
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"mq:{page - 1}"))
         if page < total_pages - 1:
-            nav_row.append(InlineKeyboardButton(">>", callback_data=f"mq:{page + 1}"))
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"mq:{page + 1}"))
         if nav_row:
             rows.append(nav_row)
         rows.append(
             [
-                InlineKeyboardButton("Queue Refresh", callback_data=f"mq:{page}"),
-                InlineKeyboardButton("Zu Chats", callback_data="ml:0"),
+                InlineKeyboardButton("🔄 Queue Refresh", callback_data=f"mq:{page}"),
+                InlineKeyboardButton("💬 Zu Chats", callback_data="ml:0"),
             ]
         )
         return InlineKeyboardMarkup(rows)
@@ -370,7 +370,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         for item in directives:
             label = f"Loeschen #{item.id}"
             rows.append([InlineKeyboardButton(label, callback_data=f"md:del:{chat_id}:{page}:{item.id}")])
-        rows.append([InlineKeyboardButton("Zurueck", callback_data=f"mc:{chat_id}:{page}")])
+        rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
 
     def _encode_key_token(key: str) -> str:
@@ -397,7 +397,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 token = _encode_key_token(key_name)
                 label = f"Loeschen {key_name}"
                 rows.append([InlineKeyboardButton(_truncate_value(label, max_len=34), callback_data=f"me:del:{chat_id}:{page}:{token}")])
-        rows.append([InlineKeyboardButton("Zurueck", callback_data=f"mc:{chat_id}:{page}")])
+        rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
 
     def _analysis_editor_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
@@ -405,8 +405,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         analysis_data = latest_entry.analysis if latest_entry else None
         rows: list[list[InlineKeyboardButton]] = [
             [
-                InlineKeyboardButton("Neu", callback_data=f"ma:ak:{chat_id}:{page}"),
-                InlineKeyboardButton("Loeschen", callback_data=f"ma:ad:{chat_id}:{page}"),
+                InlineKeyboardButton("➕ Neu", callback_data=f"ma:ak:{chat_id}:{page}"),
+                InlineKeyboardButton("🗑️ Loeschen", callback_data=f"ma:ad:{chat_id}:{page}"),
             ]
         ]
         if isinstance(analysis_data, dict):
@@ -421,7 +421,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                         )
                     ]
                 )
-        rows.append([InlineKeyboardButton("Zurueck", callback_data=f"mc:{chat_id}:{page}")])
+        rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
 
     def _format_pending_state(pending: PendingMessage | None) -> str:
