@@ -465,14 +465,15 @@ class BackgroundService:
         action_queue: list[dict[str, object]] | None = None,
         schema: str | None = None,
     ) -> None:
-        if not suggestion.strip():
+        actions = list(action_queue or [])
+        if not suggestion.strip() and not actions:
             return
 
         previous = self._pending_messages.get(context.chat_id)
         if previous:
             self._cancel_chat_task(context.chat_id)
             previous_actions = list(previous.action_queue or [])
-            new_actions = list(action_queue or [])
+            new_actions = actions
             if previous_actions != new_actions:
                 self.add_general_warning(
                     f"Chat {context.chat_id}: Bestehende Queue durch neue Modell-Actions ersetzt."
@@ -492,7 +493,7 @@ class BackgroundService:
             wait_until=wait_until,
             trigger=trigger,
             send_requested=bool(previous and previous.send_requested),
-            action_queue=list(action_queue or []),
+            action_queue=actions,
             schema=(schema or "").strip() or None,
             escalation_reason=None,
             escalation_notified=False,
@@ -557,10 +558,11 @@ class BackgroundService:
         latest = self.store.latest_for_chat(chat_id)
         if not latest:
             return False
-        if not latest.suggestion.strip():
-            return False
         actions = list(latest.actions or [])
         if not actions:
+            return False
+        has_send_message = any(str(action.get("type", "")).strip().lower() == "send_message" for action in actions)
+        if has_send_message and not latest.suggestion.strip():
             return False
         self._pending_messages[chat_id] = PendingMessage(
             chat_id=chat_id,
@@ -588,17 +590,6 @@ class BackgroundService:
         if not pending:
             return
         try:
-            if not pending.suggestion.strip():
-                pending.state = MessageState.ERROR
-                pending.last_error = "Leerer Antwortvorschlag."
-                self._notify_pending_changed(chat_id)
-                return
-            if not self.core.config.send_enabled:
-                pending.state = MessageState.ERROR
-                pending.last_error = "Senden deaktiviert (SCAMBAITER_SEND)."
-                self._notify_pending_changed(chat_id)
-                return
-
             sent_message_id: int | None = None
             sent = False
             outgoing_text = pending.suggestion
@@ -609,6 +600,17 @@ class BackgroundService:
                     {"type": "simulate_typing", "duration_seconds": 2.0},
                     {"type": "send_message"},
                 ]
+            has_send_message = any(str(action.get("type", "")).strip().lower() == "send_message" for action in action_queue)
+            if has_send_message and not pending.suggestion.strip():
+                pending.state = MessageState.ERROR
+                pending.last_error = "Leerer Antwortvorschlag für send_message."
+                self._notify_pending_changed(chat_id)
+                return
+            if has_send_message and not self.core.config.send_enabled:
+                pending.state = MessageState.ERROR
+                pending.last_error = "Senden deaktiviert (SCAMBAITER_SEND)."
+                self._notify_pending_changed(chat_id)
+                return
 
             mark_read_done = False
 
@@ -695,14 +697,9 @@ class BackgroundService:
                     self._notify_pending_changed(chat_id)
                     return
 
-            if not sent:
-                pending.state = MessageState.ERROR
-                pending.last_error = "Action-Queue enthält keine send_message-Aktion."
-                self._notify_pending_changed(chat_id)
-                return
-
             pending.sent_message_id = sent_message_id
             pending.state = MessageState.SENT
+            pending.last_error = None
             pending.current_action_index = None
             pending.current_action_total = None
             pending.current_action_label = None

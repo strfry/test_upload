@@ -47,6 +47,7 @@ PFLICHTFELDER:
 - analysis (Objekt, kein String)
 - message.text (String, max. 4000 Zeichen)
 - actions (Array, max. 10 Elemente)
+- message.text darf leer sein, wenn keine send_message-Action enthalten ist.
 
 STRUKTURREGELN:
 - message.text enthält die tatsächlich zu sendende Nachricht.
@@ -101,14 +102,23 @@ QUEUE-KONTEXT:
 - Wenn die letzte echte Chat-Nachricht bereits vom Assistenten stammt und seitdem keine neue User-Nachricht kam:
   - Erzeuge KEINE neue inhaltlich ähnliche Folge-Nachricht.
   - Nutze stattdessen `noop` (oder bestätige nur weiterhin gültige geplante Actions ohne neue Duplikat-Nachricht).
+  - Ausnahme: Wenn aktive `operator.directives` explizit ein proaktives Follow-up ohne neue User-Nachricht verlangen,
+    darfst du eine neue, klar unterscheidbare Nachricht planen (kein Duplikat der letzten Assistant-Nachricht).
+  - In diesem Ausnahmefall trage die verwendete Direktiven-ID in `analysis.operator_applied` ein.
 
 OPERATOR-DIREKTIVEN:
 - Der Input kann ein Feld `operator.directives` enthalten.
 - Jede Direktive ist bindend, solange sie aktiv ist.
 - Befolge aktive Direktiven priorisiert, sofern keine Sicherheitsregel verletzt wird.
+- Priorität: Sicherheitsregeln > operator.directives > übrige Heuristiken
+  (z.B. "kein Follow-up ohne neue User-Nachricht").
 - Trage in `analysis` ein:
   - `operator_applied`: Liste der angewendeten Direktiven-IDs.
   - `operator_ignored`: Liste von Objekten mit `id` und `reason` für ignorierte Direktiven.
+
+NOOP-REGEL:
+- Bei `noop` darf `message.text` leer sein.
+- Wenn `actions` eine `send_message`-Action enthält, muss `message.text` nicht-leer sein.
 
 SPRACHE:
 - Verwende ausschließlich die Sprache aus dem Eingabefeld "language".
@@ -187,7 +197,7 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
     if not isinstance(text_value, str):
         return None
     reply = text_value.strip()
-    if not reply or len(reply) > 4000:
+    if len(reply) > 4000:
         return None
 
     actions_value = data.get("actions")
@@ -304,12 +314,17 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
         if isinstance(top_level_value, str) and top_level_value.strip():
             metadata[top_level_key] = top_level_value.strip()
 
+    normalized_actions = normalize_action_timings(normalized_actions, reply)
+    has_send_message = any(str(action.get("type")) == "send_message" for action in normalized_actions)
+    if has_send_message and not reply:
+        return None
+
     return ModelOutput(
         raw=text,
         suggestion=reply,
         analysis=analysis or None,
         metadata=metadata,
-        actions=normalize_action_timings(normalized_actions, reply),
+        actions=normalized_actions,
     )
 
 
@@ -953,7 +968,10 @@ class ScambaiterCore:
                 actions=structured.actions,
             )
             last_output = current_output
-            if suggestion and not looks_like_reasoning_output(suggestion):
+            has_send_message = any(str(action.get("type")) == "send_message" for action in current_output.actions)
+            if has_send_message and suggestion and not looks_like_reasoning_output(suggestion):
+                return current_output
+            if not has_send_message and (not suggestion or not looks_like_reasoning_output(suggestion)):
                 return current_output
 
             print(
@@ -996,7 +1014,8 @@ class ScambaiterCore:
                     "mit den Top-Level-Feldern schema, analysis, message und actions. "
                     "schema MUSS exakt \"scambait.llm.v1\" sein. "
                     "analysis MUSS ein JSON-Objekt sein (kein String). "
-                    "message.text darf nicht leer sein. actions muss mindestens ein Element enthalten "
+                    "message.text darf leer sein, aber nur wenn keine send_message-Action enthalten ist. "
+                    "actions muss mindestens ein Element enthalten "
                     "(falls nötig: noop). "
                     "Jede Action muss ein Objekt mit Pflichtfeld \"type\" sein. "
                     "Keine Kurzformen wie {\"send_message\":{}}.\n\n"
@@ -1025,7 +1044,10 @@ class ScambaiterCore:
         if repaired is None:
             print(f"[WARN] Repair-Request lieferte weiterhin invalides JSON: {truncate_for_log(repair_raw, max_len=1200)}")
             return None
-        if not repaired.suggestion or looks_like_reasoning_output(repaired.suggestion):
+        has_send_message = any(str(action.get("type")) == "send_message" for action in repaired.actions)
+        if has_send_message and (not repaired.suggestion or looks_like_reasoning_output(repaired.suggestion)):
+            return None
+        if not has_send_message and repaired.suggestion and looks_like_reasoning_output(repaired.suggestion):
             return None
         return repaired
 
