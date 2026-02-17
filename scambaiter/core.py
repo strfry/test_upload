@@ -484,7 +484,12 @@ class ScambaiterCore:
             messages = await self.client.get_messages(dialog.entity, limit=self.config.history_limit)
             chat_messages: list[ChatMessage] = []
             for message in reversed(messages):
-                chat_message = await self._format_message_line(message, my_id=my_id, dialog_title=dialog.title)
+                chat_message = await self._format_message_line(
+                    message,
+                    my_id=my_id,
+                    dialog_title=dialog.title,
+                    chat_id=int(dialog.id),
+                )
                 if chat_message:
                     chat_messages.append(chat_message)
 
@@ -503,7 +508,12 @@ class ScambaiterCore:
 
         chat_messages: list[ChatMessage] = []
         for message in reversed(messages):
-            chat_message = await self._format_message_line(message, my_id=my_id, dialog_title=title)
+            chat_message = await self._format_message_line(
+                message,
+                my_id=my_id,
+                dialog_title=title,
+                chat_id=int(chat_id),
+            )
             if chat_message:
                 chat_messages.append(chat_message)
 
@@ -605,6 +615,7 @@ class ScambaiterCore:
     ) -> list[tuple[int, str, bytes, str]]:
         messages = await self.client.get_messages(chat_id, limit=max(20, limit * 10))
         images: list[tuple[int, str, bytes, str]] = []
+        language_hint = self._chat_language_hint(chat_id)
 
         for message in messages:
             is_photo = bool(getattr(message, "photo", None))
@@ -618,7 +629,7 @@ class ScambaiterCore:
             if not image_bytes:
                 continue
 
-            description = await self.describe_image(image_bytes)
+            description = await self.describe_image(image_bytes, language_hint=language_hint)
             if not description:
                 continue
 
@@ -650,18 +661,29 @@ class ScambaiterCore:
             for msg_id, marker, image_bytes, description in images
         ]
 
-    async def describe_image(self, image_bytes: bytes) -> str | None:
+    async def describe_image(self, image_bytes: bytes, language_hint: str | None = None) -> str | None:
         image_hash = hashlib.sha256(image_bytes).hexdigest()
+        cache_key = image_hash
+        normalized_lang = self._normalize_language_hint(language_hint)
+        if normalized_lang:
+            cache_key = f"{image_hash}:{normalized_lang}"
         if self.store:
-            cached = self.store.image_description_get(image_hash)
+            cached = self.store.image_description_get(cache_key)
             if cached and cached.description.strip():
                 cached_description = extract_image_description(cached.description)
                 if cached_description:
                     if cached_description != cached.description:
-                        self.store.image_description_set(image_hash, cached_description)
+                        self.store.image_description_set(cache_key, cached_description)
                     return cached_description
 
         encoded = base64.b64encode(image_bytes).decode("ascii")
+        language_instruction = (
+            "Write the description in German. "
+            if normalized_lang == "de"
+            else "Write the description in English. "
+            if normalized_lang == "en"
+            else ""
+        )
         completion = self.hf_client.chat.completions.create(
             model=self.config.hf_vision_model,
             max_tokens=720,
@@ -675,6 +697,7 @@ class ScambaiterCore:
                                 "You are an image captioning assistant. "
                                 "Return final answer only in this exact format: "
                                 "DESCRIPTION: <2-4 complete sentences>. "
+                                f"{language_instruction}"
                                 "Use concrete observable details, keep a benevolent tone, no speculation. "
                                 "Do not include analysis, planning, bullets, or meta text."
                             ),
@@ -692,10 +715,10 @@ class ScambaiterCore:
             return None
 
         if self.store:
-            self.store.image_description_set(image_hash, description)
+            self.store.image_description_set(cache_key, description)
         return description
 
-    async def _format_message_line(self, message, my_id: int, dialog_title: str) -> ChatMessage | None:
+    async def _format_message_line(self, message, my_id: int, dialog_title: str, chat_id: int) -> ChatMessage | None:
         text = (message.message or "").strip()
         is_own_message = message.sender_id == my_id
         sender = "Ich" if is_own_message else dialog_title
@@ -710,7 +733,7 @@ class ScambaiterCore:
             try:
                 image_bytes = await self.client.download_media(message, file=bytes)
                 if image_bytes:
-                    description = await self.describe_image(image_bytes)
+                    description = await self.describe_image(image_bytes, language_hint=self._chat_language_hint(chat_id))
                     if description:
                         marker = f"{IMAGE_MARKER_PREFIX}: {description}]"
                 else:
@@ -740,6 +763,29 @@ class ScambaiterCore:
             return "You must respond exclusively in English."
         if lang in {"de", "deutsch", "german"}:
             return "Du antwortest immer auf Deutsch."
+        return None
+
+    def _chat_language_hint(self, chat_id: int) -> str | None:
+        if not self.store:
+            return None
+        latest = self.store.latest_for_chat(int(chat_id))
+        if not latest or not latest.analysis:
+            return None
+        for key in ("language", "sprache"):
+            value = latest.analysis.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _normalize_language_hint(language_hint: str | None) -> str | None:
+        if not language_hint:
+            return None
+        lang = language_hint.strip().lower()
+        if lang in {"de", "deutsch", "german"}:
+            return "de"
+        if lang in {"en", "english", "englisch"}:
+            return "en"
         return None
 
     def generate_output(
