@@ -13,6 +13,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app = Application.builder().token(token).build()
     max_message_len = 3500
     menu_message_len = 3900
+    card_caption_len = 1024
     chats_page_size = 8
     base_info_keys = [
         "sprache",
@@ -34,7 +35,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         "scam-verdacht": "Scam-Verdacht",
         "typ": "Typ",
     }
-    infobox_targets: dict[int, set[tuple[int, int, int]]] = {}
+    infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -62,9 +63,19 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if chunk:
             await _guarded_reply(update, chunk.rstrip())
 
+    def _limit_caption(text: str) -> str:
+        if len(text) <= card_caption_len:
+            return text
+        return text[: card_caption_len - 14].rstrip() + "\n... [gekuerzt]"
+
     async def _safe_edit_message(query, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+        message = getattr(query, "message", None)
+        has_photo = bool(getattr(message, "photo", None)) if message else False
         try:
-            await query.edit_message_text(text, reply_markup=reply_markup)
+            if has_photo:
+                await query.edit_message_caption(caption=_limit_caption(text), reply_markup=reply_markup)
+            else:
+                await query.edit_message_text(text, reply_markup=reply_markup)
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return
@@ -158,12 +169,17 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         }
         return icons.get(pending.state, "?")
 
-    async def _get_known_chats(limit: int = 80):
+    def _get_known_chats_cached(limit: int = 80):
         known_chats = service.list_known_chats(limit=limit)
         if known_chats:
             return known_chats
-        await service.refresh_known_chats_from_folder()
-        return service.list_known_chats(limit=limit)
+        if service.store:
+            return service.store.list_known_chats(limit=limit)
+        return []
+
+    def _kick_background_sync() -> None:
+        service.start_known_chats_refresh()
+        service.start_folder_prefetch()
 
     def _find_known_chat(chat_id: int):
         for item in service.list_known_chats(limit=500):
@@ -178,7 +194,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         current_slice = known_chats[start : start + chats_page_size]
         lines = [f"Chats ({len(known_chats)}) | Seite {page + 1}/{total_pages}", "Status: A=kein Prozess, G/W/S/OK/X/!"]
         if not current_slice:
-            lines.append("Keine Chats verfuegbar.")
+            lines.append("Noch keine Chats im Cache. Hintergrund-Sync laeuft, bitte Refresh druecken.")
             return "\n".join(lines)
         for index, item in enumerate(current_slice, start=start + 1):
             stamp = item.updated_at.strftime("%Y-%m-%d %H:%M")
@@ -229,15 +245,29 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         lines.append(f"Trigger: {pending.trigger}")
         return "\n".join(lines)
 
-    def _build_process_infobox(chat_id: int, heading: str) -> str:
-        pending = service.get_pending_message(chat_id)
-        lines = [heading, f"Chat-ID: {chat_id}", f"Auto-Senden: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}"]
-        lines.append(_format_pending_state(pending))
-        if pending and pending.suggestion:
-            lines.append("Vorschlag: " + _truncate_value(pending.suggestion, max_len=900))
-        return "\n".join(lines)
+    def _pending_state_short(pending: PendingMessage | None) -> str:
+        if not pending:
+            return "Kein Prozess"
+        state_labels = {
+            MessageState.GENERATING: "Generierung",
+            MessageState.WAITING: "Wartephase",
+            MessageState.SENDING_TYPING: "Senden",
+            MessageState.SENT: "Gesendet",
+            MessageState.CANCELLED: "Abgebrochen",
+            MessageState.ERROR: "Fehler",
+        }
+        label = state_labels.get(pending.state, pending.state.value)
+        if pending.state == MessageState.WAITING and pending.wait_until is not None:
+            return f"{label} bis {pending.wait_until:%H:%M:%S}"
+        return label
 
-    async def _render_chat_detail(chat_id: int, page: int, heading: str | None = None, ensure_suggestion: bool = True) -> tuple[str, InlineKeyboardMarkup]:
+    async def _render_chat_detail(
+        chat_id: int,
+        page: int,
+        heading: str | None = None,
+        ensure_suggestion: bool = True,
+        compact: bool = False,
+    ) -> tuple[str, InlineKeyboardMarkup]:
         known = _find_known_chat(chat_id)
         pending = service.get_pending_message(chat_id)
         title = known.title if known else (pending.title if pending else str(chat_id))
@@ -257,9 +287,64 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             pending = service.get_pending_message(chat_id)
 
         suggestion = pending.suggestion if (pending and pending.suggestion) else kv_data.get("antwort")
-        body = _format_chat_overview(chat_id, title, updated_at, kv_data, suggestion, pending)
-        text = f"{heading}\n\n{body}" if heading else body
-        return _limit_message(text), _chat_detail_keyboard(chat_id, page)
+        if compact:
+            lines: list[str] = []
+            if heading:
+                lines.append(_truncate_value(heading, max_len=180))
+            lines.append(f"{_truncate_value(title, max_len=64)} ({chat_id})")
+            if hasattr(updated_at, "strftime"):
+                lines.append(f"Zuletzt: {updated_at:%Y-%m-%d %H:%M}")
+            lines.append(f"Status: {_pending_state_short(pending)}")
+            lines.append(f"Auto: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}")
+            if suggestion:
+                lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=320))
+            info_parts: list[str] = []
+            for key in base_info_keys:
+                value = kv_data.get(key)
+                if not value:
+                    continue
+                label = base_info_labels.get(key, key)
+                part = f"{label}={_truncate_value(value, max_len=28)}"
+                if part not in info_parts:
+                    info_parts.append(part)
+                if len(info_parts) >= 4:
+                    break
+            if info_parts:
+                lines.append("Info: " + ", ".join(info_parts))
+            text = _limit_caption("\n".join(lines))
+        else:
+            body = _format_chat_overview(chat_id, title, updated_at, kv_data, suggestion, pending)
+            text = f"{heading}\n\n{body}" if heading else body
+            text = _limit_message(text)
+        return text, _chat_detail_keyboard(chat_id, page)
+
+    async def _send_chat_detail_card(
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        page: int,
+        heading: str | None = None,
+        ensure_suggestion: bool = True,
+    ):
+        caption, keyboard = await _render_chat_detail(
+            chat_id,
+            page,
+            heading=heading,
+            ensure_suggestion=ensure_suggestion,
+            compact=True,
+        )
+        profile_photo = await service.core.get_chat_profile_photo(chat_id)
+        if profile_photo:
+            return await context.bot.send_photo(
+                chat_id=allowed_chat_id,
+                photo=InputFile(profile_photo, filename=f"profile_{chat_id}.jpg"),
+                caption=caption,
+                reply_markup=keyboard,
+            )
+        return await context.bot.send_message(
+            chat_id=allowed_chat_id,
+            text=caption,
+            reply_markup=keyboard,
+        )
 
     def _remove_message_target(chat_id: int, message_id: int) -> None:
         for target_chat_id in list(infobox_targets.keys()):
@@ -270,8 +355,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             else:
                 infobox_targets.pop(target_chat_id, None)
 
-    async def _register_infobox_target(query, chat_id: int, page: int) -> None:
-        message = getattr(query, "message", None)
+    async def _register_infobox_target(message, chat_id: int, page: int, render_mode: str) -> None:
         if not message:
             return
 
@@ -279,11 +363,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         message_id = int(message.message_id)
         _remove_message_target(message_chat_id, message_id)
 
-        new_target = (message_chat_id, message_id, page)
+        new_target = (message_chat_id, message_id, page, render_mode)
         previous_targets = infobox_targets.get(chat_id, set())
         stale_targets = [target for target in previous_targets if target[:2] != new_target[:2]]
 
-        for stale_chat_id, stale_message_id, _stale_page in stale_targets:
+        for stale_chat_id, stale_message_id, _stale_page, _stale_mode in stale_targets:
             try:
                 await app.bot.delete_message(chat_id=stale_chat_id, message_id=stale_message_id)
             except BadRequest as exc:
@@ -298,22 +382,33 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         targets = infobox_targets.get(chat_id)
         if not targets:
             return
-        stale: set[tuple[int, int, int]] = set()
-        for target_chat_id, target_message_id, page in list(targets):
-            text, reply_markup = await _render_chat_detail(chat_id, page, heading=heading, ensure_suggestion=False)
+        stale: set[tuple[int, int, int, str]] = set()
+        for target_chat_id, target_message_id, page, render_mode in list(targets):
+            compact = render_mode == "card"
+            text, reply_markup = await _render_chat_detail(
+                chat_id, page, heading=heading, ensure_suggestion=False, compact=compact
+            )
             try:
-                await app.bot.edit_message_text(
-                    chat_id=target_chat_id,
-                    message_id=target_message_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                )
+                if render_mode == "card":
+                    await app.bot.edit_message_caption(
+                        chat_id=target_chat_id,
+                        message_id=target_message_id,
+                        caption=_limit_caption(text),
+                        reply_markup=reply_markup,
+                    )
+                else:
+                    await app.bot.edit_message_text(
+                        chat_id=target_chat_id,
+                        message_id=target_message_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                    )
             except BadRequest as exc:
                 message = str(exc).lower()
                 if "message is not modified" in message:
                     continue
                 if "message to edit not found" in message or "message can't be edited" in message:
-                    stale.add((target_chat_id, target_message_id, page))
+                    stale.add((target_chat_id, target_message_id, page, render_mode))
                     continue
                 raise
         for target in stale:
@@ -373,25 +468,12 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         summary = await service.run_once(target_chat_ids=target_chat_ids)
         await _guarded_reply(update, f"Fertig. Chats: {summary.chat_count}, gesendet: {summary.sent_count}")
 
-    async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update):
-            return
-        await _guarded_reply(update, "Starte Ordner-Scan...")
-        created = await service.scan_folder(force=False)
-        known_count = len(service.list_known_chats(limit=500))
-        await _guarded_reply(update, f"Scan abgeschlossen. Neue Vorschlaege: {created}, bekannte Chats im Ordner: {known_count}")
-
     async def chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
             return
 
-        known_chats = await _get_known_chats(limit=80)
-        if not known_chats:
-            await _guarded_reply(update, "Keine Chats im konfigurierten Ordner gefunden.")
-            return
-
-        service.start_folder_prefetch()
-        service.start_known_chats_refresh()
+        _kick_background_sync()
+        known_chats = _get_known_chats_cached(limit=80)
         text = _chats_menu_text(known_chats, page=0)
         keyboard = _chats_menu_keyboard(known_chats, page=0)
         if update.message:
@@ -415,13 +497,21 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             except (ValueError, IndexError):
                 await _safe_edit_message(query, "Ungueltige Aktion.")
                 return
-            known_chats = await _get_known_chats(limit=80)
+            _kick_background_sync()
+            known_chats = _get_known_chats_cached(limit=80)
             text = _chats_menu_text(known_chats, page=page)
             keyboard = _chats_menu_keyboard(known_chats, page=page)
             message = getattr(query, "message", None)
             if message:
                 _remove_message_target(int(message.chat_id), int(message.message_id))
-            await _safe_edit_message(query, text, reply_markup=keyboard)
+            if message and getattr(message, "photo", None):
+                await context.bot.send_message(chat_id=allowed_chat_id, text=text, reply_markup=keyboard)
+                try:
+                    await context.bot.delete_message(chat_id=int(message.chat_id), message_id=int(message.message_id))
+                except BadRequest:
+                    pass
+            else:
+                await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
         if data.startswith("mc:"):
@@ -432,9 +522,19 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             except (ValueError, IndexError):
                 await _safe_edit_message(query, "Ungueltige Aktion.")
                 return
-            text, keyboard = await _render_chat_detail(chat_id, page, ensure_suggestion=True)
-            await _safe_edit_message(query, text, reply_markup=keyboard)
-            await _register_infobox_target(query, chat_id, page)
+            message = getattr(query, "message", None)
+            if message and getattr(message, "photo", None):
+                text, keyboard = await _render_chat_detail(chat_id, page, ensure_suggestion=True, compact=True)
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                await _register_infobox_target(message, chat_id, page, render_mode="card")
+                return
+            card_message = await _send_chat_detail_card(
+                context,
+                chat_id=chat_id,
+                page=page,
+                ensure_suggestion=True,
+            )
+            await _register_infobox_target(card_message, chat_id, page, render_mode="card")
             return
 
         action = ""
@@ -476,7 +576,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 summary = await service.run_once(target_chat_ids={chat_id}, on_warning=_on_run_warning)
             except Exception as exc:
                 text, keyboard = await _render_chat_detail(
-                    chat_id, page, heading=f"Fehler bei Generierung: {exc}", ensure_suggestion=False
+                    chat_id,
+                    page,
+                    heading=f"Fehler bei Generierung: {exc}",
+                    ensure_suggestion=False,
+                    compact=bool(getattr(getattr(query, "message", None), "photo", None)),
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
@@ -487,46 +591,77 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             heading = heading + (
                 f" | Chats: {summary.chat_count}, Gesendet: {summary.sent_count}, Zeit: {summary.finished_at:%Y-%m-%d %H:%M:%S}"
             )
-            text, keyboard = await _render_chat_detail(chat_id, page, heading=heading, ensure_suggestion=False)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            text, keyboard = await _render_chat_detail(
+                chat_id, page, heading=heading, ensure_suggestion=False, compact=is_card
+            )
             await _safe_edit_message(query, text, reply_markup=keyboard)
-            await _register_infobox_target(query, chat_id, page)
+            message = getattr(query, "message", None)
+            if message:
+                await _register_infobox_target(message, chat_id, page, render_mode=("card" if is_card else "text"))
             return
 
         if action == "on":
             service.set_chat_auto(chat_id, enabled=True)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading="Auto-Senden fuer diesen Chat aktiviert.", ensure_suggestion=False
+                chat_id,
+                page,
+                heading="Auto-Senden fuer diesen Chat aktiviert.",
+                ensure_suggestion=False,
+                compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
-            await _register_infobox_target(query, chat_id, page)
+            message = getattr(query, "message", None)
+            if message:
+                await _register_infobox_target(message, chat_id, page, render_mode=("card" if is_card else "text"))
             return
 
         if action == "off":
             service.set_chat_auto(chat_id, enabled=False)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading="Auto-Senden fuer diesen Chat deaktiviert.", ensure_suggestion=False
+                chat_id,
+                page,
+                heading="Auto-Senden fuer diesen Chat deaktiviert.",
+                ensure_suggestion=False,
+                compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
         if action == "s":
             started = await service.trigger_send(chat_id, trigger="bot-send-button")
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             if not started:
                 text, keyboard = await _render_chat_detail(
-                    chat_id, page, heading="Kein sendbarer Zustand vorhanden.", ensure_suggestion=False
+                    chat_id,
+                    page,
+                    heading="Kein sendbarer Zustand vorhanden.",
+                    ensure_suggestion=False,
+                    compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading="Senden ausgeloest (oder vorgemerkt).", ensure_suggestion=False
+                chat_id,
+                page,
+                heading="Senden ausgeloest (oder vorgemerkt).",
+                ensure_suggestion=False,
+                compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
-            await _register_infobox_target(query, chat_id, page)
+            message = getattr(query, "message", None)
+            if message:
+                await _register_infobox_target(message, chat_id, page, render_mode=("card" if is_card else "text"))
             return
 
         if action == "x":
             result = await service.abort_send(chat_id)
-            text, keyboard = await _render_chat_detail(chat_id, page, heading=result, ensure_suggestion=False)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            text, keyboard = await _render_chat_detail(
+                chat_id, page, heading=result, ensure_suggestion=False, compact=is_card
+            )
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
@@ -534,9 +669,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             keyboard = _chat_detail_keyboard(chat_id, page)
             await _safe_edit_message(query, f"Chat {chat_id}\n\nLade letzte Bilder...", reply_markup=keyboard)
             images = await service.core.get_recent_images_with_captions_for_control_channel(chat_id, limit=3)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             if not images:
                 text, keyboard = await _render_chat_detail(
-                    chat_id, page, heading="Keine Bilder gefunden oder keine Caption erzeugt.", ensure_suggestion=False
+                    chat_id,
+                    page,
+                    heading="Keine Bilder gefunden oder keine Caption erzeugt.",
+                    ensure_suggestion=False,
+                    compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
@@ -547,28 +687,46 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     caption=caption[:1024],
                 )
             text, keyboard = await _render_chat_detail(
-                chat_id, page, heading=f"{len(images)} Bild(er) mit Caption im Kontrollkanal gepostet.", ensure_suggestion=False
+                chat_id,
+                page,
+                heading=f"{len(images)} Bild(er) mit Caption im Kontrollkanal gepostet.",
+                ensure_suggestion=False,
+                compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
         if action == "k":
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             if not service.store:
                 text, keyboard = await _render_chat_detail(
-                    chat_id, page, heading="Keine Datenbank konfiguriert.", ensure_suggestion=False
+                    chat_id,
+                    page,
+                    heading="Keine Datenbank konfiguriert.",
+                    ensure_suggestion=False,
+                    compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
             items = service.store.kv_list(chat_id, limit=20)
             if not items:
                 text, keyboard = await _render_chat_detail(
-                    chat_id, page, heading="Keine Keys gespeichert.", ensure_suggestion=False
+                    chat_id,
+                    page,
+                    heading="Keine Keys gespeichert.",
+                    ensure_suggestion=False,
+                    compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
             lines = [f"- {item.key}={item.value}" for item in items]
-            text, keyboard = await _render_chat_detail(chat_id, page, heading="KV Store", ensure_suggestion=False)
-            text = _limit_message(text + "\n\n" + "\n".join(lines))
+            text, keyboard = await _render_chat_detail(
+                chat_id, page, heading="KV Store", ensure_suggestion=False, compact=is_card
+            )
+            if is_card:
+                text = _limit_caption(text + "\n" + "\n".join(lines[:6]))
+            else:
+                text = _limit_message(text + "\n\n" + "\n".join(lines))
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
@@ -706,9 +864,17 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         preview = service.core.build_prompt_debug_summary(chat_context, max_lines=8)
         await _guarded_reply_chunks(update, "Prompt-Preview:\n" + preview)
 
+    async def send_start_menu() -> None:
+        _kick_background_sync()
+        known_chats = _get_known_chats_cached(limit=80)
+        text = _chats_menu_text(known_chats, page=0)
+        keyboard = _chats_menu_keyboard(known_chats, page=0)
+        await app.bot.send_message(chat_id=allowed_chat_id, text=text, reply_markup=keyboard)
+
+    app.bot_data["send_start_menu"] = send_start_menu
+
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("runonce", run_once))
-    app.add_handler(CommandHandler("scan", scan))
     app.add_handler(CommandHandler("chats", chats))
     app.add_handler(CommandHandler("last", last))
     app.add_handler(CommandHandler("history", history))

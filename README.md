@@ -69,9 +69,11 @@ Verfügbare Bot-Kommandos:
 - `/status` – zeigt den letzten Lauf und die Anzahl aktiver Nachrichtenprozesse
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
-- `/scan` – scannt den konfigurierten Ordner, registriert auch beantwortete Chats und erzeugt fehlende Vorschläge für unbeantwortete Chats
 - `/chats` – zeigt ein paginiertes Chat-Menü; pro Chat öffnet sich ein Detailmenü mit den neuesten Infos und Aktionen `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `KV`
-  - Das Menü bleibt stabil: Aktionen aktualisieren die Detailansicht und behalten Navigation (`Zurueck`, `Aktualisieren`) bei
+  - Beim Start im Bot-Modus wird dieses Menü automatisch gepostet
+  - Beim Öffnen eines Chats wird eine Profil-Card mit Profilbild (falls vorhanden) als Bot-Nachricht gepostet
+  - `Refresh` startet den Hintergrund-Refresh und aktualisiert die Liste ohne blockierenden Vollscan im Handler
+  - Das Menü bleibt stabil: Aktionen aktualisieren diese Card-Ansicht (Caption + Buttons) und behalten Navigation (`Zurueck`, `Aktualisieren`) bei
   - **Generate** erzeugt immer einen neuen Antwort-Vorschlag und setzt den Nachrichtenprozess auf **Wartephase**
   - Fehlt ein Vorschlag, wird beim Öffnen der Detailansicht automatisch eine Generierung gestartet
   - **Send** löst das Senden aus (manueller Trigger)

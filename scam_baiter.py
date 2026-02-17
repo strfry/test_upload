@@ -78,18 +78,16 @@ async def run() -> None:
         )
         print(
             "BotAPI aktiv. verfügbare Kommandos: "
-            "/status /runonce /scan /chats /last /history /kvset /kvget /kvdel /kvlist"
+            "/status /runonce /chats /last /history /kvset /kvget /kvdel /kvlist"
         )
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling()
-        await bot_app.bot.send_message(
-            chat_id=control_chat_id,
-            text=(
-                "Scambaiter Bot gestartet.\n"
-                "Kommandos: /status /runonce /scan /chats /last /history /kvset /kvget /kvdel /kvlist"
-            ),
-        )
+        send_start_menu = bot_app.bot_data.get("send_start_menu")
+        if callable(send_start_menu):
+            await send_start_menu()
+        else:
+            await bot_app.bot.send_message(chat_id=control_chat_id, text="Scambaiter Bot gestartet. /chats")
         try:
             while True:
                 await asyncio.sleep(3600)

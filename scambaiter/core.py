@@ -212,6 +212,23 @@ class ScambaiterCore:
 
         return ChatContext(chat_id=chat_id, title=title, messages=chat_messages)
 
+    async def get_chat_profile_photo(self, chat_id: int) -> bytes | None:
+        try:
+            entity = await self.client.get_entity(chat_id)
+        except Exception as exc:
+            self._debug(f"Profilbild: Entity fuer {chat_id} konnte nicht geladen werden: {exc}")
+            return None
+
+        try:
+            photo_bytes = await self.client.download_profile_photo(entity, file=bytes)
+        except Exception as exc:
+            self._debug(f"Profilbild: Download fuer {chat_id} fehlgeschlagen: {exc}")
+            return None
+
+        if isinstance(photo_bytes, (bytes, bytearray)) and photo_bytes:
+            return bytes(photo_bytes)
+        return None
+
     def build_conversation_messages(
         self,
         context: ChatContext,
