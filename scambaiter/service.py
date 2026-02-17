@@ -146,8 +146,18 @@ class BackgroundService:
             except Exception as exc:
                 print(f"[WARN] Pending-Listener fehlgeschlagen für Chat {chat_id}: {exc}")
 
+    @staticmethod
+    def _as_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     def list_known_chats(self, limit: int = 50) -> list[KnownChatEntry]:
-        items = sorted(self._known_chats.values(), key=lambda item: item.updated_at, reverse=True)
+        items = sorted(
+            self._known_chats.values(),
+            key=lambda item: self._as_utc(item.updated_at),
+            reverse=True,
+        )
         return items[:limit]
 
     def add_general_warning(self, message: str) -> None:
@@ -171,11 +181,12 @@ class BackgroundService:
     async def refresh_known_chats_from_folder(self) -> int:
         async with self._run_lock:
             folder_chat_ids = await self.core.get_folder_chat_ids()
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             async for dialog in self.core.client.iter_dialogs():
                 if dialog.id not in folder_chat_ids:
                     continue
-                updated_at = getattr(getattr(dialog, "message", None), "date", None) or now
+                raw_updated_at = getattr(getattr(dialog, "message", None), "date", None) or now
+                updated_at = self._as_utc(raw_updated_at)
                 self._known_chats[dialog.id] = KnownChatEntry(
                     chat_id=int(dialog.id),
                     title=str(dialog.title),
@@ -388,37 +399,7 @@ class BackgroundService:
     ) -> list[SuggestionResult]:
         results: list[SuggestionResult] = []
         for context in contexts:
-            language_hint = None
-            previous_analysis: dict[str, object] | None = None
-            prompt_context: dict[str, object] = {
-                "messenger": "telegram",
-                "now_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            }
-            existing_pending = self._pending_messages.get(context.chat_id)
-            if self.store:
-                previous = self.store.latest_for_chat(context.chat_id)
-                previous_analysis = previous.analysis if previous else None
-                language_hint = self._extract_language_hint(previous_analysis)
-                if previous_analysis:
-                    prompt_context["previous_analysis"] = previous_analysis
-                directives = self.store.list_directives(chat_id=context.chat_id, active_only=True, limit=25)
-                if directives:
-                    prompt_context["operator"] = {
-                        "directives": [
-                            {
-                                "id": str(item.id),
-                                "text": item.text,
-                                "scope": item.scope,
-                            }
-                            for item in directives
-                        ]
-                    }
-            if existing_pending and existing_pending.action_queue:
-                prompt_context["planned_queue"] = existing_pending.action_queue
-                prompt_context["planned_queue_trigger"] = existing_pending.trigger
-            typing_hint = self.core.get_recent_typing_hint(context.chat_id, max_age_seconds=120)
-            if typing_hint:
-                prompt_context["counterparty_live_activity"] = typing_hint
+            prompt_context, language_hint, previous_analysis = self.build_prompt_context_for_chat(context.chat_id)
 
             output = self.core.generate_output(
                 context,
@@ -456,6 +437,43 @@ class BackgroundService:
                 schema=output.metadata.get("schema"),
             )
         return results
+
+    def build_prompt_context_for_chat(
+        self,
+        chat_id: int,
+    ) -> tuple[dict[str, object], str | None, dict[str, object] | None]:
+        language_hint: str | None = None
+        previous_analysis: dict[str, object] | None = None
+        prompt_context: dict[str, object] = {
+            "messenger": "telegram",
+            "now_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
+        existing_pending = self._pending_messages.get(chat_id)
+        if self.store:
+            previous = self.store.latest_for_chat(chat_id)
+            previous_analysis = previous.analysis if previous else None
+            language_hint = self._extract_language_hint(previous_analysis)
+            if previous_analysis:
+                prompt_context["previous_analysis"] = previous_analysis
+            directives = self.store.list_directives(chat_id=chat_id, active_only=True, limit=25)
+            if directives:
+                prompt_context["operator"] = {
+                    "directives": [
+                        {
+                            "id": str(item.id),
+                            "text": item.text,
+                            "scope": item.scope,
+                        }
+                        for item in directives
+                    ]
+                }
+        if existing_pending and existing_pending.action_queue:
+            prompt_context["planned_queue"] = existing_pending.action_queue
+            prompt_context["planned_queue_trigger"] = existing_pending.trigger
+        typing_hint = self.core.get_recent_typing_hint(chat_id, max_age_seconds=120)
+        if typing_hint:
+            prompt_context["counterparty_live_activity"] = typing_hint
+        return prompt_context, language_hint, previous_analysis
 
     def _cancel_chat_task(self, chat_id: int) -> None:
         task = self._chat_tasks.get(chat_id)
