@@ -18,6 +18,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     chats_page_size = 8
     queue_page_size = 8
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
+    control_cards: dict[str, tuple[int, int]] = {}
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -67,6 +68,49 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if len(text) <= max_len:
             return text
         return text[: max_len - 14].rstrip() + "\n... [gekuerzt]"
+
+    def _drop_control_card_by_message(chat_id: int, message_id: int) -> None:
+        for key, value in list(control_cards.items()):
+            if value == (chat_id, message_id):
+                control_cards.pop(key, None)
+
+    async def _post_control_card(
+        kind: str,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        bring_to_front: bool = True,
+    ):
+        existing = control_cards.get(kind)
+        if existing:
+            existing_chat_id, existing_message_id = existing
+            if not bring_to_front:
+                try:
+                    await app.bot.edit_message_text(
+                        chat_id=existing_chat_id,
+                        message_id=existing_message_id,
+                        text=_limit_message(text),
+                        reply_markup=reply_markup,
+                    )
+                    return existing_chat_id, existing_message_id
+                except BadRequest as exc:
+                    lowered = str(exc).lower()
+                    if "message to edit not found" not in lowered and "message can't be edited" not in lowered:
+                        raise
+                    control_cards.pop(kind, None)
+            else:
+                try:
+                    await app.bot.delete_message(chat_id=existing_chat_id, message_id=existing_message_id)
+                except BadRequest:
+                    pass
+                control_cards.pop(kind, None)
+
+        message = await app.bot.send_message(
+            chat_id=allowed_chat_id,
+            text=_limit_message(text),
+            reply_markup=reply_markup,
+        )
+        control_cards[kind] = (int(message.chat_id), int(message.message_id))
+        return int(message.chat_id), int(message.message_id)
 
     def _truncate_value(value: str, max_len: int = 60) -> str:
         value = value.strip()
@@ -461,6 +505,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         )
 
     def _remove_message_target(chat_id: int, message_id: int) -> None:
+        _drop_control_card_by_message(chat_id, message_id)
         for target_chat_id in list(infobox_targets.keys()):
             targets = infobox_targets[target_chat_id]
             filtered = {entry for entry in targets if not (entry[0] == chat_id and entry[1] == message_id)}
@@ -541,12 +586,17 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                         f"Chat: {pending.title} ({event_chat_id})\n\n"
                         f"Frage:\n{reason}"
                     )
-                    message = await app.bot.send_message(
-                        chat_id=allowed_chat_id,
+                    message_chat_id, message_id = await _post_control_card(
+                        kind=f"escalation:{event_chat_id}",
                         text=_limit_message(text, max_len=3000),
                         reply_markup=_chat_detail_keyboard(event_chat_id, 0),
+                        bring_to_front=True,
                     )
-                    await _register_infobox_target(message, event_chat_id, 0, render_mode="text")
+                    class _Msg:
+                        def __init__(self, c_id: int, m_id: int) -> None:
+                            self.chat_id = c_id
+                            self.message_id = m_id
+                    await _register_infobox_target(_Msg(message_chat_id, message_id), event_chat_id, 0, render_mode="text")
                 app.create_task(_send_escalation(), update=None)
         if event_chat_id in infobox_targets:
             app.create_task(_push_infobox_update(event_chat_id), update=None)
@@ -554,7 +604,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     def _on_warning(message: str) -> None:
         async def _post_warning() -> None:
             text = "⚠️ Warnung\n" + message
-            await app.bot.send_message(chat_id=allowed_chat_id, text=_limit_message(text, max_len=3000))
+            await _post_control_card(
+                kind="warning",
+                text=_limit_message(text, max_len=3000),
+                bring_to_front=True,
+            )
 
         app.create_task(_post_warning(), update=None)
 
@@ -996,7 +1050,12 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         known_chats = _get_known_chats_cached(limit=80)
         text = _chats_menu_text(known_chats, page=0)
         keyboard = _chats_menu_keyboard(known_chats, page=0)
-        await app.bot.send_message(chat_id=allowed_chat_id, text=text, reply_markup=keyboard)
+        await _post_control_card(
+            kind="menu:chats",
+            text=text,
+            reply_markup=keyboard,
+            bring_to_front=True,
+        )
 
     app.bot_data["send_start_menu"] = send_start_menu
 
