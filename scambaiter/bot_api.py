@@ -90,6 +90,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     def _has_send_message(actions: list[dict[str, object]] | None) -> bool:
         return any(str(action.get("type", "")).strip().lower() == "send_message" for action in (actions or []))
 
+    def _planned_send_at_utc(actions: list[dict[str, object]] | None) -> str | None:
+        for action in actions or []:
+            if str(action.get("type", "")).strip().lower() != "send_message":
+                continue
+            value = action.get("send_at_utc")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     def _display_queue_fallback(suggestion: str | None) -> list[dict[str, object]]:
         text = (suggestion or "").strip()
         if not text:
@@ -108,6 +117,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         analysis_data: dict[str, object] | None,
         suggestion: str | None,
         pending: PendingMessage | None,
+        display_actions: list[dict[str, object]] | None,
     ) -> str:
         lines = [f"{title} ({chat_id})"]
         if hasattr(updated_at, "strftime"):
@@ -115,6 +125,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         lines.append(f"Auto-Senden: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}")
         if pending:
             lines.append(_format_pending_state(pending))
+        planned_send_at = _planned_send_at_utc(display_actions)
+        if planned_send_at:
+            lines.append(f"Geplantes Senden: {planned_send_at}")
         if suggestion and not (pending and _has_send_message(pending.action_queue)):
             lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=900))
         parts = _analysis_summary_parts(analysis_data)
@@ -145,6 +158,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 [
                     InlineKeyboardButton("Bilder", callback_data=f"ma:i:{chat_id}:{page}"),
                     InlineKeyboardButton("Analysis", callback_data=f"ma:k:{chat_id}:{page}"),
+                    InlineKeyboardButton("Prompt", callback_data=f"ma:p:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("Zurueck", callback_data=f"ml:{page}"),
@@ -387,6 +401,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 lines.append(f"Zuletzt: {updated_at:%Y-%m-%d %H:%M}")
             lines.append(f"Status: {_pending_state_short(pending)}")
             lines.append(f"Auto: {'AN' if service.is_chat_auto_enabled(chat_id) else 'AUS'}")
+            planned_send_at = _planned_send_at_utc(display_actions)
+            if planned_send_at:
+                lines.append(f"Sendet um: {planned_send_at}")
             info_parts = _analysis_summary_parts(analysis_data, limit=4)
             if info_parts:
                 lines.append("Analysis: " + ", ".join(info_parts))
@@ -399,7 +416,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 lines.append("Vorschlag: " + _truncate_value(suggestion, max_len=180))
             text = _limit_caption("\n".join(lines))
         else:
-            body = _format_chat_overview(chat_id, title, updated_at, analysis_data, suggestion, pending)
+            body = _format_chat_overview(chat_id, title, updated_at, analysis_data, suggestion, pending, display_actions)
             if display_actions:
                 queue_lines = ["Queue:"]
                 source_text = pending.suggestion if pending else suggestion
@@ -846,6 +863,32 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 text = _limit_caption(text + "\n" + rendered[:700])
             else:
                 text = _limit_message(text + "\n\n" + rendered)
+            await _safe_edit_message(query, text, reply_markup=keyboard)
+            return
+
+        if action == "p":
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            chat_context = await service.core.build_chat_context(chat_id)
+            if not chat_context:
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading="Kein Chatverlauf gefunden.",
+                    compact=is_card,
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+            preview = service.core.build_prompt_debug_summary(chat_context, max_lines=8)
+            text, keyboard = await _render_chat_detail(
+                chat_id,
+                page,
+                heading="Prompt-Preview",
+                compact=is_card,
+            )
+            if is_card:
+                text = _limit_caption(text + "\n" + _truncate_value(preview, max_len=700))
+            else:
+                text = _limit_message(text + "\n\nPrompt-Preview:\n" + preview)
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
