@@ -17,7 +17,6 @@ class AppConfig:
     folder_name: str
     history_limit: int
     send_enabled: bool
-    send_confirm: str
     delete_after_seconds: int
     interactive_enabled: bool
     debug_enabled: bool
@@ -78,7 +77,6 @@ def load_config() -> AppConfig:
         folder_name=env_str("SCAMBAITER_FOLDER_NAME", "Scammers") or "Scammers",
         history_limit=env_int("SCAMBAITER_HISTORY_LIMIT", 20),
         send_enabled=env_flag("SCAMBAITER_SEND"),
-        send_confirm=env_str("SCAMBAITER_SEND_CONFIRM", "") or "",
         delete_after_seconds=env_int("SCAMBAITER_DELETE_OWN_AFTER_SECONDS", 0),
         interactive_enabled=env_flag("SCAMBAITER_INTERACTIVE", default=True),
         debug_enabled=env_flag("SCAMBAITER_DEBUG"),

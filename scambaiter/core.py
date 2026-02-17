@@ -944,9 +944,6 @@ class ScambaiterCore:
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
         if not self.config.send_enabled:
             return False
-        if self.config.send_confirm != "SEND":
-            print("[WARN] SCAMBAITER_SEND aktiv, aber SCAMBAITER_SEND_CONFIRM != 'SEND'.")
-            return False
         if looks_like_reasoning_output(suggestion):
             print(
                 f"[WARN] Nachricht für {context.title} ({context.chat_id}) nicht gesendet: extrahierter Text wirkt wie Denkprozess."

@@ -33,7 +33,6 @@ export SCAMBAITER_HISTORY_LIMIT="20"
 export SCAMBAITER_DEBUG="1"
 
 export SCAMBAITER_SEND="1"
-export SCAMBAITER_SEND_CONFIRM="SEND"          # Pflicht, wenn SEND aktiv
 export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30" # optional
 
 export SCAMBAITER_INTERACTIVE="1"              # nur Batch-Modus

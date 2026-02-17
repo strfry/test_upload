@@ -563,9 +563,9 @@ class BackgroundService:
                 pending.last_error = "Leerer Antwortvorschlag."
                 self._notify_pending_changed(chat_id)
                 return
-            if not self.core.config.send_enabled or self.core.config.send_confirm != "SEND":
+            if not self.core.config.send_enabled:
                 pending.state = MessageState.ERROR
-                pending.last_error = "Senden deaktiviert (SCAMBAITER_SEND/SCAMBAITER_SEND_CONFIRM)."
+                pending.last_error = "Senden deaktiviert (SCAMBAITER_SEND)."
                 self._notify_pending_changed(chat_id)
                 return
 
