@@ -105,10 +105,6 @@ QUEUE-KONTEXT:
   - Ausnahme: Wenn aktive `operator.directives` explizit ein proaktives Follow-up ohne neue User-Nachricht verlangen,
     darfst du eine neue, klar unterscheidbare Nachricht planen (kein Duplikat der letzten Assistant-Nachricht).
   - In diesem Ausnahmefall trage die verwendete Direktiven-ID in `analysis.operator_applied` ein.
-- Der Input kann `recent_assistant_messages` enthalten (frühere bereits gesendete Antworten).
-- Vermeide Wiederholungen:
-  - stelle nicht erneut dieselbe Frage, wenn die Antwort bereits in `previous_analysis` oder im Verlauf steht
-  - wiederhole keine sehr ähnlichen Formulierungen aus `recent_assistant_messages`
 
 OPERATOR-DIREKTIVEN:
 - Der Input kann ein Feld `operator.directives` enthalten.

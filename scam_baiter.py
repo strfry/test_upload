@@ -64,14 +64,6 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
                 if isinstance(value, str) and value.strip():
                     language_hint = value.strip()
                     break
-        recent_entries = store.recent_for_chat(context.chat_id, limit=6)
-        recent_assistant_messages = [
-            item.suggestion.strip()
-            for item in reversed(recent_entries)
-            if isinstance(item.suggestion, str) and item.suggestion.strip()
-        ]
-        if recent_assistant_messages:
-            prompt_context["recent_assistant_messages"] = recent_assistant_messages[-5:]
         directives = store.list_directives(chat_id=context.chat_id, active_only=True, limit=25)
         if directives:
             prompt_context["operator"] = {
