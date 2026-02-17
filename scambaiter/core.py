@@ -106,6 +106,16 @@ QUEUE-KONTEXT:
     darfst du eine neue, klar unterscheidbare Nachricht planen (kein Duplikat der letzten Assistant-Nachricht).
   - In diesem Ausnahmefall trage die verwendete Direktiven-ID in `analysis.operator_applied` ein.
 
+KONTEXT-KONSISTENZ:
+- `previous_analysis` ist nur Arbeitsspeicher und kann unvollständig oder veraltet sein.
+- Behandle `previous_analysis` als interne Faktenbasis für den aktuellen Stand.
+- Der aktuelle Chatverlauf hat Vorrang vor `previous_analysis`.
+- Frage keine Information erneut, wenn `previous_analysis` ODER der Verlauf sie bereits als bekannt markieren.
+- Wenn der Verlauf bereits eine Antwort auf eine zuvor offene Frage enthält, stelle diese Frage NICHT erneut.
+- Aktualisiere stattdessen `analysis` konsistent zum Verlauf (z.B. offene Punkte als geklärt markieren).
+- Bei Widerspruch zwischen `previous_analysis` und Verlauf: folge dem Verlauf und korrigiere `analysis`.
+- Vermeide Wiederholungsfragen in leicht umformulierter Form; das zählt ebenfalls als Duplikat.
+
 OPERATOR-DIREKTIVEN:
 - Der Input kann ein Feld `operator.directives` enthalten.
 - Jede Direktive ist bindend, solange sie aktiv ist.
@@ -850,12 +860,11 @@ class ScambaiterCore:
         self._debug("Prompt-Zusammenfassung:\n" + self.build_prompt_debug_summary(context))
 
         for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-            ]
-            if language_system_prompt:
-                messages.append({"role": "system", "content": language_system_prompt})
-            messages.extend(conversation_messages)
+            messages = self.build_model_messages(
+                context=context,
+                language_hint=language_hint,
+                prompt_context=prompt_context,
+            )
             if attempt > 1:
                 messages.append(
                     {
@@ -982,6 +991,19 @@ class ScambaiterCore:
         if last_output is None:
             return ModelOutput(raw="", suggestion="", analysis=None, metadata={}, actions=[])
         return last_output
+
+    def build_model_messages(
+        self,
+        context: ChatContext,
+        language_hint: str | None = None,
+        prompt_context: dict[str, object] | None = None,
+    ) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        language_system_prompt = self.build_language_system_prompt(language_hint)
+        if language_system_prompt:
+            messages.append({"role": "system", "content": language_system_prompt})
+        messages.extend(self.build_conversation_messages(context, prompt_context=prompt_context))
+        return messages
 
     def _attempt_repair_output(
         self,
