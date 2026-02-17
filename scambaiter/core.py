@@ -51,8 +51,10 @@ STRUKTURREGELN:
 - send_message bedeutet: sende message.text.
 - Keine zusätzlichen Keys erzeugen.
 - Keine nicht spezifizierten Felder erfinden.
+- Wenn Lesen sinnvoll ist, setze mark_read explizit vor Sende-Aktionen.
 
 ERLAUBTE ACTION-TYPEN:
+- mark_read
 - simulate_typing (benötigt duration_seconds)
 - delay_send (benötigt delay_seconds)
 - send_message (optional reply_to)
@@ -73,6 +75,12 @@ ZEITINFORMATION:
 - Nachrichten können ein Feld "ts_utc" (ISO-8601) enthalten.
 - Nutze Zeitabstände optional zur Einschätzung von Dringlichkeit oder natürlichem Antwortverhalten.
 - Führe keine komplexe Datumsberechnung durch.
+
+QUEUE-KONTEXT:
+- Der Input kann bereits geplante Actions aus einer früheren Planung enthalten (`planned_queue`).
+- Wenn die alte Planung weiterhin passt, gib die geplanten Actions konsistent erneut aus (Bestätigung).
+- Wenn sie nicht mehr passt (z.B. neue eingehende Nachricht), verwerfe/ersetze sie durch eine aktualisierte Actions-Liste.
+- Antworte immer mit der vollständigen, aktuell gültigen Actions-Liste.
 
 SPRACHE:
 - Verwende ausschließlich die Sprache aus dem Eingabefeld "language".
@@ -160,67 +168,72 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
 
     normalized_actions: list[dict[str, object]] = []
     for action in actions_value:
-        if not isinstance(action, dict):
+        normalized_action = normalize_action_shape(action)
+        if not isinstance(normalized_action, dict):
             return None
-        action_type = action.get("type")
+        action_type = normalized_action.get("type")
         if not isinstance(action_type, str):
             return None
 
-        if action_type == "simulate_typing":
-            expected = {"type", "duration_seconds"}
-            if set(action.keys()) != expected:
+        if action_type == "mark_read":
+            if set(normalized_action.keys()) != {"type"}:
                 return None
-            duration = action.get("duration_seconds")
+            normalized_actions.append({"type": "mark_read"})
+        elif action_type == "simulate_typing":
+            expected = {"type", "duration_seconds"}
+            if set(normalized_action.keys()) != expected:
+                return None
+            duration = normalized_action.get("duration_seconds")
             if not isinstance(duration, (int, float)) or duration < 0 or duration > 60:
                 return None
             normalized_actions.append({"type": "simulate_typing", "duration_seconds": float(duration)})
         elif action_type == "delay_send":
             expected = {"type", "delay_seconds"}
-            if set(action.keys()) != expected:
+            if set(normalized_action.keys()) != expected:
                 return None
-            delay = action.get("delay_seconds")
+            delay = normalized_action.get("delay_seconds")
             if not isinstance(delay, (int, float)) or delay < 0 or delay > 86400:
                 return None
             normalized_actions.append({"type": "delay_send", "delay_seconds": float(delay)})
         elif action_type == "send_message":
             expected = {"type", "reply_to"}
-            keys = set(action.keys())
+            keys = set(normalized_action.keys())
             if keys != {"type"} and keys != expected:
                 return None
             entry: dict[str, object] = {"type": "send_message"}
-            if "reply_to" in action:
-                reply_to = action.get("reply_to")
+            if "reply_to" in normalized_action:
+                reply_to = normalized_action.get("reply_to")
                 if not isinstance(reply_to, (str, int)):
                     return None
                 entry["reply_to"] = reply_to
             normalized_actions.append(entry)
         elif action_type == "edit_message":
             expected = {"type", "message_id", "new_text"}
-            if set(action.keys()) != expected:
+            if set(normalized_action.keys()) != expected:
                 return None
-            if not isinstance(action.get("new_text"), str):
+            if not isinstance(normalized_action.get("new_text"), str):
                 return None
-            message_id = action.get("message_id")
+            message_id = normalized_action.get("message_id")
             if not isinstance(message_id, (str, int)):
                 return None
             normalized_actions.append(
                 {
                     "type": "edit_message",
                     "message_id": message_id,
-                    "new_text": action.get("new_text", ""),
+                    "new_text": normalized_action.get("new_text", ""),
                 }
             )
         elif action_type == "noop":
-            if set(action.keys()) != {"type"}:
+            if set(normalized_action.keys()) != {"type"}:
                 return None
             normalized_actions.append({"type": "noop"})
         elif action_type == "escalate_to_human":
             expected = {"type", "reason"}
-            if set(action.keys()) != expected:
+            if set(normalized_action.keys()) != expected:
                 return None
-            if not isinstance(action.get("reason"), str) or not action.get("reason").strip():
+            if not isinstance(normalized_action.get("reason"), str) or not normalized_action.get("reason").strip():
                 return None
-            normalized_actions.append({"type": "escalate_to_human", "reason": action.get("reason", "").strip()})
+            normalized_actions.append({"type": "escalate_to_human", "reason": normalized_action.get("reason", "").strip()})
         else:
             return None
 
@@ -242,6 +255,34 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
         metadata=metadata,
         actions=normalized_actions,
     )
+
+
+def normalize_action_shape(action: object) -> dict[str, object] | None:
+    if not isinstance(action, dict):
+        return None
+    if "type" in action:
+        return dict(action)
+
+    # Accept and normalize legacy malformed shorthand:
+    # {"send_message": {}} -> {"type": "send_message"}
+    if len(action) == 1:
+        key = next(iter(action.keys()))
+        value = action[key]
+        if isinstance(key, str) and key in {
+            "mark_read",
+            "simulate_typing",
+            "delay_send",
+            "send_message",
+            "edit_message",
+            "noop",
+            "escalate_to_human",
+        }:
+            normalized: dict[str, object] = {"type": key}
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    normalized[str(k)] = v
+            return normalized
+    return dict(action)
 
 
 def _normalize_text_content(content: object) -> str:

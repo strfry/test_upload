@@ -148,6 +148,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             MessageState.WAITING: "W",
             MessageState.SENDING_TYPING: "S",
             MessageState.SENT: "OK",
+            MessageState.ESCALATED: "H",
             MessageState.CANCELLED: "X",
             MessageState.ERROR: "!",
         }
@@ -176,7 +177,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         page = max(0, min(page, total_pages - 1))
         start = page * chats_page_size
         current_slice = known_chats[start : start + chats_page_size]
-        lines = [f"Chats ({len(known_chats)}) | Seite {page + 1}/{total_pages}", "Status: A=kein Prozess, G/W/S/OK/X/!"]
+        lines = [f"Chats ({len(known_chats)}) | Seite {page + 1}/{total_pages}", "Status: A=kein Prozess, G/W/S/OK/H/X/!"]
         if not current_slice:
             lines.append("Noch keine Chats im Cache. Hintergrund-Sync laeuft, bitte Refresh druecken.")
             return "\n".join(lines)
@@ -271,6 +272,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             MessageState.WAITING: "Wartephase",
             MessageState.SENDING_TYPING: "Sendephase (Tippen)",
             MessageState.SENT: "Gesendet",
+            MessageState.ESCALATED: "Menschliche Eskalation",
             MessageState.CANCELLED: "Abgebrochen",
             MessageState.ERROR: "Fehler",
         }
@@ -284,6 +286,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             lines.append(f"Gesendete msg_id: {pending.sent_message_id}")
         if pending.last_error:
             lines.append(f"Fehler: {pending.last_error}")
+        if pending.state == MessageState.ESCALATED and pending.escalation_reason:
+            lines.append(f"Frage: {pending.escalation_reason}")
         action_queue = pending.action_queue or []
         if action_queue:
             lines.append("Actions:")
@@ -302,6 +306,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             MessageState.WAITING: "Wartephase",
             MessageState.SENDING_TYPING: "Senden",
             MessageState.SENT: "Gesendet",
+            MessageState.ESCALATED: "Eskalation",
             MessageState.CANCELLED: "Abgebrochen",
             MessageState.ERROR: "Fehler",
         }
@@ -460,9 +465,25 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             infobox_targets.pop(chat_id, None)
 
     def _on_pending_changed(event_chat_id: int, _pending: PendingMessage | None) -> None:
-        if event_chat_id not in infobox_targets:
-            return
-        app.create_task(_push_infobox_update(event_chat_id), update=None)
+        pending = service.get_pending_message(event_chat_id)
+        if pending and pending.state == MessageState.ESCALATED and not pending.escalation_notified:
+            if service.mark_escalation_notified(event_chat_id):
+                async def _send_escalation() -> None:
+                    reason = (pending.escalation_reason or "").strip() or "Keine Begründung angegeben."
+                    text = (
+                        f"🧑‍💼 Human Escalation\n"
+                        f"Chat: {pending.title} ({event_chat_id})\n\n"
+                        f"Frage:\n{reason}"
+                    )
+                    message = await app.bot.send_message(
+                        chat_id=allowed_chat_id,
+                        text=_limit_message(text, max_len=3000),
+                        reply_markup=_chat_detail_keyboard(event_chat_id, 0),
+                    )
+                    await _register_infobox_target(message, event_chat_id, 0, render_mode="text")
+                app.create_task(_send_escalation(), update=None)
+        if event_chat_id in infobox_targets:
+            app.create_task(_push_infobox_update(event_chat_id), update=None)
 
     service.add_pending_listener(_on_pending_changed)
 

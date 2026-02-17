@@ -26,6 +26,7 @@ class MessageState(str, Enum):
     WAITING = "waiting"
     SENDING_TYPING = "sending_typing"
     SENT = "sent"
+    ESCALATED = "escalated"
     CANCELLED = "cancelled"
     ERROR = "error"
 
@@ -44,6 +45,8 @@ class PendingMessage:
     send_requested: bool = False
     action_queue: list[dict[str, object]] | None = None
     schema: str | None = None
+    escalation_reason: str | None = None
+    escalation_notified: bool = False
 
 
 
@@ -323,12 +326,16 @@ class BackgroundService:
         for context in contexts:
             language_hint = None
             prompt_context: dict[str, object] = {"messenger": "telegram"}
+            existing_pending = self._pending_messages.get(context.chat_id)
             if self.store:
                 previous = self.store.latest_for_chat(context.chat_id)
                 previous_analysis = previous.analysis if previous else None
                 language_hint = self._extract_language_hint(previous_analysis)
                 if previous_analysis:
                     prompt_context["previous_analysis"] = previous_analysis
+            if existing_pending and existing_pending.action_queue:
+                prompt_context["planned_queue"] = existing_pending.action_queue
+                prompt_context["planned_queue_trigger"] = existing_pending.trigger
 
             output = self.core.generate_output(
                 context,
@@ -410,6 +417,12 @@ class BackgroundService:
         previous = self._pending_messages.get(context.chat_id)
         if previous:
             self._cancel_chat_task(context.chat_id)
+            previous_actions = list(previous.action_queue or [])
+            new_actions = list(action_queue or [])
+            if previous_actions != new_actions:
+                self.add_general_warning(
+                    f"Chat {context.chat_id}: Bestehende Queue durch neue Modell-Actions ersetzt."
+                )
 
         wait_until = (
             datetime.now() + timedelta(seconds=self.interval_seconds)
@@ -427,6 +440,8 @@ class BackgroundService:
             send_requested=bool(previous and previous.send_requested),
             action_queue=list(action_queue or []),
             schema=(schema or "").strip() or None,
+            escalation_reason=None,
+            escalation_notified=False,
         )
         self._notify_pending_changed(context.chat_id)
         self._start_waiting_task(context.chat_id)
@@ -504,11 +519,29 @@ class BackgroundService:
             outgoing_text = pending.suggestion
             action_queue = list(pending.action_queue or [])
             if not action_queue:
-                action_queue = [{"type": "simulate_typing", "duration_seconds": 2.0}, {"type": "send_message"}]
+                action_queue = [
+                    {"type": "mark_read"},
+                    {"type": "simulate_typing", "duration_seconds": 2.0},
+                    {"type": "send_message"},
+                ]
+
+            mark_read_done = False
+
+            async def ensure_mark_read() -> None:
+                nonlocal mark_read_done
+                if mark_read_done:
+                    return
+                await self.core.client.send_read_acknowledge(chat_id)
+                mark_read_done = True
 
             for action in action_queue:
                 action_type = str(action.get("type", "")).strip().lower()
+                if action_type == "mark_read":
+                    await ensure_mark_read()
+                    continue
+
                 if action_type == "simulate_typing":
+                    await ensure_mark_read()
                     duration = float(action.get("duration_seconds", 0.0))
                     duration = min(60.0, max(0.0, duration))
                     async with self.core.client.action(chat_id, "typing"):
@@ -522,6 +555,7 @@ class BackgroundService:
                     continue
 
                 if action_type == "send_message":
+                    await ensure_mark_read()
                     reply_to = action.get("reply_to")
                     send_kwargs: dict[str, object] = {}
                     if isinstance(reply_to, int):
@@ -532,6 +566,7 @@ class BackgroundService:
                     continue
 
                 if action_type == "edit_message":
+                    await ensure_mark_read()
                     message_id = action.get("message_id")
                     new_text = str(action.get("new_text", "")).strip()
                     if isinstance(message_id, int) and new_text:
@@ -546,8 +581,9 @@ class BackgroundService:
 
                 if action_type == "escalate_to_human":
                     reason = str(action.get("reason", "")).strip() or "Eskalation durch Action-Plan."
-                    pending.state = MessageState.ERROR
-                    pending.last_error = f"Eskalation erforderlich: {reason}"
+                    pending.state = MessageState.ESCALATED
+                    pending.escalation_reason = reason
+                    pending.last_error = None
                     self._notify_pending_changed(chat_id)
                     return
 
@@ -616,6 +652,16 @@ class BackgroundService:
 
     def list_pending_messages(self) -> list[PendingMessage]:
         return sorted(self._pending_messages.values(), key=lambda item: item.created_at, reverse=True)
+
+    def mark_escalation_notified(self, chat_id: int) -> bool:
+        pending = self._pending_messages.get(chat_id)
+        if not pending or pending.state != MessageState.ESCALATED:
+            return False
+        if pending.escalation_notified:
+            return False
+        pending.escalation_notified = True
+        self._notify_pending_changed(chat_id)
+        return True
 
     def _should_process_context(self, context: ChatContext) -> bool:
         fingerprint = self._fingerprint_context(context)
