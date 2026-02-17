@@ -489,13 +489,12 @@ class BackgroundService:
     async def trigger_send(self, chat_id: int, trigger: str = "manual") -> bool:
         pending = self._pending_messages.get(chat_id)
         if not pending:
-            started = await self.schedule_suggestion_generation(
-                chat_id=chat_id,
-                title=str(chat_id),
-                trigger="send-without-state",
-                auto_send=True,
-            )
-            return started
+            restored = self._restore_pending_from_store(chat_id, trigger=trigger)
+            if not restored:
+                return False
+            pending = self._pending_messages.get(chat_id)
+            if not pending:
+                return False
 
         if pending.state == MessageState.GENERATING:
             pending.trigger = trigger
@@ -512,6 +511,34 @@ class BackgroundService:
         self._notify_pending_changed(chat_id)
         task = asyncio.create_task(self._send_flow(chat_id))
         self._chat_tasks[chat_id] = task
+        return True
+
+    def _restore_pending_from_store(self, chat_id: int, trigger: str) -> bool:
+        if not self.store:
+            return False
+        latest = self.store.latest_for_chat(chat_id)
+        if not latest:
+            return False
+        if not latest.suggestion.strip():
+            return False
+        actions = list(latest.actions or [])
+        if not actions:
+            return False
+        self._pending_messages[chat_id] = PendingMessage(
+            chat_id=chat_id,
+            title=latest.title,
+            suggestion=latest.suggestion,
+            created_at=datetime.now(),
+            state=MessageState.WAITING,
+            wait_until=None,
+            trigger=trigger,
+            send_requested=False,
+            action_queue=actions,
+            schema=(latest.metadata.get("schema") if latest.metadata else None),
+            escalation_reason=None,
+            escalation_notified=False,
+        )
+        self._notify_pending_changed(chat_id)
         return True
 
     async def _send_flow(self, chat_id: int) -> None:
