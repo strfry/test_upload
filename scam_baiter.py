@@ -19,6 +19,27 @@ from scambaiter.service import BackgroundService
 from scambaiter.storage import AnalysisStore
 
 
+def merge_analysis(
+    previous: dict[str, object] | None,
+    current: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not isinstance(previous, dict) and not isinstance(current, dict):
+        return None
+    if not isinstance(previous, dict):
+        return dict(current or {})
+    if not isinstance(current, dict):
+        return dict(previous)
+    merged: dict[str, object] = dict(previous)
+    for key, value in current.items():
+        old_value = merged.get(key)
+        if isinstance(old_value, dict) and isinstance(value, dict):
+            nested = merge_analysis(old_value, value)
+            merged[key] = nested if isinstance(nested, dict) else {}
+        else:
+            merged[key] = value
+    return merged
+
+
 async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
     folder_chat_ids = await core.get_folder_chat_ids()
     contexts = await core.collect_folder_chats(folder_chat_ids)
@@ -56,11 +77,12 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
             language_hint=language_hint,
             prompt_context=prompt_context,
         )
+        merged_analysis = merge_analysis(previous_analysis, output.analysis)
         store.save(
             chat_id=context.chat_id,
             title=context.title,
             suggestion=output.suggestion,
-            analysis=output.analysis,
+            analysis=merged_analysis,
             actions=output.actions,
             metadata=output.metadata,
         )
@@ -69,8 +91,8 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
         if output.metadata:
             meta = ", ".join(f"{k}={v}" for k, v in output.metadata.items())
             print(f"[Meta] {meta}")
-        if output.analysis:
-            print(f"[Analysis] {output.analysis}")
+        if merged_analysis:
+            print(f"[Analysis] {merged_analysis}")
         print()
         handled = await core.maybe_interactive_console_reply(context, output.suggestion)
         if not handled:

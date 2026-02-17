@@ -389,6 +389,7 @@ class BackgroundService:
         results: list[SuggestionResult] = []
         for context in contexts:
             language_hint = None
+            previous_analysis: dict[str, object] | None = None
             prompt_context: dict[str, object] = {
                 "messenger": "telegram",
                 "now_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -427,10 +428,11 @@ class BackgroundService:
                     (lambda message, chat_id=context.chat_id: self._handle_generation_warning(chat_id, message, on_warning))
                 ),
             )
+            merged_analysis = self._merge_analysis(previous_analysis if self.store else None, output.analysis)
             result = SuggestionResult(
                 context=context,
                 suggestion=output.suggestion,
-                analysis=output.analysis,
+                analysis=merged_analysis,
                 metadata=output.metadata,
                 actions=output.actions,
             )
@@ -441,7 +443,7 @@ class BackgroundService:
                     chat_id=context.chat_id,
                     title=context.title,
                     suggestion=output.suggestion,
-                    analysis=output.analysis,
+                    analysis=merged_analysis,
                     actions=output.actions,
                     metadata=output.metadata,
                 )
@@ -533,6 +535,28 @@ class BackgroundService:
         )
         self._notify_pending_changed(context.chat_id)
         self._start_waiting_task(context.chat_id)
+
+    @staticmethod
+    def _merge_analysis(
+        previous: dict[str, object] | None,
+        current: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not isinstance(previous, dict) and not isinstance(current, dict):
+            return None
+        if not isinstance(previous, dict):
+            return dict(current or {})
+        if not isinstance(current, dict):
+            return dict(previous)
+
+        merged: dict[str, object] = dict(previous)
+        for key, value in current.items():
+            old_value = merged.get(key)
+            if isinstance(old_value, dict) and isinstance(value, dict):
+                nested = BackgroundService._merge_analysis(old_value, value)
+                merged[key] = nested if isinstance(nested, dict) else {}
+            else:
+                merged[key] = value
+        return merged
 
     @staticmethod
     def _extract_language_hint(analysis: dict[str, object] | None) -> str | None:
