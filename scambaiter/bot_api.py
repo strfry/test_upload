@@ -206,16 +206,23 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return None
 
     def _chat_detail_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
+        pending = service.get_pending_message(chat_id)
+        is_running = bool(pending and pending.state == MessageState.SENDING_TYPING)
+        auto_enabled = service.is_chat_auto_enabled(chat_id)
+        run_label = "⏭️ Skip" if is_running else "▶️ Queue Run"
+        run_action = "sk" if is_running else "q"
+        auto_on_label = "🟢 Auto an" if auto_enabled else "⚪ Auto an"
+        auto_off_label = "⚪ Auto aus" if auto_enabled else "🔴 Auto aus"
         return InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton("🧠 Generate", callback_data=f"ma:g:{chat_id}:{page}"),
-                    InlineKeyboardButton("▶️ Queue Run", callback_data=f"ma:q:{chat_id}:{page}"),
+                    InlineKeyboardButton(run_label, callback_data=f"ma:{run_action}:{chat_id}:{page}"),
                     InlineKeyboardButton("⏹️ Stop", callback_data=f"ma:x:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("🤖 Auto an", callback_data=f"ma:on:{chat_id}:{page}"),
-                    InlineKeyboardButton("🛑 Auto aus", callback_data=f"ma:off:{chat_id}:{page}"),
+                    InlineKeyboardButton(auto_on_label, callback_data=f"ma:on:{chat_id}:{page}"),
+                    InlineKeyboardButton(auto_off_label, callback_data=f"ma:off:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("🖼️ Bilder", callback_data=f"ma:i:{chat_id}:{page}"),
@@ -1013,6 +1020,27 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             message = getattr(query, "message", None)
             if message:
                 await _register_infobox_target(message, chat_id, page, render_mode=("card" if is_card else "text"))
+            return
+
+        if action == "sk":
+            skipped = service.request_skip_current_action(chat_id)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            if not skipped:
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading="Kein überspringbarer Schritt aktiv.",
+                    compact=is_card,
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+            text, keyboard = await _render_chat_detail(
+                chat_id,
+                page,
+                heading="Aktueller Schritt wird übersprungen.",
+                compact=is_card,
+            )
+            await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
         if action == "x":

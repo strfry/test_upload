@@ -80,6 +80,7 @@ class BackgroundService:
         self._periodic_run_task: asyncio.Task | None = None
         self._known_chats: dict[int, KnownChatEntry] = {}
         self._chat_auto_enabled: set[int] = set()
+        self._skip_current_action: set[int] = set()
         self._pending_listeners: list[PendingListener] = []
         self._warning_listeners: list[WarningListener] = []
         self._general_warnings: list[str] = []
@@ -108,6 +109,34 @@ class BackgroundService:
         if not self.store:
             return False
         return self.store.delete_directive(chat_id=chat_id, directive_id=directive_id)
+
+    def request_skip_current_action(self, chat_id: int) -> bool:
+        pending = self._pending_messages.get(chat_id)
+        if not pending or pending.state != MessageState.SENDING_TYPING:
+            return False
+        if pending.current_action_label not in {"simulate_typing", "wait"}:
+            return False
+        self._skip_current_action.add(int(chat_id))
+        return True
+
+    def _consume_skip_request(self, chat_id: int) -> bool:
+        if int(chat_id) in self._skip_current_action:
+            self._skip_current_action.discard(int(chat_id))
+            return True
+        return False
+
+    async def _sleep_with_optional_skip(self, chat_id: int, seconds: float) -> bool:
+        remaining = max(0.0, float(seconds))
+        if remaining <= 0:
+            return False
+        step = 0.4
+        while remaining > 0:
+            if self._consume_skip_request(chat_id):
+                return True
+            current = min(step, remaining)
+            await asyncio.sleep(current)
+            remaining -= current
+        return self._consume_skip_request(chat_id)
 
     def _notify_pending_changed(self, chat_id: int) -> None:
         pending = self._pending_messages.get(chat_id)
@@ -640,7 +669,10 @@ class BackgroundService:
                     pending.current_action_until = datetime.now() + timedelta(seconds=duration)
                     self._notify_pending_changed(chat_id)
                     async with self.core.client.action(chat_id, "typing"):
-                        await asyncio.sleep(duration)
+                        skipped = await self._sleep_with_optional_skip(chat_id, duration)
+                        if skipped:
+                            pending.current_action_until = None
+                            self._notify_pending_changed(chat_id)
                     continue
 
                 if action_type == "wait":
@@ -654,7 +686,10 @@ class BackgroundService:
                     delay = min(604800.0, max(0.0, delay))
                     pending.current_action_until = datetime.now() + timedelta(seconds=delay)
                     self._notify_pending_changed(chat_id)
-                    await asyncio.sleep(delay)
+                    skipped = await self._sleep_with_optional_skip(chat_id, delay)
+                    if skipped:
+                        pending.current_action_until = None
+                        self._notify_pending_changed(chat_id)
                     continue
 
                 if action_type == "send_message":
@@ -666,7 +701,10 @@ class BackgroundService:
                         if delay > 0:
                             pending.current_action_until = datetime.now() + timedelta(seconds=delay)
                             self._notify_pending_changed(chat_id)
-                            await asyncio.sleep(delay)
+                            skipped = await self._sleep_with_optional_skip(chat_id, delay)
+                            if skipped:
+                                pending.current_action_until = None
+                                self._notify_pending_changed(chat_id)
                     send_kwargs: dict[str, object] = {}
                     if isinstance(reply_to, int):
                         send_kwargs["reply_to"] = reply_to
@@ -716,6 +754,7 @@ class BackgroundService:
             pending.current_action_until = None
             self._notify_pending_changed(chat_id)
         finally:
+            self._skip_current_action.discard(int(chat_id))
             task = self._chat_tasks.get(chat_id)
             if task is asyncio.current_task():
                 self._chat_tasks.pop(chat_id, None)
@@ -724,6 +763,7 @@ class BackgroundService:
         pending = self._pending_messages.get(chat_id)
         if not pending:
             return "Kein Nachrichtenprozess für diesen Chat gefunden."
+        self._skip_current_action.discard(int(chat_id))
 
         task = self._chat_tasks.get(chat_id)
         if task and not task.done():
