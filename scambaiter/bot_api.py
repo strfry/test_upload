@@ -242,7 +242,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             lines.append(f"Gesendete msg_id: {pending.sent_message_id}")
         if pending.last_error:
             lines.append(f"Fehler: {pending.last_error}")
-        lines.append(f"Trigger: {pending.trigger}")
+        lines.append(f"Trigger: {pending.trigger or '-'}")
         return "\n".join(lines)
 
     def _pending_state_short(pending: PendingMessage | None) -> str:
@@ -258,8 +258,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         }
         label = state_labels.get(pending.state, pending.state.value)
         if pending.state == MessageState.WAITING and pending.wait_until is not None:
-            return f"{label} bis {pending.wait_until:%H:%M:%S}"
-        return label
+            return f"{label} bis {pending.wait_until:%H:%M:%S} | Trigger: {pending.trigger or '-'}"
+        return f"{label} | Trigger: {pending.trigger or '-'}"
 
     async def _render_chat_detail(
         chat_id: int,
@@ -603,6 +603,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         if action == "on":
             service.set_chat_auto(chat_id, enabled=True)
+            pending = service.get_pending_message(chat_id)
+            if not pending:
+                known = _find_known_chat(chat_id)
+                await service.schedule_suggestion_generation(
+                    chat_id=chat_id,
+                    title=(known.title if known else str(chat_id)),
+                    trigger="bot-auto-on",
+                    auto_send=False,
+                )
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
                 chat_id,
@@ -657,7 +666,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         if action == "x":
-            result = await service.abort_send(chat_id)
+            result = await service.abort_send(chat_id, trigger="bot-stop-button")
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
                 chat_id, page, heading=result, ensure_suggestion=False, compact=is_card

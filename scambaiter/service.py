@@ -67,6 +67,7 @@ class BackgroundService:
         self._folder_prefetch_task: asyncio.Task | None = None
         self._known_chats_refresh_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
+        self._periodic_run_task: asyncio.Task | None = None
         self._known_chats: dict[int, KnownChatEntry] = {}
         self._chat_auto_enabled: set[int] = set()
         self._pending_listeners: list[PendingListener] = []
@@ -119,6 +120,23 @@ class BackgroundService:
                 print(f"[WARN] Startup-Bootstrap fehlgeschlagen: {exc}")
 
         self._startup_task = asyncio.create_task(_bootstrap())
+        return True
+
+    def start_periodic_run(self) -> bool:
+        if self._periodic_run_task and not self._periodic_run_task.done():
+            return False
+
+        async def _periodic_run_loop() -> None:
+            while True:
+                try:
+                    await self.run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    print(f"[WARN] Periodischer Lauf fehlgeschlagen: {exc}")
+                await asyncio.sleep(self.interval_seconds)
+
+        self._periodic_run_task = asyncio.create_task(_periodic_run_loop())
         return True
 
     async def scan_folder(self, force: bool = False) -> int:
@@ -428,7 +446,7 @@ class BackgroundService:
             if task is asyncio.current_task():
                 self._chat_tasks.pop(chat_id, None)
 
-    async def abort_send(self, chat_id: int) -> str:
+    async def abort_send(self, chat_id: int, trigger: str = "manual-stop") -> str:
         pending = self._pending_messages.get(chat_id)
         if not pending:
             return "Kein Nachrichtenprozess für diesen Chat gefunden."
@@ -442,6 +460,7 @@ class BackgroundService:
             except asyncio.CancelledError:
                 pass
             pending.state = MessageState.CANCELLED
+            pending.trigger = trigger
             self._notify_pending_changed(chat_id)
             if previous_state == MessageState.GENERATING:
                 return "Vorschlagserzeugung wurde abgebrochen."
@@ -452,11 +471,13 @@ class BackgroundService:
         if pending.sent_message_id is not None:
             await self.core.client.delete_messages(chat_id, [pending.sent_message_id])
             pending.state = MessageState.CANCELLED
+            pending.trigger = trigger
             self._notify_pending_changed(chat_id)
             return f"Gesendete Nachricht {pending.sent_message_id} wurde gelöscht."
 
         if pending.state in {MessageState.WAITING, MessageState.GENERATING}:
             pending.state = MessageState.CANCELLED
+            pending.trigger = trigger
             self._notify_pending_changed(chat_id)
             return "Warte-/Generierungsphase beendet. Nachricht wird nicht gesendet."
 
@@ -500,11 +521,20 @@ class BackgroundService:
         if not pending or pending.state != MessageState.WAITING:
             return
 
+        pending.trigger = "bot-auto-on" if enabled else "bot-auto-off"
         pending.wait_until = datetime.now() + timedelta(seconds=self.interval_seconds) if enabled else None
         self._notify_pending_changed(chat_id)
         self._start_waiting_task(chat_id)
 
     async def shutdown(self) -> None:
+        if self._periodic_run_task and not self._periodic_run_task.done():
+            self._periodic_run_task.cancel()
+            try:
+                await self._periodic_run_task
+            except asyncio.CancelledError:
+                pass
+            self._periodic_run_task = None
+
         if self._startup_task and not self._startup_task.done():
             self._startup_task.cancel()
             try:

@@ -69,6 +69,7 @@ async def run() -> None:
 
         service = BackgroundService(core, interval_seconds=config.auto_interval_seconds, store=store)
         service.start_startup_bootstrap()
+        service.start_periodic_run()
         bot_me = await Bot(config.bot_token).get_me()
         control_chat_id = await core.resolve_control_chat_id(bot_me.username)
         bot_app = create_bot_app(
