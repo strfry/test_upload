@@ -345,7 +345,10 @@ class BackgroundService:
         results: list[SuggestionResult] = []
         for context in contexts:
             language_hint = None
-            prompt_context: dict[str, object] = {"messenger": "telegram"}
+            prompt_context: dict[str, object] = {
+                "messenger": "telegram",
+                "now_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            }
             existing_pending = self._pending_messages.get(context.chat_id)
             if self.store:
                 previous = self.store.latest_for_chat(context.chat_id)

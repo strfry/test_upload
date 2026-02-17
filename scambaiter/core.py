@@ -7,7 +7,7 @@ import json
 import re
 import traceback
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Literal
 
 
@@ -33,6 +33,8 @@ AUSGABEVERTRAG:
 - Gib ausschließlich ein einzelnes gültiges JSON-Objekt aus.
 - Kein Markdown. Kein Fließtext außerhalb des JSON.
 - Keine zusätzlichen Kommentare oder Erklärungen.
+- Keine Tool-Calls, keine Funktionsaufrufe, kein Code-Ausführen.
+- Verboten sind Strukturen wie {"name":"...","arguments":{...}}.
 - Erlaubte Top-Level-Keys:
   - schema
   - analysis
@@ -86,6 +88,7 @@ REFERENZREGELN:
 
 ZEITINFORMATION:
 - Nachrichten können ein Feld "ts_utc" (ISO-8601) enthalten.
+- Der Kontext kann ein Feld "now_utc" (ISO-8601, UTC) enthalten.
 - Nutze Zeitabstände optional zur Einschätzung von Dringlichkeit oder natürlichem Antwortverhalten.
 - Führe keine komplexe Datumsberechnung durch.
 - Für geplantes Senden kann send_message ein Feld "send_at_utc" (ISO-8601, UTC) enthalten.
@@ -95,6 +98,9 @@ QUEUE-KONTEXT:
 - Wenn die alte Planung weiterhin passt, gib die geplanten Actions konsistent erneut aus (Bestätigung).
 - Wenn sie nicht mehr passt (z.B. neue eingehende Nachricht), verwerfe/ersetze sie durch eine aktualisierte Actions-Liste.
 - Antworte immer mit der vollständigen, aktuell gültigen Actions-Liste.
+- Wenn die letzte echte Chat-Nachricht bereits vom Assistenten stammt und seitdem keine neue User-Nachricht kam:
+  - Erzeuge KEINE neue inhaltlich ähnliche Folge-Nachricht.
+  - Nutze stattdessen `noop` (oder bestätige nur weiterhin gültige geplante Actions ohne neue Duplikat-Nachricht).
 
 SPRACHE:
 - Verwende ausschließlich die Sprache aus dem Eingabefeld "language".
@@ -567,10 +573,14 @@ class ScambaiterCore:
             )
 
         for item in context.messages:
-            timestamp = self._fmt_dt(item.timestamp)
-            speaker = "Ich" if item.role == "assistant" else item.sender
-            content = f"[{timestamp}] {speaker}: {item.text}"
-            messages.append({"role": item.role, "content": content})
+            ts_utc = item.timestamp.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            event_payload = {
+                "ts_utc": ts_utc,
+                "role": item.role,
+                "sender": ("self" if item.role == "assistant" else item.sender),
+                "text": item.text,
+            }
+            messages.append({"role": item.role, "content": json.dumps(event_payload, ensure_ascii=False)})
 
         return messages
 
@@ -824,6 +834,7 @@ class ScambaiterCore:
                             "Gib jetzt ausschließlich ein valides JSON-Objekt zurück "
                             "mit schema=\"scambait.llm.v1\", analysis als OBJEKT, "
                             "message.text als nicht-leerem String und actions als nicht-leerem Array. "
+                            "Keine Tool-Calls oder Funktionsaufrufe. "
                             "Keine Zusatztexte."
                         ),
                     }
@@ -845,6 +856,14 @@ class ScambaiterCore:
                     f"in Versuch {attempt}: {error_detail}"
                 )
                 failed_generation = extract_failed_generation_from_exception(exc)
+                if on_warning:
+                    tool_name = extract_tool_call_name_from_failed_generation(failed_generation)
+                    if tool_name:
+                        on_warning(
+                            "Modell versuchte unzulässigen Tool-Call "
+                            f"({tool_name}). failed_generation="
+                            f"{truncate_for_log(failed_generation or '', max_len=600)}"
+                        )
                 if failed_generation:
                     repaired = self._attempt_repair_output(
                         source_text=failed_generation,
@@ -960,6 +979,8 @@ class ScambaiterCore:
                     "(falls nötig: noop). "
                     "Jede Action muss ein Objekt mit Pflichtfeld \"type\" sein. "
                     "Keine Kurzformen wie {\"send_message\":{}}.\n\n"
+                    "Keine Tool-Calls oder Funktionsaufrufe. "
+                    "Verboten sind Strukturen wie {\"name\":\"...\",\"arguments\":{...}}.\n\n"
                     "Falls eine Wartezeit geplant ist, nutze die Action \"wait\" mit "
                     "\"value\" und \"unit\" (seconds|minutes).\n\n"
                     f"Fehlerhafte Ausgabe:\n{candidate}"
@@ -1157,6 +1178,22 @@ def extract_failed_generation_from_exception(exc: Exception) -> str | None:
     failed_generation = _find_key_deep(payload, "failed_generation")
     if isinstance(failed_generation, str):
         cleaned = failed_generation.strip()
+        return cleaned or None
+    return None
+
+
+def extract_tool_call_name_from_failed_generation(failed_generation: str | None) -> str | None:
+    if not failed_generation:
+        return None
+    try:
+        payload = json.loads(failed_generation)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("name")
+    if isinstance(name, str):
+        cleaned = name.strip()
         return cleaned or None
     return None
 

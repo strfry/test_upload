@@ -8,6 +8,7 @@ Bot mode: Telegram Bot API control for run/start/stop/insights.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from telegram import Bot
 
@@ -29,7 +30,10 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
     print(f"Gefundene Chats im Ordner: {len(contexts)}\n")
     for index, context in enumerate(contexts, start=1):
         language_hint = None
-        prompt_context: dict[str, object] = {"messenger": "telegram"}
+        prompt_context: dict[str, object] = {
+            "messenger": "telegram",
+            "now_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        }
         previous = store.latest_for_chat(context.chat_id)
         previous_analysis = previous.analysis if previous else None
         if previous_analysis:
