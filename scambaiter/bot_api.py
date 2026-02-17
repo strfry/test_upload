@@ -602,6 +602,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             else:
                 infobox_targets.pop(target_chat_id, None)
 
+    def _is_infobox_message(chat_id: int, message_id: int) -> bool:
+        for targets in infobox_targets.values():
+            for target_chat_id, target_message_id, _page, _render_mode in targets:
+                if target_chat_id == chat_id and target_message_id == message_id:
+                    return True
+        return False
+
     async def _register_infobox_target(message, chat_id: int, page: int, render_mode: str) -> None:
         if not message:
             return
@@ -764,6 +771,19 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             text = _chats_menu_text(known_chats, page=page)
             keyboard = _chats_menu_keyboard(known_chats, page=page)
             message = getattr(query, "message", None)
+            if message and _is_infobox_message(int(message.chat_id), int(message.message_id)):
+                _remove_message_target(int(message.chat_id), int(message.message_id))
+                try:
+                    await context.bot.delete_message(chat_id=int(message.chat_id), message_id=int(message.message_id))
+                except BadRequest:
+                    pass
+                await _post_control_card(
+                    kind="menu:chats",
+                    text=text,
+                    reply_markup=keyboard,
+                    bring_to_front=True,
+                )
+                return
             if message:
                 _remove_message_target(int(message.chat_id), int(message.message_id))
             if message and getattr(message, "photo", None):
