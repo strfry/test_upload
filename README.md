@@ -70,10 +70,10 @@ Verfügbare Bot-Kommandos:
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
 - `/scan` – scannt den konfigurierten Ordner, registriert auch beantwortete Chats und erzeugt fehlende Vorschläge für unbeantwortete Chats
-- `/chats` – zeigt klickbare Buttons pro Chat: `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `KV`
+- `/chats` – zeigt ein paginiertes Chat-Menü; pro Chat öffnet sich ein Detailmenü mit den neuesten Infos und Aktionen `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `KV`
+  - Das Menü bleibt stabil: Aktionen aktualisieren die Detailansicht und behalten Navigation (`Zurueck`, `Aktualisieren`) bei
   - **Generate** erzeugt immer einen neuen Antwort-Vorschlag und setzt den Nachrichtenprozess auf **Wartephase**
-  - Die Chat-Übersicht zeigt den aktuellen Vorschlag direkt pro Chat an
-  - Fehlt ein Vorschlag, wird der Chat sofort angezeigt und der Status `Vorschlag wird erzeugt` eingeblendet
+  - Fehlt ein Vorschlag, wird beim Öffnen der Detailansicht automatisch eine Generierung gestartet
   - **Send** löst das Senden aus (manueller Trigger)
   - **Stop** bricht den laufenden Prozess ab; falls die Nachricht bereits versendet wurde, wird sie gelöscht
   - **Auto an** aktiviert das automatische Senden nach Wartezeit nur für diesen Chat
