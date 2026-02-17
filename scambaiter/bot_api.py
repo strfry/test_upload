@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 from scambaiter.service import BackgroundService, MessageState, PendingMessage
 
@@ -17,9 +26,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     card_caption_len = 1024
     chats_page_size = 8
     queue_page_size = 8
+    directive_input_state = 1
+    analysis_input_state = 2
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
-    pending_directive_input: dict[int, tuple[int, int]] = {}
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -217,6 +227,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     InlineKeyboardButton("Dir -", callback_data=f"ma:dl:{chat_id}:{page}"),
                 ],
                 [
+                    InlineKeyboardButton("An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
+                ],
+                [
                     InlineKeyboardButton("Zurueck", callback_data=f"ml:{page}"),
                     InlineKeyboardButton("Aktualisieren", callback_data=f"mc:{chat_id}:{page}"),
                 ],
@@ -357,6 +370,57 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         for item in directives:
             label = f"Loeschen #{item.id}"
             rows.append([InlineKeyboardButton(label, callback_data=f"md:del:{chat_id}:{page}:{item.id}")])
+        rows.append([InlineKeyboardButton("Zurueck", callback_data=f"mc:{chat_id}:{page}")])
+        return InlineKeyboardMarkup(rows)
+
+    def _encode_key_token(key: str) -> str:
+        raw = key.encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    def _decode_key_token(token: str) -> str | None:
+        clean = token.strip()
+        if not clean:
+            return None
+        padding = "=" * ((4 - len(clean) % 4) % 4)
+        try:
+            return base64.urlsafe_b64decode((clean + padding).encode("ascii")).decode("utf-8")
+        except Exception:
+            return None
+
+    def _analysis_delete_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
+        latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+        analysis_data = latest_entry.analysis if latest_entry else None
+        rows: list[list[InlineKeyboardButton]] = []
+        if isinstance(analysis_data, dict):
+            for key in list(analysis_data.keys())[:12]:
+                key_name = str(key)
+                token = _encode_key_token(key_name)
+                label = f"Loeschen {key_name}"
+                rows.append([InlineKeyboardButton(_truncate_value(label, max_len=34), callback_data=f"me:del:{chat_id}:{page}:{token}")])
+        rows.append([InlineKeyboardButton("Zurueck", callback_data=f"mc:{chat_id}:{page}")])
+        return InlineKeyboardMarkup(rows)
+
+    def _analysis_editor_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
+        latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+        analysis_data = latest_entry.analysis if latest_entry else None
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton("Neu", callback_data=f"ma:ak:{chat_id}:{page}"),
+                InlineKeyboardButton("Loeschen", callback_data=f"ma:ad:{chat_id}:{page}"),
+            ]
+        ]
+        if isinstance(analysis_data, dict):
+            for key in list(analysis_data.keys())[:10]:
+                key_name = str(key)
+                token = _encode_key_token(key_name)
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            _truncate_value(f"Edit {key_name}", max_len=34),
+                            callback_data=f"me:edit:{chat_id}:{page}:{token}",
+                        )
+                    ]
+                )
         rows.append([InlineKeyboardButton("Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
 
@@ -788,6 +852,40 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
+        if data.startswith("me:"):
+            try:
+                _prefix, op, chat_id_raw, page_raw, key_token = data.split(":")
+                chat_id = int(chat_id_raw)
+                page = int(page_raw)
+            except (ValueError, IndexError):
+                await _safe_edit_message(query, "Ungueltige Aktion.")
+                return
+            if op != "del":
+                await _safe_edit_message(query, "Ungueltige Aktion.")
+                return
+            key_name = _decode_key_token(key_token)
+            if not key_name:
+                await _safe_edit_message(query, "Ungueltiger Key.")
+                return
+            latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+            current = dict(latest_entry.analysis or {}) if latest_entry and isinstance(latest_entry.analysis, dict) else None
+            if current is None:
+                await _safe_edit_message(query, "Keine Analysis zum Bearbeiten vorhanden.")
+                return
+            removed = key_name in current
+            if removed:
+                current.pop(key_name, None)
+                service.store.update_latest_analysis(chat_id, current)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            heading = (
+                f"Analysis-Key gelöscht: {key_name}"
+                if removed
+                else f"Analysis-Key nicht gefunden: {key_name}"
+            )
+            text, keyboard = await _render_chat_detail(chat_id, page, heading=heading, compact=is_card)
+            await _safe_edit_message(query, text, reply_markup=keyboard)
+            return
+
         try:
             if not data.startswith("ma:"):
                 await _safe_edit_message(query, "Ungueltige Aktion.")
@@ -967,18 +1065,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
-        if action in {"da", "d+"}:
-            pending_directive_input[allowed_chat_id] = (chat_id, page)
-            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
-            text, keyboard = await _render_chat_detail(
-                chat_id,
-                page,
-                heading="Direktive hinzufügen: Bitte jetzt eine normale Textnachricht senden (kein Slash-Befehl).",
-                compact=is_card,
-            )
-            await _safe_edit_message(query, text, reply_markup=keyboard)
-            return
-
         if action in {"dl", "d-"}:
             directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=10)
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
@@ -997,6 +1083,47 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             delete_keyboard = _directive_delete_keyboard(chat_id, page)
             text = _limit_message("\n".join(lines))
             await _safe_edit_message(query, text, reply_markup=delete_keyboard)
+            return
+
+        if action in {"ad", "a-"}:
+            latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+            analysis_data = latest_entry.analysis if latest_entry else None
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            if not isinstance(analysis_data, dict) or not analysis_data:
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading="Keine Analysis-Keys zum Loeschen vorhanden.",
+                    compact=is_card,
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+            lines = [f"Chat {chat_id}", "", "Analysis-Key löschen:"]
+            for key in list(analysis_data.keys())[:12]:
+                lines.append(f"- {key}")
+            text = _limit_message("\n".join(lines))
+            await _safe_edit_message(query, text, reply_markup=_analysis_delete_keyboard(chat_id, page))
+            return
+
+        if action in {"ae"}:
+            latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+            analysis_data = latest_entry.analysis if latest_entry else None
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            lines = [f"Chat {chat_id}", "", "Analysis Editor"]
+            if isinstance(analysis_data, dict) and analysis_data:
+                for key in list(analysis_data.keys())[:10]:
+                    value = _truncate_value(str(analysis_data.get(key)), max_len=40)
+                    lines.append(f"- {key} = {value}")
+            else:
+                lines.append("Noch keine Analysis-Keys vorhanden.")
+            lines.append("")
+            lines.append("Neu: `Neu` drücken und `key=value` senden.")
+            lines.append("Edit: `Edit <key>` drücken und neuen Wert senden.")
+            lines.append("Loeschen: `Loeschen` drücken.")
+            text = _limit_message("\n".join(lines))
+            if is_card:
+                text = _limit_caption(text)
+            await _safe_edit_message(query, text, reply_markup=_analysis_editor_keyboard(chat_id, page))
             return
 
         if action == "p":
@@ -1126,31 +1253,215 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         preview = service.core.build_prompt_debug_summary(chat_context, max_lines=8)
         await _guarded_reply_chunks(update, "Prompt-Preview:\n" + preview)
 
-    async def directive_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def directive_input_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        if not query:
+            return ConversationHandler.END
+        await query.answer()
+        if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
+            await _safe_edit_message(query, "Nicht autorisiert.")
+            return ConversationHandler.END
+        data = query.data or ""
+        try:
+            _prefix, action, chat_id_raw, page_raw = data.split(":")
+            chat_id = int(chat_id_raw)
+            page = int(page_raw)
+        except (ValueError, IndexError):
+            await _safe_edit_message(query, "Ungueltige Aktion.")
+            return ConversationHandler.END
+        if action not in {"da", "d+"}:
+            return ConversationHandler.END
+        context.user_data["directive_target"] = {"chat_id": chat_id, "page": page}
+        is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+        text, keyboard = await _render_chat_detail(
+            chat_id,
+            page,
+            heading="Direktive hinzufügen: Bitte jetzt eine normale Textnachricht senden (oder /cancel).",
+            compact=is_card,
+        )
+        await _safe_edit_message(query, text, reply_markup=keyboard)
+        return directive_input_state
+
+    async def directive_input_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not _authorized(update):
-            return
+            return ConversationHandler.END
+        context.user_data.pop("directive_target", None)
+        await _guarded_reply(update, "Direktiven-Eingabe abgebrochen.")
+        return ConversationHandler.END
+
+    async def directive_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        if not _authorized(update):
+            return ConversationHandler.END
         message = update.message
         if not message or not message.text:
-            return
-        pending = pending_directive_input.get(allowed_chat_id)
-        if not pending:
-            return
+            return directive_input_state
+        target = context.user_data.get("directive_target")
+        if not isinstance(target, dict):
+            return ConversationHandler.END
+        raw_chat_id = target.get("chat_id")
+        raw_page = target.get("page")
+        if not isinstance(raw_chat_id, int) or not isinstance(raw_page, int):
+            context.user_data.pop("directive_target", None)
+            return ConversationHandler.END
         text = message.text.strip()
         if not text or text.startswith("/"):
             await _guarded_reply(update, "Bitte Direktive als normalen Text senden (ohne Slash-Befehl).")
-            return
-        chat_id, page = pending
+            return directive_input_state
+        chat_id = raw_chat_id
+        page = raw_page
         created = service.add_chat_directive(chat_id=chat_id, text=text, scope="session")
-        pending_directive_input.pop(allowed_chat_id, None)
+        context.user_data.pop("directive_target", None)
         if not created:
             await _guarded_reply(update, "Direktive konnte nicht gespeichert werden.")
-            return
+            return ConversationHandler.END
         await _guarded_reply(
             update,
             f"Direktive gespeichert: #{created.id} ({created.scope}) {created.text}",
         )
         if chat_id in infobox_targets:
             app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt."), update=None)
+        return ConversationHandler.END
+
+    async def analysis_input_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        if not query:
+            return ConversationHandler.END
+        await query.answer()
+        if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
+            await _safe_edit_message(query, "Nicht autorisiert.")
+            return ConversationHandler.END
+        data = query.data or ""
+        try:
+            _prefix, action, chat_id_raw, page_raw = data.split(":")
+            chat_id = int(chat_id_raw)
+            page = int(page_raw)
+        except (ValueError, IndexError):
+            await _safe_edit_message(query, "Ungueltige Aktion.")
+            return ConversationHandler.END
+        if action not in {"ak", "a+"}:
+            return ConversationHandler.END
+        context.user_data["analysis_target"] = {"chat_id": chat_id, "page": page}
+        is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+        text, keyboard = await _render_chat_detail(
+            chat_id,
+            page,
+            heading="Analysis bearbeiten: sende jetzt `key=value` (oder /cancel).",
+            compact=is_card,
+        )
+        await _safe_edit_message(query, text, reply_markup=keyboard)
+        return analysis_input_state
+
+    async def analysis_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        if not query:
+            return ConversationHandler.END
+        await query.answer()
+        if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
+            await _safe_edit_message(query, "Nicht autorisiert.")
+            return ConversationHandler.END
+        data = query.data or ""
+        try:
+            _prefix, op, chat_id_raw, page_raw, key_token = data.split(":")
+            chat_id = int(chat_id_raw)
+            page = int(page_raw)
+        except (ValueError, IndexError):
+            await _safe_edit_message(query, "Ungueltige Aktion.")
+            return ConversationHandler.END
+        if op != "edit":
+            return ConversationHandler.END
+        key_name = _decode_key_token(key_token)
+        if not key_name:
+            await _safe_edit_message(query, "Ungueltiger Key.")
+            return ConversationHandler.END
+        latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+        analysis_data = latest_entry.analysis if latest_entry else None
+        if not isinstance(analysis_data, dict) or key_name not in analysis_data:
+            await _safe_edit_message(query, f"Key nicht gefunden: {key_name}")
+            return ConversationHandler.END
+        context.user_data["analysis_target"] = {
+            "chat_id": chat_id,
+            "page": page,
+            "mode": "edit",
+            "key": key_name,
+        }
+        is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+        current_value = _truncate_value(str(analysis_data.get(key_name)), max_len=120)
+        text, keyboard = await _render_chat_detail(
+            chat_id,
+            page,
+            heading=f"Analysis editieren: {key_name} (alt={current_value})\nSende jetzt den neuen Wert (oder /cancel).",
+            compact=is_card,
+        )
+        await _safe_edit_message(query, text, reply_markup=keyboard)
+        return analysis_input_state
+
+    async def analysis_input_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        if not _authorized(update):
+            return ConversationHandler.END
+        context.user_data.pop("analysis_target", None)
+        await _guarded_reply(update, "Analysis-Eingabe abgebrochen.")
+        return ConversationHandler.END
+
+    async def analysis_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        if not _authorized(update):
+            return ConversationHandler.END
+        message = update.message
+        if not message or not message.text:
+            return analysis_input_state
+        target = context.user_data.get("analysis_target")
+        if not isinstance(target, dict):
+            return ConversationHandler.END
+        raw_chat_id = target.get("chat_id")
+        edit_mode = str(target.get("mode", "new")).strip().lower()
+        edit_key = target.get("key")
+        if not isinstance(raw_chat_id, int):
+            context.user_data.pop("analysis_target", None)
+            return ConversationHandler.END
+        text = message.text.strip()
+        if edit_mode == "edit":
+            if not isinstance(edit_key, str) or not edit_key.strip():
+                await _guarded_reply(update, "Ungueltiger Edit-Key.")
+                return analysis_input_state
+            key = edit_key.strip()
+            raw_value = text
+        else:
+            sep = "=" if "=" in text else ":" if ":" in text else None
+            if not sep:
+                await _guarded_reply(update, "Format: key=value")
+                return analysis_input_state
+            key, raw_value = text.split(sep, 1)
+            key = key.strip()
+            raw_value = raw_value.strip()
+            if not key:
+                await _guarded_reply(update, "Key darf nicht leer sein.")
+                return analysis_input_state
+
+        value: object
+        try:
+            value = json.loads(raw_value)
+        except Exception:
+            value = raw_value
+
+        if not service.store:
+            await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            context.user_data.pop("analysis_target", None)
+            return ConversationHandler.END
+        latest_entry = service.store.latest_for_chat(raw_chat_id)
+        if not latest_entry:
+            await _guarded_reply(update, "Keine Analyse fuer diesen Chat gefunden.")
+            context.user_data.pop("analysis_target", None)
+            return ConversationHandler.END
+        current = dict(latest_entry.analysis or {})
+        current[key] = value
+        updated = service.store.update_latest_analysis(raw_chat_id, current)
+        context.user_data.pop("analysis_target", None)
+        if not updated:
+            await _guarded_reply(update, "Analysis konnte nicht aktualisiert werden.")
+            return ConversationHandler.END
+        await _guarded_reply(update, f"Analysis aktualisiert: {key}={value}")
+        if raw_chat_id in infobox_targets:
+            app.create_task(_push_infobox_update(raw_chat_id, heading=f"Analysis-Key gesetzt: {key}"), update=None)
+        return ConversationHandler.END
 
     async def send_start_menu() -> None:
         _kick_background_sync()
@@ -1173,6 +1484,32 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app.add_handler(CommandHandler("analysisget", analysis_get))
     app.add_handler(CommandHandler("analysisset", analysis_set))
     app.add_handler(CommandHandler("promptpreview", prompt_preview))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, directive_input))
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(directive_input_start, pattern=r"^ma:(da|d\+):")],
+            states={
+                directive_input_state: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, directive_input),
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", directive_input_cancel)],
+            allow_reentry=True,
+        )
+    )
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(analysis_input_start, pattern=r"^ma:(ak|a\+):"),
+                CallbackQueryHandler(analysis_edit_start, pattern=r"^me:edit:"),
+            ],
+            states={
+                analysis_input_state: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, analysis_input),
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", analysis_input_cancel)],
+            allow_reentry=True,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|generate|send|stop|autoon|autooff|img|kv):"))
     return app
