@@ -43,6 +43,14 @@ async def run_batch(core: ScambaiterCore, store: AnalysisStore) -> None:
                 if isinstance(value, str) and value.strip():
                     language_hint = value.strip()
                     break
+        directives = store.list_directives(chat_id=context.chat_id, active_only=True, limit=25)
+        if directives:
+            prompt_context["operator"] = {
+                "directives": [
+                    {"id": str(item.id), "text": item.text, "scope": item.scope}
+                    for item in directives
+                ]
+            }
         output = core.generate_output(
             context,
             language_hint=language_hint,

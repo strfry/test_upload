@@ -11,7 +11,7 @@ PendingListener = Callable[[int, "PendingMessage | None"], None]
 WarningListener = Callable[[str], None]
 
 from scambaiter.core import ChatContext, ScambaiterCore, SuggestionResult
-from scambaiter.storage import AnalysisStore
+from scambaiter.storage import AnalysisStore, StoredDirective
 
 
 @dataclass
@@ -93,6 +93,21 @@ class BackgroundService:
 
     def add_warning_listener(self, listener: WarningListener) -> None:
         self._warning_listeners.append(listener)
+
+    def list_chat_directives(self, chat_id: int, active_only: bool = True, limit: int = 50) -> list[StoredDirective]:
+        if not self.store:
+            return []
+        return self.store.list_directives(chat_id=chat_id, active_only=active_only, limit=limit)
+
+    def add_chat_directive(self, chat_id: int, text: str, scope: str = "session") -> StoredDirective | None:
+        if not self.store:
+            return None
+        return self.store.add_directive(chat_id=chat_id, text=text, scope=scope)
+
+    def delete_chat_directive(self, chat_id: int, directive_id: int) -> bool:
+        if not self.store:
+            return False
+        return self.store.delete_directive(chat_id=chat_id, directive_id=directive_id)
 
     def _notify_pending_changed(self, chat_id: int) -> None:
         pending = self._pending_messages.get(chat_id)
@@ -356,6 +371,18 @@ class BackgroundService:
                 language_hint = self._extract_language_hint(previous_analysis)
                 if previous_analysis:
                     prompt_context["previous_analysis"] = previous_analysis
+                directives = self.store.list_directives(chat_id=context.chat_id, active_only=True, limit=25)
+                if directives:
+                    prompt_context["operator"] = {
+                        "directives": [
+                            {
+                                "id": str(item.id),
+                                "text": item.text,
+                                "scope": item.scope,
+                            }
+                            for item in directives
+                        ]
+                    }
             if existing_pending and existing_pending.action_queue:
                 prompt_context["planned_queue"] = existing_pending.action_queue
                 prompt_context["planned_queue_trigger"] = existing_pending.trigger

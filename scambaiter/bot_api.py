@@ -5,7 +5,7 @@ import math
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from scambaiter.service import BackgroundService, MessageState, PendingMessage
 
@@ -19,6 +19,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     queue_page_size = 8
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
+    pending_directive_input: dict[int, tuple[int, int]] = {}
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -131,6 +132,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 break
         return parts
 
+    def _directive_preview_parts(chat_id: int, limit: int = 2) -> list[str]:
+        directives = service.list_chat_directives(chat_id, active_only=True, limit=limit)
+        return [f"#{item.id}: {_truncate_value(item.text, max_len=60)}" for item in directives]
+
     def _has_send_message(actions: list[dict[str, object]] | None) -> bool:
         return any(str(action.get("type", "")).strip().lower() == "send_message" for action in (actions or []))
 
@@ -177,6 +182,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         parts = _analysis_summary_parts(analysis_data)
         if parts:
             lines.append("Analysis: " + ", ".join(parts))
+        directive_parts = _directive_preview_parts(chat_id, limit=2)
+        if directive_parts:
+            lines.append("Direktiven: " + " | ".join(directive_parts))
         return "\n".join(lines)
 
     def _parse_chat_id_arg(args: list[str]) -> int | None:
@@ -203,6 +211,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     InlineKeyboardButton("Bilder", callback_data=f"ma:i:{chat_id}:{page}"),
                     InlineKeyboardButton("Analysis", callback_data=f"ma:k:{chat_id}:{page}"),
                     InlineKeyboardButton("Prompt", callback_data=f"ma:p:{chat_id}:{page}"),
+                ],
+                [
+                    InlineKeyboardButton("Dir +", callback_data=f"ma:da:{chat_id}:{page}"),
+                    InlineKeyboardButton("Dir -", callback_data=f"ma:dl:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("Zurueck", callback_data=f"ml:{page}"),
@@ -339,6 +351,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         )
         return InlineKeyboardMarkup(rows)
 
+    def _directive_delete_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
+        directives = service.list_chat_directives(chat_id, active_only=True, limit=10)
+        rows: list[list[InlineKeyboardButton]] = []
+        for item in directives:
+            label = f"Loeschen #{item.id}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"md:del:{chat_id}:{page}:{item.id}")])
+        rows.append([InlineKeyboardButton("Zurueck", callback_data=f"mc:{chat_id}:{page}")])
+        return InlineKeyboardMarkup(rows)
+
     def _format_pending_state(pending: PendingMessage | None) -> str:
         if not pending:
             return "Status: Kein Prozesszustand vorhanden."
@@ -451,6 +472,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             info_parts = _analysis_summary_parts(analysis_data, limit=4)
             if info_parts:
                 lines.append("Analysis: " + ", ".join(info_parts))
+            directive_parts = _directive_preview_parts(chat_id, limit=2)
+            if directive_parts:
+                lines.append("Direktiven: " + " | ".join(directive_parts))
             if display_actions:
                 lines.append("Queue:")
                 source_text = pending.suggestion if pending else suggestion
@@ -741,6 +765,29 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _register_infobox_target(card_message, chat_id, page, render_mode="card")
             return
 
+        if data.startswith("md:"):
+            try:
+                _prefix, op, chat_id_raw, page_raw, directive_id_raw = data.split(":")
+                chat_id = int(chat_id_raw)
+                page = int(page_raw)
+                directive_id = int(directive_id_raw)
+            except (ValueError, IndexError):
+                await _safe_edit_message(query, "Ungueltige Aktion.")
+                return
+            if op != "del":
+                await _safe_edit_message(query, "Ungueltige Aktion.")
+                return
+            deleted = service.delete_chat_directive(chat_id=chat_id, directive_id=directive_id)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            heading = (
+                f"Direktive #{directive_id} geloescht."
+                if deleted
+                else f"Direktive #{directive_id} nicht gefunden."
+            )
+            text, keyboard = await _render_chat_detail(chat_id, page, heading=heading, compact=is_card)
+            await _safe_edit_message(query, text, reply_markup=keyboard)
+            return
+
         try:
             if not data.startswith("ma:"):
                 await _safe_edit_message(query, "Ungueltige Aktion.")
@@ -920,6 +967,38 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
+        if action in {"da", "d+"}:
+            pending_directive_input[allowed_chat_id] = (chat_id, page)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            text, keyboard = await _render_chat_detail(
+                chat_id,
+                page,
+                heading="Direktive hinzufügen: Bitte jetzt eine normale Textnachricht senden (kein Slash-Befehl).",
+                compact=is_card,
+            )
+            await _safe_edit_message(query, text, reply_markup=keyboard)
+            return
+
+        if action in {"dl", "d-"}:
+            directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=10)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            if not directives:
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading="Keine aktiven Direktiven vorhanden.",
+                    compact=is_card,
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+            lines = [f"Chat {chat_id}", "", "Direktiven löschen:"]
+            for item in directives:
+                lines.append(f"#{item.id} ({item.scope}) {item.text}")
+            delete_keyboard = _directive_delete_keyboard(chat_id, page)
+            text = _limit_message("\n".join(lines))
+            await _safe_edit_message(query, text, reply_markup=delete_keyboard)
+            return
+
         if action == "p":
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             chat_context = await service.core.build_chat_context(chat_id)
@@ -946,7 +1025,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
-        await _safe_edit_message(query, "Unbekannte Aktion.")
+        self_warning = f"Unbekannte Callback-Aktion: data={data}"
+        service.add_general_warning(self_warning)
+        await _safe_edit_message(query, f"Unbekannte Aktion: {data}")
 
     async def last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -1045,6 +1126,32 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         preview = service.core.build_prompt_debug_summary(chat_context, max_lines=8)
         await _guarded_reply_chunks(update, "Prompt-Preview:\n" + preview)
 
+    async def directive_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        message = update.message
+        if not message or not message.text:
+            return
+        pending = pending_directive_input.get(allowed_chat_id)
+        if not pending:
+            return
+        text = message.text.strip()
+        if not text or text.startswith("/"):
+            await _guarded_reply(update, "Bitte Direktive als normalen Text senden (ohne Slash-Befehl).")
+            return
+        chat_id, page = pending
+        created = service.add_chat_directive(chat_id=chat_id, text=text, scope="session")
+        pending_directive_input.pop(allowed_chat_id, None)
+        if not created:
+            await _guarded_reply(update, "Direktive konnte nicht gespeichert werden.")
+            return
+        await _guarded_reply(
+            update,
+            f"Direktive gespeichert: #{created.id} ({created.scope}) {created.text}",
+        )
+        if chat_id in infobox_targets:
+            app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt."), update=None)
+
     async def send_start_menu() -> None:
         _kick_background_sync()
         known_chats = _get_known_chats_cached(limit=80)
@@ -1066,5 +1173,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app.add_handler(CommandHandler("analysisget", analysis_get))
     app.add_handler(CommandHandler("analysisset", analysis_set))
     app.add_handler(CommandHandler("promptpreview", prompt_preview))
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, directive_input))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|generate|send|stop|autoon|autooff|img|kv):"))
     return app

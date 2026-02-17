@@ -31,6 +31,17 @@ class StoredKnownChat:
     updated_at: datetime
 
 
+@dataclass
+class StoredDirective:
+    id: int
+    chat_id: int
+    text: str
+    scope: str
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class AnalysisStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -65,6 +76,22 @@ class AnalysisStore:
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS directives (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'session',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_directives_chat_active ON directives (chat_id, active, id DESC)"
             )
 
     @staticmethod
@@ -184,6 +211,80 @@ class AnalysisStore:
             )
             for row in rows
         ]
+
+    def add_directive(self, chat_id: int, text: str, scope: str = "session") -> StoredDirective | None:
+        clean_text = text.strip()
+        clean_scope = scope.strip().lower() or "session"
+        if not clean_text:
+            return None
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO directives (chat_id, text, scope, active, created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (int(chat_id), clean_text, clean_scope, now, now),
+            )
+            row_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            row = conn.execute(
+                """
+                SELECT id, chat_id, text, scope, active, created_at, updated_at
+                FROM directives
+                WHERE id = ?
+                """,
+                (row_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return StoredDirective(
+            id=int(row[0]),
+            chat_id=int(row[1]),
+            text=str(row[2]),
+            scope=str(row[3]),
+            active=bool(int(row[4])),
+            created_at=datetime.fromisoformat(row[5]),
+            updated_at=datetime.fromisoformat(row[6]),
+        )
+
+    def list_directives(self, chat_id: int, active_only: bool = True, limit: int = 50) -> list[StoredDirective]:
+        query = (
+            """
+            SELECT id, chat_id, text, scope, active, created_at, updated_at
+            FROM directives
+            WHERE chat_id = ?
+            """
+        )
+        params: list[object] = [int(chat_id)]
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [
+            StoredDirective(
+                id=int(row[0]),
+                chat_id=int(row[1]),
+                text=str(row[2]),
+                scope=str(row[3]),
+                active=bool(int(row[4])),
+                created_at=datetime.fromisoformat(row[5]),
+                updated_at=datetime.fromisoformat(row[6]),
+            )
+            for row in rows
+        ]
+
+    def delete_directive(self, chat_id: int, directive_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM directives WHERE id = ? AND chat_id = ? LIMIT 1",
+                (int(directive_id), int(chat_id)),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM directives WHERE id = ?", (int(directive_id),))
+            return True
 
     @staticmethod
     def _decode_analysis(value: str | None) -> dict[str, object] | None:

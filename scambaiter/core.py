@@ -102,6 +102,14 @@ QUEUE-KONTEXT:
   - Erzeuge KEINE neue inhaltlich ähnliche Folge-Nachricht.
   - Nutze stattdessen `noop` (oder bestätige nur weiterhin gültige geplante Actions ohne neue Duplikat-Nachricht).
 
+OPERATOR-DIREKTIVEN:
+- Der Input kann ein Feld `operator.directives` enthalten.
+- Jede Direktive ist bindend, solange sie aktiv ist.
+- Befolge aktive Direktiven priorisiert, sofern keine Sicherheitsregel verletzt wird.
+- Trage in `analysis` ein:
+  - `operator_applied`: Liste der angewendeten Direktiven-IDs.
+  - `operator_ignored`: Liste von Objekten mit `id` und `reason` für ignorierte Direktiven.
+
 SPRACHE:
 - Verwende ausschließlich die Sprache aus dem Eingabefeld "language".
 - Die JSON-Struktur und Feldnamen bleiben unverändert.
