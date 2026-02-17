@@ -52,6 +52,8 @@ STRUKTURREGELN:
 - Keine zusätzlichen Keys erzeugen.
 - Keine nicht spezifizierten Felder erfinden.
 - Wenn Lesen sinnvoll ist, setze mark_read explizit vor Sende-Aktionen.
+- Jede Action im actions-Array ist ein Objekt mit Pflichtfeld "type".
+- Verboten: Kurzformen wie {"send_message":{}} oder {"simulate_typing":{...}}.
 
 ERLAUBTE ACTION-TYPEN:
 - mark_read
@@ -171,6 +173,15 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
         normalized_action = normalize_action_shape(action)
         if not isinstance(normalized_action, dict):
             return None
+        if (
+            isinstance(action, dict)
+            and "type" not in action
+            and normalized_action.get("type") is not None
+        ):
+            print(
+                "[WARN] Parser normalisiert Action-Kurzform: "
+                + truncate_for_log(json.dumps(action, ensure_ascii=False), max_len=500)
+            )
         action_type = normalized_action.get("type")
         if not isinstance(action_type, str):
             return None
@@ -790,7 +801,9 @@ class ScambaiterCore:
                     "schema MUSS exakt \"scambait.llm.v1\" sein. "
                     "analysis MUSS ein JSON-Objekt sein (kein String). "
                     "message.text darf nicht leer sein. actions muss mindestens ein Element enthalten "
-                    "(falls nötig: noop).\n\n"
+                    "(falls nötig: noop). "
+                    "Jede Action muss ein Objekt mit Pflichtfeld \"type\" sein. "
+                    "Keine Kurzformen wie {\"send_message\":{}}.\n\n"
                     f"Fehlerhafte Ausgabe:\n{candidate}"
                 ),
             }
