@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Callable
 
 PendingListener = Callable[[int, "PendingMessage | None"], None]
+WarningListener = Callable[[str], None]
 
 from scambaiter.core import ChatContext, ScambaiterCore, SuggestionResult
 from scambaiter.storage import AnalysisStore
@@ -76,6 +77,7 @@ class BackgroundService:
         self._known_chats: dict[int, KnownChatEntry] = {}
         self._chat_auto_enabled: set[int] = set()
         self._pending_listeners: list[PendingListener] = []
+        self._warning_listeners: list[WarningListener] = []
         self._general_warnings: list[str] = []
         if self.core.config.hf_max_tokens < 1000:
             self.add_general_warning(
@@ -84,6 +86,9 @@ class BackgroundService:
 
     def add_pending_listener(self, listener: PendingListener) -> None:
         self._pending_listeners.append(listener)
+
+    def add_warning_listener(self, listener: WarningListener) -> None:
+        self._warning_listeners.append(listener)
 
     def _notify_pending_changed(self, chat_id: int) -> None:
         pending = self._pending_messages.get(chat_id)
@@ -106,6 +111,11 @@ class BackgroundService:
         self._general_warnings.append(text)
         if len(self._general_warnings) > 30:
             self._general_warnings = self._general_warnings[-30:]
+        for listener in list(self._warning_listeners):
+            try:
+                listener(text)
+            except Exception as exc:
+                print(f"[WARN] Warning-Listener fehlgeschlagen: {exc}")
 
     def get_general_warnings(self, limit: int = 5) -> list[str]:
         return self._general_warnings[-limit:]
@@ -210,7 +220,11 @@ class BackgroundService:
                 process_contexts = [
                     ctx
                     for ctx in contexts
-                    if ctx.chat_id in self._chat_auto_enabled and self._should_process_context(ctx)
+                    if (
+                        ctx.chat_id in self._chat_auto_enabled
+                        and self._is_generation_allowed_for_chat(ctx.chat_id)
+                        and self._should_process_context(ctx)
+                    )
                 ]
 
             results = await self._generate_for_contexts(
@@ -686,10 +700,28 @@ class BackgroundService:
 
     @staticmethod
     def _fingerprint_context(context: ChatContext) -> str:
+        # Only fingerprint incoming user messages. Own outgoing messages and
+        # queue progress should not retrigger model generation by themselves.
         joined = "\n".join(
-            f"{msg.timestamp.isoformat()}|{msg.role}|{msg.sender}|{msg.text}" for msg in context.messages
+            f"{msg.timestamp.isoformat()}|{msg.role}|{msg.sender}|{msg.text}"
+            for msg in context.messages
+            if msg.role == "user"
         )
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+    def _is_generation_allowed_for_chat(self, chat_id: int) -> bool:
+        pending = self._pending_messages.get(chat_id)
+        if not pending:
+            return True
+        # While a queue is active (or explicitly escalated), do not regenerate.
+        if pending.state in {
+            MessageState.GENERATING,
+            MessageState.WAITING,
+            MessageState.SENDING_TYPING,
+            MessageState.ESCALATED,
+        }:
+            return False
+        return True
 
     @staticmethod
     def _seconds_until_utc(send_at_utc: str) -> float:
