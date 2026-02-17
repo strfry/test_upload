@@ -23,13 +23,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app = Application.builder().token(token).build()
     max_message_len = 3500
     menu_message_len = 3900
-    card_caption_len = 1024
+    card_caption_len = 900
     chats_page_size = 8
     queue_page_size = 8
     directive_input_state = 1
     analysis_input_state = 2
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
+    prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -57,10 +58,38 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if chunk:
             await _guarded_reply(update, chunk.rstrip())
 
-    def _limit_caption(text: str) -> str:
-        if len(text) <= card_caption_len:
+    def _tg_units(text: str) -> int:
+        return len(text.encode("utf-16-le")) // 2
+
+    def _trim_to_tg_units(text: str, max_units: int) -> str:
+        if max_units <= 0:
+            return ""
+        if _tg_units(text) <= max_units:
             return text
-        return text[: card_caption_len - 14].rstrip() + "\n... [gekuerzt]"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _tg_units(text[:mid]) <= max_units:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo]
+
+    def _is_caption_too_long_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "media_caption_too_long" in msg
+            or "caption is too long" in msg
+            or "message caption is too long" in msg
+        )
+
+    def _limit_caption(text: str) -> str:
+        suffix = "\n... [gekuerzt]"
+        if _tg_units(text) <= card_caption_len:
+            return text
+        budget = card_caption_len - _tg_units(suffix)
+        trimmed = _trim_to_tg_units(text, budget).rstrip()
+        return trimmed + suffix
 
     async def _safe_edit_message(query, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
         message = getattr(query, "message", None)
@@ -72,6 +101,19 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await query.edit_message_text(text, reply_markup=reply_markup)
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
+                return
+            if has_photo and message and _is_caption_too_long_error(exc):
+                replacement = await app.bot.send_message(
+                    chat_id=int(message.chat_id),
+                    text=_limit_message(text),
+                    reply_markup=reply_markup,
+                )
+                try:
+                    await app.bot.delete_message(chat_id=int(message.chat_id), message_id=int(message.message_id))
+                except BadRequest:
+                    pass
+                _drop_control_card_by_message(int(message.chat_id), int(message.message_id))
+                _drop_control_card_by_message(int(replacement.chat_id), int(replacement.message_id))
                 return
             raise
 
@@ -128,6 +170,78 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if len(value) <= max_len:
             return value
         return value[: max_len - 3].rstrip() + "..."
+
+    def _paginate_text(text: str, max_len: int) -> list[str]:
+        clean = text.strip()
+        if not clean:
+            return [""]
+        if len(clean) <= max_len:
+            return [clean]
+        lines = clean.splitlines(keepends=True)
+        pages: list[str] = []
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) > max_len and chunk:
+                pages.append(chunk.rstrip())
+                chunk = line
+            else:
+                chunk += line
+        if chunk:
+            pages.append(chunk.rstrip())
+        return pages or [clean[:max_len]]
+
+    async def _send_paged_text(
+        bot,
+        chat_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        page_len: int = max_message_len,
+    ):
+        pages = _paginate_text(text, max_len=page_len)
+        first_message = None
+        for idx, page in enumerate(pages):
+            message = await bot.send_message(
+                chat_id=chat_id,
+                text=page,
+                reply_markup=(reply_markup if idx == 0 else None),
+            )
+            if first_message is None:
+                first_message = message
+        return first_message
+
+    def _prompt_preview_keyboard(chat_id: int, chat_page: int, page: int, total: int) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀️", callback_data=f"pp:{chat_id}:{chat_page}:{page - 1}"))
+        if page < total - 1:
+            nav_row.append(InlineKeyboardButton("▶️", callback_data=f"pp:{chat_id}:{chat_page}:{page + 1}"))
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{chat_page}")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _render_prompt_preview(
+        chat_id: int,
+        chat_page: int,
+        page: int,
+        is_card: bool,
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        cached = prompt_preview_cache.get(chat_id)
+        if not cached:
+            return "Prompt-Preview nicht verfügbar.", _prompt_preview_keyboard(chat_id, chat_page, 0, 1)
+        cached_chat_page, pages = cached
+        effective_chat_page = cached_chat_page if isinstance(cached_chat_page, int) else chat_page
+        total = max(1, len(pages))
+        page = max(0, min(page, total - 1))
+        header = f"Prompt-Preview {page + 1}/{total} | Chat {chat_id}"
+        body = pages[page]
+        text = header + "\n\n" + body
+        if is_card:
+            text = _limit_caption(text)
+        else:
+            text = _limit_message(text)
+        return text, _prompt_preview_keyboard(chat_id, effective_chat_page, page, total)
 
     def _analysis_summary_parts(analysis_data: dict[str, object] | None, limit: int = 4) -> list[str]:
         if not analysis_data:
@@ -195,6 +309,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         directive_parts = _directive_preview_parts(chat_id, limit=2)
         if directive_parts:
             lines.append("Direktiven: " + " | ".join(directive_parts))
+        retry_lines = _generation_attempt_lines(chat_id, limit=3)
+        if retry_lines:
+            lines.append("Retries:")
+            lines.extend(retry_lines)
         return "\n".join(lines)
 
     def _parse_chat_id_arg(args: list[str]) -> int | None:
@@ -228,6 +346,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     InlineKeyboardButton("🖼️ Bilder", callback_data=f"ma:i:{chat_id}:{page}"),
                     InlineKeyboardButton("📊 Analysis", callback_data=f"ma:k:{chat_id}:{page}"),
                     InlineKeyboardButton("🧾 Prompt", callback_data=f"ma:p:{chat_id}:{page}"),
+                ],
+                [
+                    InlineKeyboardButton("🔁 Retries", callback_data=f"ma:r:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("➕ Dir", callback_data=f"ma:da:{chat_id}:{page}"),
@@ -510,6 +631,20 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         rendered = ", ".join(_truncate_value(str(item), max_len=48) for item in fields)
         return f"{action_type} ({rendered})"
 
+    def _generation_attempt_lines(chat_id: int, limit: int = 3) -> list[str]:
+        attempts = service.list_generation_attempts(chat_id, limit=limit)
+        lines: list[str] = []
+        for item in attempts:
+            status = "ok" if item.accepted else "reject"
+            reason = f", reason={item.reject_reason}" if item.reject_reason else ""
+            lines.append(
+                _truncate_value(
+                    f"{item.created_at:%H:%M:%S} a{item.attempt_no}/{item.phase} {status}{reason}",
+                    max_len=140,
+                )
+            )
+        return lines
+
     async def _render_chat_detail(
         chat_id: int,
         page: int,
@@ -546,6 +681,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             directive_parts = _directive_preview_parts(chat_id, limit=2)
             if directive_parts:
                 lines.append("Direktiven: " + " | ".join(directive_parts))
+            retry_lines = _generation_attempt_lines(chat_id, limit=3)
+            if retry_lines:
+                lines.append("Retries:")
+                lines.extend(retry_lines)
             if display_actions:
                 lines.append("Queue:")
                 source_text = pending.suggestion if pending else suggestion
@@ -587,17 +726,76 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             )
         profile_photo = await service.core.get_chat_profile_photo(chat_id)
         if profile_photo:
-            return await context.bot.send_photo(
-                chat_id=allowed_chat_id,
-                photo=InputFile(profile_photo, filename=f"profile_{chat_id}.jpg"),
-                caption=caption,
-                reply_markup=keyboard,
-            )
+            try:
+                return await context.bot.send_photo(
+                    chat_id=allowed_chat_id,
+                    photo=InputFile(profile_photo, filename=f"profile_{chat_id}.jpg"),
+                    caption=_limit_caption(caption),
+                    reply_markup=keyboard,
+                )
+            except BadRequest as exc:
+                if not _is_caption_too_long_error(exc):
+                    raise
+                return await _send_paged_text(
+                    context.bot,
+                    chat_id=allowed_chat_id,
+                    text=_limit_message(caption),
+                    reply_markup=keyboard,
+                    page_len=menu_message_len,
+                )
         return await context.bot.send_message(
             chat_id=allowed_chat_id,
             text=caption,
             reply_markup=keyboard,
         )
+
+    async def _send_chat_detail_via_app(
+        chat_id: int,
+        page: int,
+        heading: str | None,
+        preferred_render_mode: str,
+    ):
+        prefer_card = preferred_render_mode == "card"
+        if prefer_card:
+            caption, keyboard = await _render_chat_detail(
+                chat_id,
+                page,
+                heading=heading,
+                compact=True,
+            )
+            if len(caption) <= card_caption_len:
+                profile_photo = await service.core.get_chat_profile_photo(chat_id)
+                if profile_photo:
+                    try:
+                        message = await app.bot.send_photo(
+                            chat_id=allowed_chat_id,
+                            photo=InputFile(profile_photo, filename=f"profile_{chat_id}.jpg"),
+                            caption=_limit_caption(caption),
+                            reply_markup=keyboard,
+                        )
+                        return message, "card"
+                    except BadRequest as exc:
+                        if not _is_caption_too_long_error(exc):
+                            raise
+            message = await app.bot.send_message(
+                chat_id=allowed_chat_id,
+                text=_limit_message(caption),
+                reply_markup=keyboard,
+            )
+            return message, "text"
+
+        text, keyboard = await _render_chat_detail(
+            chat_id,
+            page,
+            heading=heading,
+            compact=False,
+        )
+        message = await app.bot.send_message(
+            chat_id=allowed_chat_id,
+            text=_limit_message(text),
+            reply_markup=keyboard,
+        )
+        return message, "text"
 
     def _remove_message_target(chat_id: int, message_id: int) -> None:
         _drop_control_card_by_message(chat_id, message_id)
@@ -622,9 +820,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         message_chat_id = int(message.chat_id)
         message_id = int(message.message_id)
+        has_photo = bool(getattr(message, "photo", None))
+        normalized_mode = "card" if has_photo else "text"
+        if render_mode == "text":
+            normalized_mode = "text"
+        elif render_mode == "card" and has_photo:
+            normalized_mode = "card"
         _remove_message_target(message_chat_id, message_id)
 
-        new_target = (message_chat_id, message_id, page, render_mode)
+        new_target = (message_chat_id, message_id, page, normalized_mode)
         previous_targets = infobox_targets.get(chat_id, set())
         stale_targets = [target for target in previous_targets if target[:2] != new_target[:2]]
 
@@ -644,6 +848,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if not targets:
             return
         stale: set[tuple[int, int, int, str]] = set()
+        replacements: list[tuple[tuple[int, int, int, str], tuple[int, int, int, str]]] = []
         for target_chat_id, target_message_id, page, render_mode in list(targets):
             compact = render_mode == "card"
             text, reply_markup = await _render_chat_detail(
@@ -671,9 +876,35 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 if "message to edit not found" in message or "message can't be edited" in message:
                     stale.add((target_chat_id, target_message_id, page, render_mode))
                     continue
+                if "caption" in message or "text" in message:
+                    replacement_message, replacement_mode = await _send_chat_detail_via_app(
+                        chat_id=chat_id,
+                        page=page,
+                        heading=heading,
+                        preferred_render_mode=render_mode,
+                    )
+                    try:
+                        await app.bot.delete_message(chat_id=target_chat_id, message_id=target_message_id)
+                    except BadRequest:
+                        pass
+                    replacements.append(
+                        (
+                            (target_chat_id, target_message_id, page, render_mode),
+                            (
+                                int(replacement_message.chat_id),
+                                int(replacement_message.message_id),
+                                page,
+                                replacement_mode,
+                            ),
+                        )
+                    )
+                    continue
                 raise
         for target in stale:
             targets.discard(target)
+        for old_target, new_target in replacements:
+            targets.discard(old_target)
+            targets.add(new_target)
         if not targets:
             infobox_targets.pop(chat_id, None)
 
@@ -854,6 +1085,36 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 page=page,
             )
             await _register_infobox_target(card_message, chat_id, page, render_mode="card")
+            return
+
+        if data.startswith("pp:"):
+            try:
+                _prefix, chat_id_raw, chat_page_raw, preview_page_raw = data.split(":")
+                chat_id = int(chat_id_raw)
+                chat_page = int(chat_page_raw)
+                preview_page = int(preview_page_raw)
+            except (ValueError, IndexError):
+                await _safe_edit_message(query, "Ungueltige Aktion.")
+                return
+            text, keyboard = await _render_prompt_preview(
+                chat_id=chat_id,
+                chat_page=chat_page,
+                page=preview_page,
+                is_card=False,
+            )
+            message = getattr(query, "message", None)
+            if message and getattr(message, "photo", None):
+                await context.bot.send_message(
+                    chat_id=allowed_chat_id,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+                try:
+                    await context.bot.delete_message(chat_id=int(message.chat_id), message_id=int(message.message_id))
+                except BadRequest:
+                    pass
+            else:
+                await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
         if data.startswith("md:"):
@@ -1067,11 +1328,26 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
             for image_bytes, caption in images:
-                await context.bot.send_photo(
-                    chat_id=allowed_chat_id,
-                    photo=InputFile(image_bytes, filename=f"chat_{chat_id}.jpg"),
-                    caption=caption[:1024],
-                )
+                caption_pages = _paginate_text(caption, max_len=card_caption_len)
+                first_caption = _limit_caption(caption_pages[0] if caption_pages else "")
+                try:
+                    await context.bot.send_photo(
+                        chat_id=allowed_chat_id,
+                        photo=InputFile(image_bytes, filename=f"chat_{chat_id}.jpg"),
+                        caption=first_caption,
+                    )
+                except BadRequest as exc:
+                    if not _is_caption_too_long_error(exc):
+                        raise
+                    await context.bot.send_photo(
+                        chat_id=allowed_chat_id,
+                        photo=InputFile(image_bytes, filename=f"chat_{chat_id}.jpg"),
+                    )
+                for idx, tail_page in enumerate(caption_pages[1:], start=2):
+                    await context.bot.send_message(
+                        chat_id=allowed_chat_id,
+                        text=f"Bild-Caption {idx}/{len(caption_pages)}:\n{tail_page}",
+                    )
             text, keyboard = await _render_chat_detail(
                 chat_id,
                 page,
@@ -1175,29 +1451,74 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         if action == "p":
-            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             chat_context = await service.core.build_chat_context(chat_id)
             if not chat_context:
                 text, keyboard = await _render_chat_detail(
                     chat_id,
                     page,
                     heading="Kein Chatverlauf gefunden.",
+                    compact=bool(getattr(getattr(query, "message", None), "photo", None)),
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+            prompt_context, language_hint, _previous_analysis = service.build_prompt_context_for_chat(chat_id)
+            model_messages = service.core.build_model_messages(
+                chat_context,
+                language_hint=language_hint,
+                prompt_context=prompt_context,
+            )
+            preview_raw = json.dumps(model_messages, ensure_ascii=False, indent=2)
+            preview_pages = _paginate_text(preview_raw, max_len=3000)
+            prompt_preview_cache[chat_id] = (page, preview_pages)
+            text, keyboard = await _render_prompt_preview(
+                chat_id=chat_id,
+                chat_page=page,
+                page=0,
+                is_card=False,
+            )
+            message = getattr(query, "message", None)
+            if message and getattr(message, "photo", None):
+                await context.bot.send_message(
+                    chat_id=allowed_chat_id,
+                    text=text,
+                    reply_markup=keyboard,
+                )
+                try:
+                    await context.bot.delete_message(chat_id=int(message.chat_id), message_id=int(message.message_id))
+                except BadRequest:
+                    pass
+            else:
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+            return
+
+        if action == "r":
+            attempts = service.list_generation_attempts(chat_id, limit=12)
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            if not attempts:
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading="Keine Retry-/Attempt-Daten vorhanden.",
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
-            preview = service.core.build_prompt_debug_summary(chat_context, max_lines=8)
-            text, keyboard = await _render_chat_detail(
-                chat_id,
-                page,
-                heading="Prompt-Preview",
-                compact=is_card,
-            )
-            if is_card:
-                text = _limit_caption(text + "\n" + _truncate_value(preview, max_len=700))
-            else:
-                text = _limit_message(text + "\n\nPrompt-Preview:\n" + preview)
-            await _safe_edit_message(query, text, reply_markup=keyboard)
+            lines = [f"Chat {chat_id}", "", f"Retries ({len(attempts)}):"]
+            for idx, item in enumerate(attempts, start=1):
+                status = "ok" if item.accepted else "reject"
+                reason = f" | reason={item.reject_reason}" if item.reject_reason else ""
+                schema = f" | schema={item.schema}" if item.schema else ""
+                lines.append(
+                    _truncate_value(
+                        f"{idx}. {item.created_at:%Y-%m-%d %H:%M:%S} | a{item.attempt_no}/{item.phase} | "
+                        f"{status}{reason}{schema}",
+                        max_len=220,
+                    )
+                )
+                if item.raw_excerpt:
+                    lines.append(_truncate_value(f"   raw={item.raw_excerpt}", max_len=220))
+            text = _limit_message("\n".join(lines), max_len=3300)
+            await _safe_edit_message(query, text, reply_markup=_chat_detail_keyboard(chat_id, page))
             return
 
         self_warning = f"Unbekannte Callback-Aktion: data={data}"
@@ -1298,8 +1619,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _guarded_reply(update, "Kein Chatverlauf gefunden.")
             return
 
-        preview = service.core.build_prompt_debug_summary(chat_context, max_lines=8)
-        await _guarded_reply_chunks(update, "Prompt-Preview:\n" + preview)
+        prompt_context, language_hint, _previous_analysis = service.build_prompt_context_for_chat(chat_id)
+        model_messages = service.core.build_model_messages(
+            chat_context,
+            language_hint=language_hint,
+            prompt_context=prompt_context,
+        )
+        preview = json.dumps(model_messages, ensure_ascii=False, indent=2)
+        await _guarded_reply_chunks(update, "Prompt-Preview (tatsaechlicher Modell-Input):\n" + preview)
 
     async def directive_input_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         query = update.callback_query
@@ -1393,7 +1720,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         text, keyboard = await _render_chat_detail(
             chat_id,
             page,
-            heading="Analysis bearbeiten: sende jetzt `key=value` (oder /cancel).",
+            heading=(
+                "Analysis bearbeiten: sende jetzt `key=value` "
+                "oder ein JSON-Objekt `{...}` zum Mergen (oder /cancel)."
+            ),
             compact=is_card,
         )
         await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -1466,6 +1796,34 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             context.user_data.pop("analysis_target", None)
             return ConversationHandler.END
         text = message.text.strip()
+        if edit_mode != "edit":
+            try:
+                parsed_obj = json.loads(text)
+            except Exception:
+                parsed_obj = None
+            if isinstance(parsed_obj, dict):
+                if not service.store:
+                    await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+                    context.user_data.pop("analysis_target", None)
+                    return ConversationHandler.END
+                latest_entry = service.store.latest_for_chat(raw_chat_id)
+                if not latest_entry:
+                    await _guarded_reply(update, "Keine Analyse fuer diesen Chat gefunden.")
+                    context.user_data.pop("analysis_target", None)
+                    return ConversationHandler.END
+                current = dict(latest_entry.analysis or {})
+                for key_obj, value_obj in parsed_obj.items():
+                    current[str(key_obj)] = value_obj
+                updated = service.store.update_latest_analysis(raw_chat_id, current)
+                context.user_data.pop("analysis_target", None)
+                if not updated:
+                    await _guarded_reply(update, "Analysis konnte nicht aktualisiert werden.")
+                    return ConversationHandler.END
+                await _guarded_reply(update, f"Analysis gemerged: {len(parsed_obj)} Key(s).")
+                if raw_chat_id in infobox_targets:
+                    app.create_task(_push_infobox_update(raw_chat_id, heading="Analysis-JSON gemerged"), update=None)
+                return ConversationHandler.END
+
         if edit_mode == "edit":
             if not isinstance(edit_key, str) or not edit_key.strip():
                 await _guarded_reply(update, "Ungueltiger Edit-Key.")
@@ -1475,7 +1833,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         else:
             sep = "=" if "=" in text else ":" if ":" in text else None
             if not sep:
-                await _guarded_reply(update, "Format: key=value")
+                await _guarded_reply(update, "Format: key=value oder JSON-Objekt `{...}`")
                 return analysis_input_state
             key, raw_value = text.split(sep, 1)
             key = key.strip()
@@ -1559,5 +1917,5 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             allow_reentry=True,
         )
     )
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|pp|generate|send|stop|autoon|autooff|img|kv):"))
     return app

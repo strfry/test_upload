@@ -54,6 +54,10 @@ STRUKTURREGELN:
 - send_message bedeutet: sende message.text.
 - Keine zusätzlichen Keys erzeugen.
 - Keine nicht spezifizierten Felder erfinden.
+- `message.text` muss wie eine natürliche Chat-Nachricht an die Gegenpartei klingen,
+  nicht wie interne Analyse oder Moderationsnotiz.
+- `analysis` ist ein Update-Objekt (Delta): gib nur neue/aktualisierte Fakten zurück.
+- Spiegele `previous_analysis` NICHT als Ganzes in `analysis`.
 - Wenn Lesen sinnvoll ist, setze mark_read explizit vor Sende-Aktionen.
 - Jede Action im actions-Array ist ein Objekt mit Pflichtfeld "type".
 - Verboten: Kurzformen wie {"send_message":{}} oder {"simulate_typing":{...}}.
@@ -116,6 +120,31 @@ KONTEXT-KONSISTENZ:
 - Bei Widerspruch zwischen `previous_analysis` und Verlauf: folge dem Verlauf und korrigiere `analysis`.
 - Vermeide Wiederholungsfragen in leicht umformulierter Form; das zählt ebenfalls als Duplikat.
 
+ANTWORT-PRIORITÄT:
+- Richte die nächste Nachricht primär auf die JÜNGSTE User-Nachricht aus.
+- Beantworte deren aktuelle Intention zuerst, statt auf ältere offene Punkte zurückzufallen.
+- Wenn mehrere Themen offen sind, priorisiere das zuletzt vom User angesprochene Thema.
+- Bevorzuge eine konkrete, kreative Anschlussfrage oder einen konkreten nächsten Schritt,
+  statt eine bereits diskutierte Basisfrage erneut zu stellen.
+
+PROGRESS-REGEL:
+- Stelle nicht wiederholt dieselbe Kernfrage.
+- Wenn ein Intent-Thema in den letzten 2 Assistant-Nachrichten bereits als Hauptfrage vorkam,
+  darf es in der nächsten Nachricht nicht erneut die Hauptfrage sein.
+- Liefere stattdessen Fortschritt: nächster konkreter Schritt, neues Subthema oder gezielte Nachfrage
+  zu einem bisher nicht geklärten Detail.
+
+LOOP-GUARD:
+- Wenn `analysis.loop_guard_active=true`, vermeide semantische Wiederholung der letzten Assistant-Hauptfrage.
+- Wenn `analysis.ask_again_guard.topic_from_last_turn=true`, stelle keine inhaltlich ähnliche Rückfrage
+  zum zuletzt bereits gefragten Kern-Intent.
+- Eine erneut formulierte Frage zum gleichen Intent gilt als Duplikat und ist unzulässig.
+- In diesem Fall liefere stattdessen einen neuen, konkreten Fortschrittsschritt oder eine neue Detailfrage.
+
+LAST-USER-PRIORITY:
+- Wenn `analysis.last_user_topic_priority=true`, muss `message.text` primär auf die JÜNGSTE User-Nachricht reagieren.
+- Weiche davon nur ab, wenn Sicherheitsregeln es erzwingen.
+
 OPERATOR-DIREKTIVEN:
 - Der Input kann ein Feld `operator.directives` enthalten.
 - Jede Direktive ist bindend, solange sie aktiv ist.
@@ -139,10 +168,30 @@ SICHERHEITSREGELN:
 - Keine echten persönlichen Daten preisgeben.
 - Keine illegalen Anleitungen geben.
 - Keine Schadsoftware oder Credential-Erfassung unterstützen.
+- Erfinde keine konkreten Zahlungsdetails (Wallet-Adressen, Bankdaten, Zahlungslinks,
+  Beträge/Mindest-Einlagen oder Transferanweisungen), wenn sie nicht eindeutig
+  im Chatverlauf genannt wurden.
+- Gib keine Platzhalter-Wallets oder Beispieladressen aus.
 
 FALLBACK:
 - Wenn keine sichere oder regelkonforme Antwort möglich ist:
   Verwende escalate_to_human.
+- Verwende ebenfalls `escalate_to_human`, wenn für eine plausible nächste Nachricht
+  entscheidende Fakten fehlen und du sonst raten oder halluzinieren müsstest.
+- Pflicht-Escalation: Wenn (a) entscheidende Fakten fehlen ODER (b) die verlangte Aktion
+  gegen Sicherheitsregeln verstößt, nutze `escalate_to_human` statt `send_message`.
+- Bei Sicherheitskonflikt ist eine reine Ablehnungs-Nachricht per `send_message` kein gültiger Ersatz.
+- In diesem Fall MUSS `actions` genau eine `escalate_to_human`-Action enthalten
+  (optional mit vorbereitenden Nicht-Sende-Actions wie `mark_read`/`simulate_typing`).
+- Eskaliere nicht vorschnell: Wenn eine sichere, nicht-spekulative Klärungsfrage möglich ist,
+  bevorzuge diese und führe den Dialog weiter.
+- Nutze `escalate_to_human` primär dann, wenn ohne menschliche Entscheidung kein regelkonformer
+  nächster Schritt möglich ist.
+- In diesem Fall:
+  - setze `actions` auf `[{\"type\":\"escalate_to_human\",\"reason\":\"...\"}]`
+  - lass `message.text` leer
+  - dokumentiere in `analysis`, welche Informationen fehlen und welche Keys hilfreich wären
+    (z.B. `missing_facts`, `suggested_analysis_keys`).
 
 Gib ausschließlich gültiges JSON zurück."""
 
@@ -178,6 +227,8 @@ class ModelOutput:
     analysis: dict[str, object] | None
     metadata: dict[str, str]
     actions: list[dict[str, object]]
+
+GenerationAttemptCallback = Callable[[dict[str, object]], None]
 
 
 def parse_structured_model_output(text: str) -> ModelOutput | None:
@@ -593,7 +644,7 @@ class ScambaiterCore:
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
             {
-                "role": "user",
+                "role": "system",
                 "content": (
                     f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id}). "
                     "Die folgenden Nachrichten sind chronologisch sortiert."
@@ -605,7 +656,7 @@ class ScambaiterCore:
             context_json = json.dumps(prompt_context, ensure_ascii=False, indent=2)
             messages.append(
                 {
-                    "role": "user",
+                    "role": "system",
                     "content": (
                         "Strukturierter System-Kontext (nur intern, nicht wortwörtlich zitieren):\n"
                         f"{context_json}"
@@ -845,6 +896,7 @@ class ScambaiterCore:
         language_hint: str | None = None,
         prompt_context: dict[str, object] | None = None,
         on_warning: Callable[[str], None] | None = None,
+        on_attempt: GenerationAttemptCallback | None = None,
     ) -> ModelOutput:
         last_output: ModelOutput | None = None
         language_system_prompt = self.build_language_system_prompt(language_hint)
@@ -896,6 +948,19 @@ class ScambaiterCore:
                     f"in Versuch {attempt}: {error_detail}"
                 )
                 failed_generation = extract_failed_generation_from_exception(exc)
+                if on_attempt:
+                    on_attempt(
+                        {
+                            "attempt_no": attempt,
+                            "phase": "initial",
+                            "parsed_ok": False,
+                            "accepted": False,
+                            "reject_reason": "request_error",
+                            "raw_excerpt": truncate_for_log(failed_generation or "", max_len=1000) if failed_generation else None,
+                            "suggestion": None,
+                            "schema": None,
+                        }
+                    )
                 if on_warning:
                     tool_name = extract_tool_call_name_from_failed_generation(failed_generation)
                     if tool_name:
@@ -908,6 +973,8 @@ class ScambaiterCore:
                     repaired = self._attempt_repair_output(
                         source_text=failed_generation,
                         language_system_prompt=language_system_prompt,
+                        on_attempt=on_attempt,
+                        attempt_no=attempt,
                     )
                     if repaired is not None:
                         if on_warning:
@@ -944,12 +1011,27 @@ class ScambaiterCore:
             raw = _normalize_text_content(content)
             structured = parse_structured_model_output(raw)
             if structured is None:
+                if on_attempt:
+                    on_attempt(
+                        {
+                            "attempt_no": attempt,
+                            "phase": "initial",
+                            "parsed_ok": False,
+                            "accepted": False,
+                            "reject_reason": "invalid_json",
+                            "raw_excerpt": truncate_for_log(raw, max_len=1000),
+                            "suggestion": None,
+                            "schema": None,
+                        }
+                    )
                 print(
                     f"[WARN] Keine valide JSON-Ausgabe für {context.title} ({context.chat_id}) in Versuch {attempt}."
                 )
                 repaired = self._attempt_repair_output(
                     source_text=raw,
                     language_system_prompt=language_system_prompt,
+                    on_attempt=on_attempt,
+                    attempt_no=attempt,
                 )
                 if repaired is not None:
                     if on_warning:
@@ -979,14 +1061,53 @@ class ScambaiterCore:
             last_output = current_output
             has_send_message = any(str(action.get("type")) == "send_message" for action in current_output.actions)
             if has_send_message and suggestion and not looks_like_reasoning_output(suggestion):
+                if on_attempt:
+                    on_attempt(
+                        {
+                            "attempt_no": attempt,
+                            "phase": "initial",
+                            "parsed_ok": True,
+                            "accepted": True,
+                            "reject_reason": None,
+                            "raw_excerpt": truncate_for_log(raw, max_len=1000),
+                            "suggestion": suggestion,
+                            "schema": metadata.get("schema"),
+                        }
+                    )
                 return current_output
             if not has_send_message and (not suggestion or not looks_like_reasoning_output(suggestion)):
+                if on_attempt:
+                    on_attempt(
+                        {
+                            "attempt_no": attempt,
+                            "phase": "initial",
+                            "parsed_ok": True,
+                            "accepted": True,
+                            "reject_reason": None,
+                            "raw_excerpt": truncate_for_log(raw, max_len=1000),
+                            "suggestion": suggestion,
+                            "schema": metadata.get("schema"),
+                        }
+                    )
                 return current_output
 
             print(
                 f"[WARN] Extrahierte Antwort wirkt wie Denkprozess oder ist leer für {context.title} "
                 f"({context.chat_id}) in Versuch {attempt}: {suggestion}"
             )
+            if on_attempt:
+                on_attempt(
+                    {
+                        "attempt_no": attempt,
+                        "phase": "initial",
+                        "parsed_ok": True,
+                        "accepted": False,
+                        "reject_reason": "reasoning_or_empty",
+                        "raw_excerpt": truncate_for_log(raw, max_len=1000),
+                        "suggestion": suggestion,
+                        "schema": metadata.get("schema"),
+                    }
+                )
 
         if last_output is None:
             return ModelOutput(raw="", suggestion="", analysis=None, metadata={}, actions=[])
@@ -1009,6 +1130,8 @@ class ScambaiterCore:
         self,
         source_text: str,
         language_system_prompt: str | None = None,
+        on_attempt: GenerationAttemptCallback | None = None,
+        attempt_no: int = 0,
     ) -> ModelOutput | None:
         candidate = (source_text or "").strip()
         if not candidate:
@@ -1065,12 +1188,64 @@ class ScambaiterCore:
         repaired = parse_structured_model_output(repair_raw)
         if repaired is None:
             print(f"[WARN] Repair-Request lieferte weiterhin invalides JSON: {truncate_for_log(repair_raw, max_len=1200)}")
+            if on_attempt:
+                on_attempt(
+                    {
+                        "attempt_no": attempt_no,
+                        "phase": "repair",
+                        "parsed_ok": False,
+                        "accepted": False,
+                        "reject_reason": "invalid_json",
+                        "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
+                        "suggestion": None,
+                        "schema": None,
+                    }
+                )
             return None
         has_send_message = any(str(action.get("type")) == "send_message" for action in repaired.actions)
         if has_send_message and (not repaired.suggestion or looks_like_reasoning_output(repaired.suggestion)):
+            if on_attempt:
+                on_attempt(
+                    {
+                        "attempt_no": attempt_no,
+                        "phase": "repair",
+                        "parsed_ok": True,
+                        "accepted": False,
+                        "reject_reason": "reasoning_or_empty",
+                        "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
+                        "suggestion": repaired.suggestion,
+                        "schema": repaired.metadata.get("schema"),
+                    }
+                )
             return None
         if not has_send_message and repaired.suggestion and looks_like_reasoning_output(repaired.suggestion):
+            if on_attempt:
+                on_attempt(
+                    {
+                        "attempt_no": attempt_no,
+                        "phase": "repair",
+                        "parsed_ok": True,
+                        "accepted": False,
+                        "reject_reason": "reasoning_output",
+                        "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
+                        "suggestion": repaired.suggestion,
+                        "schema": repaired.metadata.get("schema"),
+                    }
+                )
             return None
+        if on_attempt:
+            on_attempt(
+                {
+                    "attempt_no": attempt_no,
+                    "phase": "repair",
+                    "parsed_ok": True,
+                    "accepted": True,
+                    "reject_reason": None,
+                    "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
+                    "suggestion": repaired.suggestion,
+                    "schema": repaired.metadata.get("schema"),
+                }
+            )
         return repaired
 
     async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:

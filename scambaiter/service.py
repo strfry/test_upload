@@ -11,7 +11,7 @@ PendingListener = Callable[[int, "PendingMessage | None"], None]
 WarningListener = Callable[[str], None]
 
 from scambaiter.core import ChatContext, ScambaiterCore, SuggestionResult
-from scambaiter.storage import AnalysisStore, StoredDirective
+from scambaiter.storage import AnalysisStore, StoredDirective, StoredGenerationAttempt
 
 
 @dataclass
@@ -84,6 +84,7 @@ class BackgroundService:
         self._pending_listeners: list[PendingListener] = []
         self._warning_listeners: list[WarningListener] = []
         self._general_warnings: list[str] = []
+        self._recent_generation_attempts: dict[int, list[StoredGenerationAttempt]] = {}
         if self.core.config.hf_max_tokens < 1000:
             self.add_general_warning(
                 f"HF_MAX_TOKENS={self.core.config.hf_max_tokens} ist niedrig; empfohlen sind >= 1000."
@@ -174,6 +175,11 @@ class BackgroundService:
                 listener(text)
             except Exception as exc:
                 print(f"[WARN] Warning-Listener fehlgeschlagen: {exc}")
+
+    def list_generation_attempts(self, chat_id: int, limit: int = 12) -> list[StoredGenerationAttempt]:
+        if self.store:
+            return self.store.list_generation_attempts_for_chat(chat_id=int(chat_id), limit=int(limit))
+        return list(self._recent_generation_attempts.get(int(chat_id), []))[: int(limit)]
 
     def get_general_warnings(self, limit: int = 5) -> list[str]:
         return self._general_warnings[-limit:]
@@ -408,6 +414,14 @@ class BackgroundService:
                 on_warning=(
                     (lambda message, chat_id=context.chat_id: self._handle_generation_warning(chat_id, message, on_warning))
                 ),
+                on_attempt=(
+                    lambda event, chat_id=context.chat_id, title=context.title: self._record_generation_attempt(
+                        chat_id=chat_id,
+                        title=title,
+                        trigger=trigger,
+                        event=event,
+                    )
+                ),
             )
             merged_analysis = self._merge_analysis(previous_analysis if self.store else None, output.analysis)
             result = SuggestionResult(
@@ -437,6 +451,74 @@ class BackgroundService:
                 schema=output.metadata.get("schema"),
             )
         return results
+
+    def _record_generation_attempt(
+        self,
+        *,
+        chat_id: int,
+        title: str,
+        trigger: str,
+        event: dict[str, object],
+    ) -> None:
+        attempt_no = int(event.get("attempt_no") or 0)
+        phase = str(event.get("phase") or "initial")
+        parsed_ok = bool(event.get("parsed_ok"))
+        accepted = bool(event.get("accepted"))
+        reject_reason_value = event.get("reject_reason")
+        reject_reason = str(reject_reason_value) if isinstance(reject_reason_value, str) else None
+        raw_excerpt_value = event.get("raw_excerpt")
+        raw_excerpt = str(raw_excerpt_value) if isinstance(raw_excerpt_value, str) and raw_excerpt_value else None
+        suggestion_value = event.get("suggestion")
+        suggestion = str(suggestion_value) if isinstance(suggestion_value, str) else None
+        schema_value = event.get("schema")
+        schema = str(schema_value) if isinstance(schema_value, str) and schema_value else None
+        heuristic_score_value = event.get("heuristic_score")
+        heuristic_score = float(heuristic_score_value) if isinstance(heuristic_score_value, (int, float)) else None
+        flags_value = event.get("heuristic_flags")
+        heuristic_flags = [str(item) for item in flags_value] if isinstance(flags_value, list) else []
+
+        if self.store:
+            self.store.save_generation_attempt(
+                chat_id=chat_id,
+                title=title,
+                trigger=trigger,
+                attempt_no=attempt_no,
+                phase=phase,
+                parsed_ok=parsed_ok,
+                accepted=accepted,
+                reject_reason=reject_reason,
+                heuristic_score=heuristic_score,
+                heuristic_flags=heuristic_flags,
+                raw_excerpt=raw_excerpt,
+                suggestion=suggestion,
+                schema=schema,
+            )
+            self._notify_pending_changed(chat_id)
+            return
+
+        # Fallback im Speicher, falls kein Store konfiguriert ist.
+        created = datetime.now()
+        synthetic = StoredGenerationAttempt(
+            id=0,
+            created_at=created,
+            chat_id=int(chat_id),
+            title=title,
+            trigger=trigger,
+            attempt_no=attempt_no,
+            phase=phase,
+            parsed_ok=parsed_ok,
+            accepted=accepted,
+            reject_reason=reject_reason,
+            heuristic_score=heuristic_score,
+            heuristic_flags=heuristic_flags,
+            raw_excerpt=raw_excerpt,
+            suggestion=suggestion,
+            schema=schema,
+        )
+        bucket = self._recent_generation_attempts.setdefault(int(chat_id), [])
+        bucket.insert(0, synthetic)
+        del bucket[30:]
+        self._notify_pending_changed(chat_id)
 
     def build_prompt_context_for_chat(
         self,

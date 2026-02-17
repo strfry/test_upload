@@ -42,6 +42,25 @@ class StoredDirective:
     updated_at: datetime
 
 
+@dataclass
+class StoredGenerationAttempt:
+    id: int
+    created_at: datetime
+    chat_id: int
+    title: str
+    trigger: str
+    attempt_no: int
+    phase: str
+    parsed_ok: bool
+    accepted: bool
+    reject_reason: str | None
+    heuristic_score: float | None
+    heuristic_flags: list[str]
+    raw_excerpt: str | None
+    suggestion: str | None
+    schema: str | None
+
+
 class AnalysisStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -92,6 +111,30 @@ class AnalysisStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_directives_chat_active ON directives (chat_id, active, id DESC)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS generation_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    parsed_ok INTEGER NOT NULL,
+                    accepted INTEGER NOT NULL,
+                    reject_reason TEXT,
+                    heuristic_score REAL,
+                    heuristic_flags_json TEXT,
+                    raw_excerpt TEXT,
+                    suggestion TEXT,
+                    schema TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_generation_attempts_chat_id_id ON generation_attempts (chat_id, id DESC)"
             )
 
     @staticmethod
@@ -286,6 +329,84 @@ class AnalysisStore:
             conn.execute("DELETE FROM directives WHERE id = ?", (int(directive_id),))
             return True
 
+    def save_generation_attempt(
+        self,
+        *,
+        chat_id: int,
+        title: str,
+        trigger: str,
+        attempt_no: int,
+        phase: str,
+        parsed_ok: bool,
+        accepted: bool,
+        reject_reason: str | None,
+        heuristic_score: float | None,
+        heuristic_flags: list[str] | None,
+        raw_excerpt: str | None,
+        suggestion: str | None,
+        schema: str | None,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        flags_json = json.dumps(list(heuristic_flags or []), ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO generation_attempts (
+                    created_at, chat_id, title, trigger, attempt_no, phase,
+                    parsed_ok, accepted, reject_reason, heuristic_score,
+                    heuristic_flags_json, raw_excerpt, suggestion, schema
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    int(chat_id),
+                    str(title),
+                    str(trigger),
+                    int(attempt_no),
+                    str(phase),
+                    1 if parsed_ok else 0,
+                    1 if accepted else 0,
+                    reject_reason,
+                    float(heuristic_score) if heuristic_score is not None else None,
+                    flags_json,
+                    raw_excerpt,
+                    suggestion,
+                    schema,
+                ),
+            )
+
+    def list_generation_attempts_for_chat(self, chat_id: int, limit: int = 20) -> list[StoredGenerationAttempt]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, chat_id, title, trigger, attempt_no, phase,
+                       parsed_ok, accepted, reject_reason, heuristic_score,
+                       heuristic_flags_json, raw_excerpt, suggestion, schema
+                FROM generation_attempts
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(chat_id), int(limit)),
+            ).fetchall()
+        return [self._decode_generation_attempt_row(row) for row in rows]
+
+    def list_generation_attempts_recent(self, limit: int = 50) -> list[StoredGenerationAttempt]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, chat_id, title, trigger, attempt_no, phase,
+                       parsed_ok, accepted, reject_reason, heuristic_score,
+                       heuristic_flags_json, raw_excerpt, suggestion, schema
+                FROM generation_attempts
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [self._decode_generation_attempt_row(row) for row in rows]
+
     @staticmethod
     def _decode_analysis(value: str | None) -> dict[str, object] | None:
         if not value:
@@ -325,6 +446,35 @@ class AnalysisStore:
             if isinstance(item, dict):
                 actions.append({str(k): v for k, v in item.items()})
         return actions or None
+
+    @staticmethod
+    def _decode_generation_attempt_row(row: tuple) -> StoredGenerationAttempt:
+        flags: list[str] = []
+        raw_flags = row[11]
+        if isinstance(raw_flags, str) and raw_flags:
+            try:
+                parsed = json.loads(raw_flags)
+                if isinstance(parsed, list):
+                    flags = [str(item) for item in parsed if str(item).strip()]
+            except json.JSONDecodeError:
+                flags = []
+        return StoredGenerationAttempt(
+            id=int(row[0]),
+            created_at=datetime.fromisoformat(str(row[1])),
+            chat_id=int(row[2]),
+            title=str(row[3]),
+            trigger=str(row[4]),
+            attempt_no=int(row[5]),
+            phase=str(row[6]),
+            parsed_ok=bool(int(row[7])),
+            accepted=bool(int(row[8])),
+            reject_reason=(str(row[9]) if row[9] is not None else None),
+            heuristic_score=(float(row[10]) if row[10] is not None else None),
+            heuristic_flags=flags,
+            raw_excerpt=(str(row[12]) if row[12] is not None else None),
+            suggestion=(str(row[13]) if row[13] is not None else None),
+            schema=(str(row[14]) if row[14] is not None else None),
+        )
 
     def image_description_get(self, image_hash: str) -> StoredImageDescription | None:
         with self._connect() as conn:
