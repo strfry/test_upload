@@ -518,28 +518,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if event_chat_id in infobox_targets:
             app.create_task(_push_infobox_update(event_chat_id), update=None)
 
-    service.add_pending_listener(_on_pending_changed)
+    def _on_warning(message: str) -> None:
+        async def _post_warning() -> None:
+            text = "⚠️ Warnung\n" + message
+            await app.bot.send_message(chat_id=allowed_chat_id, text=_limit_message(text, max_len=3000))
 
-    async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _authorized(update):
-            return
-        summary = service.last_summary
-        if not summary:
-            await _guarded_reply(update, "Noch kein Lauf ausgeführt.")
-            return
-        pending_count = service.pending_count()
-        warnings = service.get_general_warnings(limit=3)
-        warning_line = "Warnungen: -" if not warnings else "Warnungen: " + " | ".join(warnings)
-        await _guarded_reply(
-            update,
-            (
-                f"Letzter Lauf: {summary.finished_at:%Y-%m-%d %H:%M:%S}\n"
-                f"Gefundene Chats: {summary.chat_count}\n"
-                f"Gesendete Nachrichten: {summary.sent_count}\n"
-                f"Nachrichtenprozesse: {pending_count}\n"
-                f"{warning_line}"
-            ),
-        )
+        app.create_task(_post_warning(), update=None)
+
+    service.add_pending_listener(_on_pending_changed)
+    service.add_warning_listener(_on_warning)
 
     async def run_once(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -954,7 +941,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
     app.bot_data["send_start_menu"] = send_start_menu
 
-    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("runonce", run_once))
     app.add_handler(CommandHandler("chats", chats))
     app.add_handler(CommandHandler("last", last))

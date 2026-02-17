@@ -2,7 +2,7 @@
 """Telegram Scambaiter suggestion tool.
 
 Batch mode (default): one run with optional interactive send.
-Bot mode: Telegram Bot API control for run/start/stop/status/insights.
+Bot mode: Telegram Bot API control for run/start/stop/insights.
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ async def run() -> None:
         )
         print(
             "BotAPI aktiv. verfügbare Kommandos: "
-            "/status /runonce /chats /last /history /analysisget /analysisset"
+            "/runonce /chats /last /history /analysisget /analysisset"
         )
         await bot_app.initialize()
         await bot_app.start()

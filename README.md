@@ -66,7 +66,6 @@ Beim Start im BotAPI-Modus wird der Ordner asynchron über die Telegram-API eing
 
 Verfügbare Bot-Kommandos:
 
-- `/status` – zeigt den letzten Lauf und die Anzahl aktiver Nachrichtenprozesse
 - `/runonce` – startet sofort einen Einmaldurchlauf
 - `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
 - `/chats` – zeigt ein paginiertes Chat-Menü; pro Chat öffnet sich ein Detailmenü mit den neuesten Infos und Aktionen `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `Analysis`
