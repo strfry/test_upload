@@ -5,7 +5,17 @@ import json
 import math
 import re
 
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -29,6 +39,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     queue_page_size = 8
     directive_input_state = 1
     analysis_input_state = 2
+    analysis_reply_kb_keyvalue = "🧩 key=value"
+    analysis_reply_kb_json = "🧱 JSON merge"
+    analysis_reply_kb_cancel = "❌ Abbrechen"
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
     prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
@@ -2125,20 +2138,43 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         except (ValueError, IndexError):
             await _safe_edit_message(query, "Ungueltige Aktion.")
             return ConversationHandler.END
-        if action not in {"ak", "a+"}:
+        if action not in {"ak", "a+", "ae"}:
             return ConversationHandler.END
-        context.user_data["analysis_target"] = {"chat_id": chat_id, "page": page}
+        mode = "quick" if action == "ae" else "new"
+        context.user_data["analysis_target"] = {"chat_id": chat_id, "page": page, "mode": mode}
         is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+        heading_text = (
+            "Analysis Editor (Reply-Keyboard Demo): nutze unten die Tastatur oder sende direkt key=value bzw. JSON."
+            if action == "ae"
+            else "Analysis bearbeiten: sende jetzt `key=value` oder ein JSON-Objekt `{...}` zum Mergen (oder /cancel)."
+        )
         text, keyboard = await _render_chat_detail(
             chat_id,
             page,
-            heading=(
-                "Analysis bearbeiten: sende jetzt `key=value` "
-                "oder ein JSON-Objekt `{...}` zum Mergen (oder /cancel)."
-            ),
+            heading=heading_text,
             compact=is_card,
         )
         await _safe_edit_message(query, text, reply_markup=keyboard)
+        if action == "ae":
+            reply_keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(analysis_reply_kb_keyvalue), KeyboardButton(analysis_reply_kb_json)],
+                    [KeyboardButton(analysis_reply_kb_cancel)],
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=False,
+                input_field_placeholder="key=value oder JSON senden…",
+            )
+            await context.bot.send_message(
+                chat_id=allowed_chat_id,
+                text=(
+                    "Reply-Keyboard aktiv (Demo).\n"
+                    f"- {analysis_reply_kb_keyvalue}: Hinweis für Key-Value\n"
+                    f"- {analysis_reply_kb_json}: Hinweis für JSON-Merge\n"
+                    f"- {analysis_reply_kb_cancel}: Editor beenden"
+                ),
+                reply_markup=reply_keyboard,
+            )
         return analysis_input_state
 
     async def analysis_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2189,7 +2225,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if not _authorized(update):
             return ConversationHandler.END
         context.user_data.pop("analysis_target", None)
-        await _guarded_reply(update, "Analysis-Eingabe abgebrochen.")
+        if update.message:
+            await update.message.reply_text("Analysis-Eingabe abgebrochen.", reply_markup=ReplyKeyboardRemove())
+        else:
+            await _guarded_reply(update, "Analysis-Eingabe abgebrochen.")
         return ConversationHandler.END
 
     async def analysis_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2208,6 +2247,16 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             context.user_data.pop("analysis_target", None)
             return ConversationHandler.END
         text = message.text.strip()
+        if text == analysis_reply_kb_cancel:
+            context.user_data.pop("analysis_target", None)
+            await message.reply_text("Analysis-Editor beendet.", reply_markup=ReplyKeyboardRemove())
+            return ConversationHandler.END
+        if text == analysis_reply_kb_keyvalue:
+            await _guarded_reply(update, "Format: key=value (Beispiel: loop_guard_active=true)")
+            return analysis_input_state
+        if text == analysis_reply_kb_json:
+            await _guarded_reply(update, "Format: JSON-Objekt zum Mergen, z.B. {\"loop_guard_active\": true}")
+            return analysis_input_state
         if edit_mode != "edit":
             try:
                 parsed_obj = json.loads(text)
@@ -2232,6 +2281,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     await _guarded_reply(update, "Analysis konnte nicht aktualisiert werden.")
                     return ConversationHandler.END
                 await _guarded_reply(update, f"Analysis gemerged: {len(parsed_obj)} Key(s).")
+                await message.reply_text("Reply-Keyboard geschlossen.", reply_markup=ReplyKeyboardRemove())
                 if raw_chat_id in infobox_targets:
                     app.create_task(_push_infobox_update(raw_chat_id, heading="Analysis-JSON gemerged"), update=None)
                 return ConversationHandler.END
@@ -2277,6 +2327,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _guarded_reply(update, "Analysis konnte nicht aktualisiert werden.")
             return ConversationHandler.END
         await _guarded_reply(update, f"Analysis aktualisiert: {key}={value}")
+        await message.reply_text("Reply-Keyboard geschlossen.", reply_markup=ReplyKeyboardRemove())
         if raw_chat_id in infobox_targets:
             app.create_task(_push_infobox_update(raw_chat_id, heading=f"Analysis-Key gesetzt: {key}"), update=None)
         return ConversationHandler.END
@@ -2380,6 +2431,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(analysis_input_start, pattern=r"^ma:(ak|a\+):"),
+                CallbackQueryHandler(analysis_input_start, pattern=r"^ma:ae:"),
                 CallbackQueryHandler(analysis_edit_start, pattern=r"^me:edit:"),
             ],
             states={
