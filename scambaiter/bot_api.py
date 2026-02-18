@@ -1730,7 +1730,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
             directive_delete_batch_seq["value"] += 1
-            batch_id = f"{chat_id}:{directive_delete_batch_seq['value']}"
+            # Keep batch_id delimiter-safe for callback_data parsing (":" is used as separator).
+            batch_id = f"{chat_id}-{directive_delete_batch_seq['value']}"
             created_messages: list[tuple[int, int]] = []
 
             cancel_message = await context.bot.send_message(
