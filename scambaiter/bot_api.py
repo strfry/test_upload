@@ -46,6 +46,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
     prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
+    directive_delete_batches: dict[str, list[tuple[int, int]]] = {}
+    directive_delete_batch_seq = {"value": 0}
     anti_loop_preset_text = (
         "Allgemeine Anti-Loop-Regel: "
         "Ermittle pro Turn den Kern-Intent der letzten Assistant-Nachricht "
@@ -579,15 +581,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 InlineKeyboardButton("💬 Zu Chats", callback_data="ml:0"),
             ]
         )
-        return InlineKeyboardMarkup(rows)
-
-    def _directive_delete_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
-        directives = service.list_chat_directives(chat_id, active_only=True, limit=10)
-        rows: list[list[InlineKeyboardButton]] = []
-        for item in directives:
-            label = f"Loeschen #{item.id}"
-            rows.append([InlineKeyboardButton(label, callback_data=f"md:del:{chat_id}:{page}:{item.id}")])
-        rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
 
     def _as_boolish(value: object) -> bool:
@@ -1438,25 +1431,41 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         if data.startswith("md:"):
             try:
-                _prefix, op, chat_id_raw, page_raw, directive_id_raw = data.split(":")
+                _prefix, op, chat_id_raw, page_raw, target_raw = data.split(":")
                 chat_id = int(chat_id_raw)
                 page = int(page_raw)
-                directive_id = int(directive_id_raw)
             except (ValueError, IndexError):
                 await _safe_edit_message(query, "Ungueltige Aktion.")
                 return
+
+            if op == "cancel":
+                batch_id = target_raw.strip()
+                entries = directive_delete_batches.pop(batch_id, [])
+                if not entries:
+                    await _safe_edit_message(query, "Direktiven-Liste bereits geschlossen oder abgelaufen.")
+                    return
+                for msg_chat_id, msg_id in entries:
+                    try:
+                        await context.bot.delete_message(chat_id=int(msg_chat_id), message_id=int(msg_id))
+                    except BadRequest:
+                        pass
+                return
+
             if op != "del":
                 await _safe_edit_message(query, "Ungueltige Aktion.")
                 return
+            try:
+                directive_id = int(target_raw)
+            except ValueError:
+                await _safe_edit_message(query, "Ungueltige Direktiven-ID.")
+                return
             deleted = service.delete_chat_directive(chat_id=chat_id, directive_id=directive_id)
-            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
-            heading = (
-                f"Direktive #{directive_id} geloescht."
-                if deleted
-                else f"Direktive #{directive_id} nicht gefunden."
-            )
-            text, keyboard = await _render_chat_detail(chat_id, page, heading=heading, compact=is_card)
-            await _safe_edit_message(query, text, reply_markup=keyboard)
+            if deleted:
+                await _safe_edit_message(query, f"✅ Direktive #{directive_id} geloescht.")
+            else:
+                await _safe_edit_message(query, f"⚠️ Direktive #{directive_id} nicht gefunden.")
+            if chat_id in infobox_targets:
+                app.create_task(_push_infobox_update(chat_id, heading="Direktive aktualisiert."), update=None)
             return
 
         if data.startswith("me:"):
@@ -1720,12 +1729,40 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
-            lines = [f"Chat {chat_id}", "", "Direktiven löschen:"]
+            directive_delete_batch_seq["value"] += 1
+            batch_id = f"{chat_id}:{directive_delete_batch_seq['value']}"
+            created_messages: list[tuple[int, int]] = []
+
+            cancel_message = await context.bot.send_message(
+                chat_id=allowed_chat_id,
+                text=_limit_message(
+                    f"Direktiven fuer Chat {chat_id} ({len(directives)} Eintraege).\n"
+                    "Abbrechen loescht alle unten erzeugten Direktiven-Nachrichten."
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Abbrechen", callback_data=f"md:cancel:{chat_id}:{page}:{batch_id}")]]
+                ),
+            )
+            created_messages.append((int(cancel_message.chat_id), int(cancel_message.message_id)))
+
             for item in directives:
-                lines.append(f"#{item.id} ({item.scope}) {item.text}")
-            delete_keyboard = _directive_delete_keyboard(chat_id, page)
-            text = _limit_message("\n".join(lines))
-            await _safe_edit_message(query, text, reply_markup=delete_keyboard)
+                msg = await context.bot.send_message(
+                    chat_id=allowed_chat_id,
+                    text=_limit_message(f"#{item.id} ({item.scope})\n{item.text}", max_len=3200),
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("(X) Loeschen", callback_data=f"md:del:{chat_id}:{page}:{item.id}")]]
+                    ),
+                )
+                created_messages.append((int(msg.chat_id), int(msg.message_id)))
+
+            directive_delete_batches[batch_id] = created_messages
+            text, keyboard = await _render_chat_detail(
+                chat_id,
+                page,
+                heading=f"Direktiven als Einzelnachrichten gepostet ({len(directives)}).",
+                compact=is_card,
+            )
+            await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
         if action in {"ad", "a-"}:
