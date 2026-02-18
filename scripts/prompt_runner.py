@@ -43,6 +43,24 @@ def _parse_iso_utc(value: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _parse_optional_message_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    while len(text) >= 2 and ((text[0] == '"' and text[-1] == '"') or (text[0] == "'" and text[-1] == "'")):
+        text = text[1:-1].strip()
+    if not text or not text.isdigit():
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 def _load_input_file(path: Path) -> RunnerInput:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
@@ -62,6 +80,8 @@ def _load_input_file(path: Path) -> RunnerInput:
         role_raw = str(item.get("role", "")).strip().lower()
         sender = str(item.get("sender", "")).strip() or ("self" if role_raw == "assistant" else "user")
         text = str(item.get("text", ""))
+        message_id = _parse_optional_message_id(item.get("message_id"))
+        reply_to = _parse_optional_message_id(item.get("reply_to"))
         if not ts_raw or not isinstance(ts_raw, str):
             raise ValueError(f"messages[{idx}].ts_utc fehlt oder ist ungültig.")
         if role_raw not in {"assistant", "user"}:
@@ -72,6 +92,8 @@ def _load_input_file(path: Path) -> RunnerInput:
                 sender=sender,
                 role=role_raw,  # type: ignore[arg-type]
                 text=text,
+                message_id=message_id,
+                reply_to=reply_to,
             )
         )
 
@@ -148,6 +170,10 @@ def _build_model_messages_without_core(
             "sender": ("self" if item.role == "assistant" else item.sender),
             "text": item.text,
         }
+        if item.message_id is not None:
+            payload["message_id"] = item.message_id
+        if item.reply_to is not None:
+            payload["reply_to"] = item.reply_to
         messages.append({"role": item.role, "content": json.dumps(payload, ensure_ascii=False)})
     return messages
 

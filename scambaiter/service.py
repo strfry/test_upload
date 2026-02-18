@@ -153,6 +153,25 @@ class BackgroundService:
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
 
+    @staticmethod
+    def _coerce_message_id(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        # Handle quoted numeric IDs such as '"123"' or "'123'".
+        while len(text) >= 2 and ((text[0] == '"' and text[-1] == '"') or (text[0] == "'" and text[-1] == "'")):
+            text = text[1:-1].strip()
+        if not text or not text.isdigit():
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
     def list_known_chats(self, limit: int = 50) -> list[KnownChatEntry]:
         items = sorted(
             self._known_chats.values(),
@@ -180,6 +199,14 @@ class BackgroundService:
         if self.store:
             return self.store.list_generation_attempts_for_chat(chat_id=int(chat_id), limit=int(limit))
         return list(self._recent_generation_attempts.get(int(chat_id), []))[: int(limit)]
+
+    def list_recent_generation_attempts(self, limit: int = 30) -> list[StoredGenerationAttempt]:
+        if self.store:
+            return self.store.list_generation_attempts_recent(limit=int(limit))
+        all_items: list[StoredGenerationAttempt] = []
+        for items in self._recent_generation_attempts.values():
+            all_items.extend(items)
+        return sorted(all_items, key=lambda item: item.created_at, reverse=True)[: int(limit)]
 
     def get_general_warnings(self, limit: int = 5) -> list[str]:
         return self._general_warnings[-limit:]
@@ -818,7 +845,7 @@ class BackgroundService:
 
                 if action_type == "send_message":
                     await ensure_mark_read()
-                    reply_to = action.get("reply_to")
+                    reply_to = self._coerce_message_id(action.get("reply_to"))
                     send_at_utc = action.get("send_at_utc")
                     if isinstance(send_at_utc, str) and send_at_utc.strip():
                         delay = self._seconds_until_utc(send_at_utc)
@@ -830,7 +857,7 @@ class BackgroundService:
                                 pending.current_action_until = None
                                 self._notify_pending_changed(chat_id)
                     send_kwargs: dict[str, object] = {}
-                    if isinstance(reply_to, int):
+                    if reply_to is not None:
                         send_kwargs["reply_to"] = reply_to
                     sent_message = await self.core.client.send_message(chat_id, outgoing_text, **send_kwargs)
                     sent_message_id = int(sent_message.id)
@@ -839,9 +866,9 @@ class BackgroundService:
 
                 if action_type == "edit_message":
                     await ensure_mark_read()
-                    message_id = action.get("message_id")
+                    message_id = self._coerce_message_id(action.get("message_id"))
                     new_text = str(action.get("new_text", "")).strip()
-                    if isinstance(message_id, int) and new_text:
+                    if message_id is not None and new_text:
                         try:
                             await self.core.client.edit_message(chat_id, message_id, new_text)
                         except Exception:
