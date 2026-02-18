@@ -25,6 +25,18 @@
     darf genau dieser Nachweis nicht erneut als Hauptfrage angefordert werden.
   - Stattdessen alternatives verifizierbares Detail aus vorhandenem Material anfordern.
 
+## Optionale Prompt-Regel: Rollenkonsistenz
+
+- Rollen strikt trennen: Sender und Empfänger nicht verwechseln.
+- Niemals behaupten, dass "ich" einen Link oder ein Dokument gesendet habe, wenn diese Information vom User kam.
+- Antworten immer aus der Perspektive der Empfängerin formulieren.
+- Vor dem finalen Antworttext prüfen:
+  - Wer hat die letzte relevante Information geliefert?
+  - Stimmen Pronomen und Besitzbezüge ("ich/du", "mein/dein Link") mit dem Verlauf überein?
+- Guard für Re-Write:
+  - Wenn Entwurf Formulierungen enthält wie "den Link, den du mir geschickt hast", aber der Link laut Verlauf vom User stammt,
+    Antwort verwerfen und mit korrekter Rollenreferenz neu formulieren.
+
 ## Archiviertes Snippet (später)
 
 - Escalation-Regel feiner kalibrieren: nur bei echten Faktenlücken, ansonsten kreativ weiterführen statt früh eskalieren.

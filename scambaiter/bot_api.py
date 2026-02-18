@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest
@@ -31,6 +32,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
     prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
+    directive_preset_cache: dict[int, tuple[int, list[tuple[str, str]]]] = {}
     anti_loop_preset_text = (
         "Allgemeine Anti-Loop-Regel: "
         "Ermittle pro Turn den Kern-Intent der letzten Assistant-Nachricht "
@@ -43,6 +45,35 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         "Wenn User sagt, dass ein Nachweis nicht verfügbar ist (z.B. nicht auf der Website), "
         "darf genau dieser Nachweis nicht erneut als Hauptfrage angefordert werden; "
         "stattdessen alternatives verifizierbares Detail aus vorhandenem Material anfordern."
+    )
+    role_consistency_preset_text = (
+        "Rollenkonsistenz: Sender und Empfaenger niemals verwechseln. "
+        "Nicht behaupten, dass ich einen Link oder ein Dokument gesendet habe, wenn es vom User kam. "
+        "Vor Versand pruefen: Wer lieferte die letzte relevante Information, und stimmen "
+        "ich/du sowie mein/dein-Referenzen mit dem Verlauf ueberein."
+    )
+    last_user_priority_preset_text = (
+        "Last-User-Priority: Die naechste Nachricht muss primaer auf die juengste User-Aussage reagieren "
+        "und darf nicht auf ein altes Hauptthema zurueckfallen."
+    )
+    no_repeat_public_page_preset_text = (
+        "Wenn User sagt, dass bestimmte Details nicht auf der Website stehen, dieselbe Frage nach "
+        "oeffentlicher Seite/Link/fee page nicht erneut als Hauptfrage stellen. "
+        "Stattdessen ein anderes verifizierbares Detail anfordern."
+    )
+    contract_detail_drilldown_preset_text = (
+        "Bei fehlender Website-Transparenz auf Vertragsdetails wechseln: "
+        "genau eine konkrete Klausel/Zeile anfordern (Gebuehr, Laufzeit, Auszahlung, Kuendigung, Haftung), "
+        "nicht erneut allgemeine Link-Anfrage."
+    )
+    no_premature_registration_preset_text = (
+        "Keine fruehe Zustimmung zu Registrierung/Einzahlung. "
+        "Wenn User zum sofortigen Registrieren draengt, zuerst ein konkretes pruefbares Detail anfordern "
+        "und den naechsten Schritt klar absichern."
+    )
+    analysis_memory_preset_text = (
+        "Analysis-Memory nutzen: Bei Wiederholungsgefahr in analysis setzen "
+        "loop_guard_active=true, repeated_intent, next_intent und blocked_intents_next_turns (2 Turns)."
     )
 
     def _authorized(update: Update) -> bool:
@@ -393,7 +424,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     InlineKeyboardButton("➖ Dir", callback_data=f"ma:dl:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("🧩 Preset", callback_data=f"ma:dpal:{chat_id}:{page}"),
+                    InlineKeyboardButton("🧩 Presets", callback_data=f"ma:dp:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("✏️ An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
@@ -548,6 +579,109 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             rows.append([InlineKeyboardButton(label, callback_data=f"md:del:{chat_id}:{page}:{item.id}")])
         rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
+
+    def _directive_preset_keyboard(chat_id: int, page: int, presets: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        for idx, (label, _text) in enumerate(presets):
+            button_label = f"{idx + 1}. {_truncate_value(label, max_len=30)}"
+            rows.append([InlineKeyboardButton(button_label, callback_data=f"mp:add:{chat_id}:{page}:{idx}")])
+        rows.append(
+            [
+                InlineKeyboardButton("🔄 Neu generieren", callback_data=f"mp:regen:{chat_id}:{page}:0"),
+                InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mp:back:{chat_id}:{page}:0"),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    def _directive_preset_card_text(chat_id: int, presets: list[tuple[str, str]]) -> str:
+        lines = [
+            f"Chat {chat_id}",
+            "",
+            f"Directive Presets (dynamisch, {len(presets)} Vorschlaege):",
+        ]
+        for idx, (label, text) in enumerate(presets, start=1):
+            lines.append(f"{idx}. {label}")
+            lines.append("   " + _truncate_value(text, max_len=170))
+        lines.append("")
+        lines.append("Waehle einen Vorschlag per Button. Er wird als Session-Direktive gespeichert.")
+        lines.append("Hinweis: Wirkung kann ueber previous_analysis erhalten bleiben.")
+        return _limit_message("\n".join(lines), max_len=3300)
+
+    def _as_boolish(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y"}
+        return False
+
+    async def _build_directive_presets(chat_id: int, limit: int = 7) -> list[tuple[str, str]]:
+        latest_analysis: dict[str, object] = {}
+        if service.store:
+            latest = service.store.latest_for_chat(chat_id)
+            if latest and isinstance(latest.analysis, dict):
+                latest_analysis = dict(latest.analysis)
+
+        chat_context = await service.core.build_chat_context(chat_id)
+        last_user_text = ""
+        last_assistant_text = ""
+        if chat_context and chat_context.messages:
+            for item in reversed(chat_context.messages):
+                if not last_user_text and item.role == "user":
+                    last_user_text = item.text.strip()
+                if not last_assistant_text and item.role == "assistant":
+                    last_assistant_text = item.text.strip()
+                if last_user_text and last_assistant_text:
+                    break
+
+        active_directives = service.list_chat_directives(chat_id, active_only=True, limit=50)
+        active_norm = {" ".join(item.text.lower().split()) for item in active_directives}
+        seen_norm: set[str] = set()
+        candidates: list[tuple[str, str]] = []
+
+        def add_candidate(label: str, text: str, when: bool = True) -> None:
+            if not when:
+                return
+            norm = " ".join(text.lower().split())
+            if norm in seen_norm or norm in active_norm:
+                return
+            seen_norm.add(norm)
+            candidates.append((label, text))
+
+        last_user_l = last_user_text.lower()
+        last_assistant_l = last_assistant_text.lower()
+        combined = " ".join(
+            [
+                last_user_l,
+                last_assistant_l,
+                json.dumps(latest_analysis, ensure_ascii=False).lower() if latest_analysis else "",
+            ]
+        )
+        user_no_website = bool(
+            re.search(
+                r"(not stated.*website|not on (the )?website|already explained|steht nicht.*website)",
+                last_user_l,
+            )
+        )
+        asks_public_link_again = any(token in last_assistant_l for token in ("link", "website", "fee", "terms", "page"))
+        mentions_contract = any(token in combined for token in ("contract", "agreement", "klausel", "vertrag"))
+        registration_push = any(
+            token in last_user_l for token in ("register", "sign up", "open account", "verify account", "deposit now")
+        )
+        link_received = _as_boolish(latest_analysis.get("link_received")) or _as_boolish(latest_analysis.get("received_link"))
+
+        add_candidate("Anti-Loop (General)", anti_loop_preset_text, when=True)
+        add_candidate("Role Consistency", role_consistency_preset_text, when=True)
+        add_candidate("Latest User First", last_user_priority_preset_text, when=True)
+        add_candidate(
+            "No Re-Ask Public Page",
+            no_repeat_public_page_preset_text,
+            when=(user_no_website or (asks_public_link_again and link_received)),
+        )
+        add_candidate("Contract Detail Drilldown", contract_detail_drilldown_preset_text, when=(mentions_contract or user_no_website))
+        add_candidate("No Early Registration", no_premature_registration_preset_text, when=registration_push)
+        add_candidate("Analysis Loop Memory", analysis_memory_preset_text, when=True)
+
+        return candidates[: max(1, min(limit, 7))]
 
     def _encode_key_token(key: str) -> str:
         raw = key.encode("utf-8")
@@ -1102,6 +1236,68 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, "Unbekannte Tool-Aktion.")
             return
 
+        if data.startswith("mp:"):
+            try:
+                _prefix, op, chat_id_raw, page_raw, idx_raw = data.split(":")
+                chat_id = int(chat_id_raw)
+                page = int(page_raw)
+                idx = int(idx_raw)
+            except (ValueError, IndexError):
+                await _safe_edit_message(query, "Ungueltige Preset-Aktion.")
+                return
+
+            if op == "back":
+                is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+                text, keyboard = await _render_chat_detail(chat_id, page, compact=is_card)
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+
+            if op == "regen":
+                presets = await _build_directive_presets(chat_id, limit=7)
+                directive_preset_cache[chat_id] = (page, presets)
+                text = _directive_preset_card_text(chat_id, presets)
+                keyboard = _directive_preset_keyboard(chat_id, page, presets)
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+
+            if op == "add":
+                cached = directive_preset_cache.get(chat_id)
+                if not cached:
+                    await _safe_edit_message(query, "Preset-Liste ist abgelaufen. Bitte Presets erneut oeffnen.")
+                    return
+                _cached_page, presets = cached
+                if idx < 0 or idx >= len(presets):
+                    await _safe_edit_message(query, "Ungueltiger Preset-Index.")
+                    return
+                label, preset_text = presets[idx]
+                created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="session")
+                is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+                if not created:
+                    text, keyboard = await _render_chat_detail(
+                        chat_id,
+                        page,
+                        heading="Preset konnte nicht gespeichert werden.",
+                        compact=is_card,
+                    )
+                    await _safe_edit_message(query, text, reply_markup=keyboard)
+                    return
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading=(
+                        f"Preset hinzugefuegt: {label} (session). "
+                        "Hinweis: Wirkung kann ueber previous_analysis/analysis-Keys erhalten bleiben."
+                    ),
+                    compact=is_card,
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                if chat_id in infobox_targets:
+                    app.create_task(_push_infobox_update(chat_id, heading=f"Directive Preset hinzugefuegt: {label}"), update=None)
+                return
+
+            await _safe_edit_message(query, "Unbekannte Preset-Aktion.")
+            return
+
         if data.startswith("ml:"):
             try:
                 page = int(data.split(":")[1])
@@ -1394,7 +1590,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 text, keyboard = await _render_chat_detail(
                     chat_id,
                     page,
-                    heading="Kein überspringbarer Schritt aktiv.",
+                    heading="Keine überspringbare Wartezeit aktiv.",
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -1402,7 +1598,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             text, keyboard = await _render_chat_detail(
                 chat_id,
                 page,
-                heading="Aktueller Schritt wird übersprungen.",
+                heading="Aktuelle Wartezeit wird übersprungen.",
                 compact=is_card,
             )
             await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -1513,34 +1709,12 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, text, reply_markup=delete_keyboard)
             return
 
-        if action == "dpal":
-            created = service.add_chat_directive(
-                chat_id=chat_id,
-                text=anti_loop_preset_text,
-                scope="session",
-            )
-            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
-            if not created:
-                text, keyboard = await _render_chat_detail(
-                    chat_id,
-                    page,
-                    heading="Preset konnte nicht gespeichert werden.",
-                    compact=is_card,
-                )
-                await _safe_edit_message(query, text, reply_markup=keyboard)
-                return
-            text, keyboard = await _render_chat_detail(
-                chat_id,
-                page,
-                heading=(
-                    "Preset aktiviert: Anti-Loop (General) als Session-Direktive. "
-                    "Hinweis: Persistenzwirkung erfolgt ueber previous_analysis/analysis-Keys."
-                ),
-                compact=is_card,
-            )
+        if action == "dp":
+            presets = await _build_directive_presets(chat_id, limit=7)
+            directive_preset_cache[chat_id] = (page, presets)
+            text = _directive_preset_card_text(chat_id, presets)
+            keyboard = _directive_preset_keyboard(chat_id, page, presets)
             await _safe_edit_message(query, text, reply_markup=keyboard)
-            if chat_id in infobox_targets:
-                app.create_task(_push_infobox_update(chat_id, heading="Directive Preset hinzugefuegt."), update=None)
             return
 
         if action in {"ad", "a-"}:
@@ -2064,5 +2238,5 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             allow_reentry=True,
         )
     )
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|pp|mt|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|mp|pp|mt|generate|send|stop|autoon|autooff|img|kv):"))
     return app
