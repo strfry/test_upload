@@ -2020,7 +2020,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             "chat_id": chat_id,
             "page": page,
             "preset_map": preset_map,
-            "preset_values": [item[1] for item in presets],
         }
         is_card = bool(getattr(getattr(query, "message", None), "photo", None))
         text, keyboard = await _render_chat_detail(
@@ -2083,31 +2082,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await message.reply_text("Direktiven-Editor beendet.", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
         preset_map_raw = target.get("preset_map")
-        preset_values_raw = target.get("preset_values")
-        selected_preset_index: int | None = None
         if isinstance(preset_map_raw, dict):
             preset_text = preset_map_raw.get(text)
             if isinstance(preset_text, str) and preset_text.strip():
                 text = preset_text.strip()
-                # Recover ordinal from button prefix "N. ...", if present.
-                ord_match = re.match(r"^\s*(\d+)\.", str(text))
-                if ord_match:
-                    try:
-                        selected_preset_index = int(ord_match.group(1))
-                    except ValueError:
-                        selected_preset_index = None
-        if isinstance(preset_values_raw, list):
-            ordinal_match = re.match(r"^\s*(\d+)\.", text)
-            if ordinal_match:
-                try:
-                    ord_idx = int(ordinal_match.group(1))
-                except ValueError:
-                    ord_idx = 0
-                if 1 <= ord_idx <= len(preset_values_raw):
-                    raw_candidate = preset_values_raw[ord_idx - 1]
-                    if isinstance(raw_candidate, str) and raw_candidate.strip():
-                        text = raw_candidate.strip()
-                        selected_preset_index = ord_idx
         if not text or text.startswith("/"):
             await _guarded_reply(update, "Bitte Direktive als normalen Text senden (ohne Slash-Befehl).")
             return directive_input_state
@@ -2118,11 +2096,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if not created:
             await _guarded_reply(update, "Direktive konnte nicht gespeichert werden.")
             return ConversationHandler.END
-        prefix = f"Direktive gespeichert (Preset {selected_preset_index})" if selected_preset_index else "Direktive gespeichert"
-        await message.reply_text(
-            f"{prefix}: #{created.id} ({created.scope}) {created.text}",
-            reply_markup=ReplyKeyboardRemove(),
+        await _guarded_reply(
+            update,
+            f"Direktive gespeichert: #{created.id} ({created.scope}) {created.text}",
         )
+        await message.reply_text("Reply-Keyboard geschlossen.", reply_markup=ReplyKeyboardRemove())
         if chat_id in infobox_targets:
             app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt."), update=None)
         return ConversationHandler.END
