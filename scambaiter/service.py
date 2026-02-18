@@ -115,7 +115,8 @@ class BackgroundService:
         pending = self._pending_messages.get(chat_id)
         if not pending or pending.state != MessageState.SENDING_TYPING:
             return False
-        if pending.current_action_label not in {"simulate_typing", "wait"}:
+        # "Skip" is intended to skip explicit waiting only, not typing simulation.
+        if pending.current_action_label != "wait":
             return False
         self._skip_current_action.add(int(chat_id))
         return True
