@@ -123,14 +123,13 @@ async def run() -> None:
         )
         await bot_app.initialize()
         await bot_app.start()
+        register_command_menu = bot_app.bot_data.get("register_command_menu")
+        if callable(register_command_menu):
+            await register_command_menu()
         await bot_app.updater.start_polling()
         service.start_startup_bootstrap()
         service.start_periodic_run()
-        send_start_menu = bot_app.bot_data.get("send_start_menu")
-        if callable(send_start_menu):
-            await send_start_menu()
-        else:
-            await bot_app.bot.send_message(chat_id=control_chat_id, text="Scambaiter Bot gestartet. /chats")
+        await bot_app.bot.send_message(chat_id=control_chat_id, text="⚠️ Server wurde neugestartet.")
         try:
             while True:
                 await asyncio.sleep(3600)

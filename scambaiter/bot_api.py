@@ -5,7 +5,7 @@ import json
 import math
 import re
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -2201,7 +2201,24 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             bring_to_front=True,
         )
 
+    async def register_command_menu() -> None:
+        commands = [
+            BotCommand("chats", "Chat-Übersicht öffnen"),
+            BotCommand("runonce", "Einmaldurchlauf starten"),
+            BotCommand("retries", "Letzte Retries anzeigen"),
+            BotCommand("history", "Persistierte History anzeigen"),
+            BotCommand("last", "Letzte Vorschläge anzeigen"),
+            BotCommand("promptpreview", "Prompt-Preview für Chat-ID"),
+            BotCommand("analysisget", "Analysis für Chat-ID anzeigen"),
+            BotCommand("analysisset", "Analysis für Chat-ID setzen"),
+        ]
+        try:
+            await app.bot.set_my_commands(commands=commands, scope=BotCommandScopeChat(chat_id=allowed_chat_id))
+        except Exception as exc:
+            service.add_general_warning(f"Command-Menü konnte nicht gesetzt werden: {exc}")
+
     app.bot_data["send_start_menu"] = send_start_menu
+    app.bot_data["register_command_menu"] = register_command_menu
 
     app.add_handler(CommandHandler("runonce", run_once))
     app.add_handler(CommandHandler("chats", chats))
