@@ -734,6 +734,77 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
 
+    def _analysis_demo_keyboard(
+        chat_id: int,
+        page: int,
+        mode: str,
+        keys: list[str],
+        key_offset: int,
+        page_size: int = 6,
+    ) -> InlineKeyboardMarkup:
+        normalized_mode = mode if mode in {"edit", "delete"} else "edit"
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton("➕ Neu", callback_data=f"ma:ak:{chat_id}:{page}"),
+                InlineKeyboardButton("✏️ Edit", callback_data=f"ax:edit:{chat_id}:{page}:0"),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"ax:delete:{chat_id}:{page}:0"),
+            ]
+        ]
+
+        start = max(0, key_offset)
+        total = len(keys)
+        current = keys[start : start + page_size]
+        for key_name in current:
+            token = _encode_key_token(key_name)
+            if normalized_mode == "delete":
+                label = _truncate_value(f"Del {key_name}", max_len=30)
+                callback = f"me:del:{chat_id}:{page}:{token}"
+            else:
+                label = _truncate_value(f"Edit {key_name}", max_len=30)
+                callback = f"me:edit:{chat_id}:{page}:{token}"
+            rows.append([InlineKeyboardButton(label, callback_data=callback)])
+
+        nav_row: list[InlineKeyboardButton] = []
+        if start > 0:
+            prev_offset = max(0, start - page_size)
+            nav_row.append(InlineKeyboardButton("⬅️ Keys", callback_data=f"ax:{normalized_mode}:{chat_id}:{page}:{prev_offset}"))
+        if start + page_size < total:
+            next_offset = start + page_size
+            nav_row.append(InlineKeyboardButton("➡️ Keys", callback_data=f"ax:{normalized_mode}:{chat_id}:{page}:{next_offset}"))
+        if nav_row:
+            rows.append(nav_row)
+
+        rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
+        return InlineKeyboardMarkup(rows)
+
+    def _analysis_demo_text(chat_id: int, mode: str, keys: list[str], key_offset: int, page_size: int = 6) -> str:
+        normalized_mode = mode if mode in {"edit", "delete"} else "edit"
+        mode_label = "Edit" if normalized_mode == "edit" else "Delete"
+        total = len(keys)
+        start = max(0, key_offset)
+        end = min(total, start + page_size)
+        lines = [
+            f"Chat {chat_id}",
+            "",
+            "Analysis Editor Demo (Inline Buttons)",
+            f"Modus: {mode_label}",
+            f"Keys: {total} | Seite: {((start // page_size) + 1) if total else 1}",
+            "",
+            "Buttons testen:",
+            "- `Neu` startet key=value / JSON Eingabe",
+            "- `Edit/Delete` schaltet den Modus",
+            "- Key-Buttons arbeiten direkt auf vorhandenen Keys",
+        ]
+        if total:
+            lines.append("")
+            lines.append("Sichtbare Keys:")
+            for key_name in keys[start:end]:
+                lines.append(f"- {key_name}")
+        else:
+            lines.append("")
+            lines.append("Noch keine Analysis-Keys vorhanden.")
+        return _limit_message("\n".join(lines))
+
     def _format_pending_state(pending: PendingMessage | None) -> str:
         if not pending:
             return "Status: Kein Prozesszustand vorhanden."
@@ -1301,6 +1372,30 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, "Unbekannte Preset-Aktion.")
             return
 
+        if data.startswith("ax:"):
+            try:
+                _prefix, mode_raw, chat_id_raw, page_raw, offset_raw = data.split(":")
+                mode = mode_raw.strip().lower()
+                chat_id = int(chat_id_raw)
+                page = int(page_raw)
+                key_offset = int(offset_raw)
+            except (ValueError, IndexError):
+                await _safe_edit_message(query, "Ungueltige Analysis-Demo-Aktion.")
+                return
+            latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
+            analysis_data = latest_entry.analysis if latest_entry else None
+            keys = [str(key) for key in analysis_data.keys()] if isinstance(analysis_data, dict) else []
+            text = _analysis_demo_text(chat_id=chat_id, mode=mode, keys=keys, key_offset=key_offset)
+            keyboard = _analysis_demo_keyboard(
+                chat_id=chat_id,
+                page=page,
+                mode=mode,
+                keys=keys,
+                key_offset=key_offset,
+            )
+            await _safe_edit_message(query, text, reply_markup=keyboard)
+            return
+
         if data.startswith("ml:"):
             try:
                 page = int(data.split(":")[1])
@@ -1743,22 +1838,16 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if action in {"ae"}:
             latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
             analysis_data = latest_entry.analysis if latest_entry else None
-            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
-            lines = [f"Chat {chat_id}", "", "Analysis Editor"]
-            if isinstance(analysis_data, dict) and analysis_data:
-                for key in list(analysis_data.keys())[:10]:
-                    value = _truncate_value(str(analysis_data.get(key)), max_len=40)
-                    lines.append(f"- {key} = {value}")
-            else:
-                lines.append("Noch keine Analysis-Keys vorhanden.")
-            lines.append("")
-            lines.append("Neu: `Neu` drücken und `key=value` senden.")
-            lines.append("Edit: `Edit <key>` drücken und neuen Wert senden.")
-            lines.append("Loeschen: `Loeschen` drücken.")
-            text = _limit_message("\n".join(lines))
-            if is_card:
-                text = _limit_caption(text)
-            await _safe_edit_message(query, text, reply_markup=_analysis_editor_keyboard(chat_id, page))
+            keys = [str(key) for key in analysis_data.keys()] if isinstance(analysis_data, dict) else []
+            text = _analysis_demo_text(chat_id=chat_id, mode="edit", keys=keys, key_offset=0)
+            keyboard = _analysis_demo_keyboard(
+                chat_id=chat_id,
+                page=page,
+                mode="edit",
+                keys=keys,
+                key_offset=0,
+            )
+            await _safe_edit_message(query, text, reply_markup=keyboard)
             return
 
         if action == "p":
@@ -2302,5 +2391,5 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             allow_reentry=True,
         )
     )
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|mp|pp|mt|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|mp|ax|pp|mt|generate|send|stop|autoon|autooff|img|kv):"))
     return app
