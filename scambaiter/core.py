@@ -209,6 +209,8 @@ class ChatMessage:
     sender: str
     role: Literal["assistant", "user"]
     text: str
+    message_id: int | None = None
+    reply_to: int | None = None
 
 
 @dataclass
@@ -367,7 +369,7 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
     analysis_value = data.get("analysis")
     if not isinstance(analysis_value, dict):
         return None
-    analysis: dict[str, object] = analysis_value
+    analysis = normalize_analysis_value_types(analysis_value)
 
     metadata: dict[str, str] = {}
     for top_level_key in ("schema",):
@@ -415,6 +417,32 @@ def normalize_action_shape(action: object) -> dict[str, object] | None:
                     normalized[str(k)] = v
             return normalized
     return dict(action)
+
+
+def normalize_analysis_value_types(value: object) -> dict[str, object]:
+    normalized = _normalize_analysis_scalar_or_container(value)
+    if isinstance(normalized, dict):
+        return normalized
+    return {}
+
+
+def _normalize_analysis_scalar_or_container(value: object) -> object:
+    if isinstance(value, dict):
+        normalized_dict: dict[str, object] = {}
+        for key, item in value.items():
+            normalized_dict[str(key)] = _normalize_analysis_scalar_or_container(item)
+        return normalized_dict
+    if isinstance(value, list):
+        return [_normalize_analysis_scalar_or_container(item) for item in value]
+    if isinstance(value, str):
+        stripped = value.strip()
+        lowered = stripped.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        return value
+    return value
 
 
 def normalize_iso_utc(value: str) -> str | None:
@@ -672,6 +700,10 @@ class ScambaiterCore:
                 "sender": ("self" if item.role == "assistant" else item.sender),
                 "text": item.text,
             }
+            if item.message_id is not None:
+                event_payload["message_id"] = item.message_id
+            if item.reply_to is not None:
+                event_payload["reply_to"] = item.reply_to
             messages.append({"role": item.role, "content": json.dumps(event_payload, ensure_ascii=False)})
 
         return messages
@@ -825,6 +857,9 @@ class ScambaiterCore:
         is_own_message = message.sender_id == my_id
         sender = "Ich" if is_own_message else dialog_title
         role: Literal["assistant", "user"] = "assistant" if is_own_message else "user"
+        message_id_raw = getattr(message, "id", None)
+        message_id = int(message_id_raw) if isinstance(message_id_raw, int) else None
+        reply_to = self._extract_reply_to_message_id(message)
 
         document = getattr(message, "document", None)
         mime_type = getattr(document, "mime_type", "") if document else ""
@@ -844,12 +879,44 @@ class ScambaiterCore:
                 self._debug(f"Bildbeschreibung fehlgeschlagen (msg_id={message.id}): {exc}")
 
             if text:
-                return ChatMessage(timestamp=message.date, sender=sender, role=role, text=f"{marker} {text}")
-            return ChatMessage(timestamp=message.date, sender=sender, role=role, text=marker)
+                return ChatMessage(
+                    timestamp=message.date,
+                    sender=sender,
+                    role=role,
+                    text=f"{marker} {text}",
+                    message_id=message_id,
+                    reply_to=reply_to,
+                )
+            return ChatMessage(
+                timestamp=message.date,
+                sender=sender,
+                role=role,
+                text=marker,
+                message_id=message_id,
+                reply_to=reply_to,
+            )
 
         if text:
-            return ChatMessage(timestamp=message.date, sender=sender, role=role, text=text)
+            return ChatMessage(
+                timestamp=message.date,
+                sender=sender,
+                role=role,
+                text=text,
+                message_id=message_id,
+                reply_to=reply_to,
+            )
 
+        return None
+
+    @staticmethod
+    def _extract_reply_to_message_id(message: object) -> int | None:
+        direct = getattr(message, "reply_to_msg_id", None)
+        if isinstance(direct, int):
+            return direct
+        nested = getattr(message, "reply_to", None)
+        nested_id = getattr(nested, "reply_to_msg_id", None) if nested is not None else None
+        if isinstance(nested_id, int):
+            return nested_id
         return None
 
     def generate_suggestion(self, context: ChatContext) -> str:
@@ -1446,6 +1513,39 @@ def format_model_exception_details(exc: Exception) -> str:
         status = getattr(response, "status_code", None)
         if status is not None:
             parts.append(f"status_code={status}")
+        url = getattr(response, "url", None)
+        if url:
+            parts.append(f"response_url={url}")
+        request = getattr(response, "request", None)
+        if request is not None:
+            method = getattr(request, "method", None)
+            request_url = getattr(request, "url", None)
+            if method:
+                parts.append(f"request_method={method}")
+            if request_url:
+                parts.append(f"request_url={request_url}")
+        headers = getattr(response, "headers", None)
+        if headers:
+            header_dict: dict[str, str] = {}
+            for key, value in headers.items():
+                key_l = str(key).lower()
+                if key_l in {
+                    "x-request-id",
+                    "x-amzn-requestid",
+                    "x-amz-request-id",
+                    "x-trace-id",
+                    "cf-ray",
+                    "content-type",
+                    "content-length",
+                    "date",
+                    "server",
+                }:
+                    header_dict[str(key)] = str(value)
+            if header_dict:
+                parts.append(
+                    "response_headers="
+                    + truncate_for_log(json.dumps(header_dict, ensure_ascii=False), max_len=1200)
+                )
         try:
             payload = response.json()
             failed_generation = _find_key_deep(payload, "failed_generation")
@@ -1453,9 +1553,14 @@ def format_model_exception_details(exc: Exception) -> str:
                 parts.append(f"failed_generation={truncate_for_log(str(failed_generation), max_len=2500)}")
             parts.append(f"response_json={truncate_for_log(json.dumps(payload, ensure_ascii=False), max_len=2500)}")
         except Exception:
-            text = getattr(response, "text", None)
-            if text:
-                parts.append(f"response_text={truncate_for_log(str(text), max_len=2500)}")
+            pass
+
+        text = getattr(response, "text", None)
+        if text:
+            parts.append(f"response_text={truncate_for_log(str(text), max_len=2500)}")
+        content = getattr(response, "content", None)
+        if isinstance(content, (bytes, bytearray)) and content:
+            parts.append(f"response_content_bytes={truncate_for_log(repr(bytes(content)), max_len=1200)}")
 
     stack = "".join(traceback.format_exception_only(type(exc), exc)).strip()
     if stack:
