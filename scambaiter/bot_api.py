@@ -42,6 +42,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     analysis_reply_kb_keyvalue = "🧩 key=value"
     analysis_reply_kb_json = "🧱 JSON merge"
     analysis_reply_kb_cancel = "❌ Abbrechen"
+    directive_reply_kb_custom = "✍️ Eigener Text"
+    directive_reply_kb_cancel = "❌ Abbrechen"
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
     prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
@@ -2071,22 +2073,57 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return ConversationHandler.END
         if action not in {"da", "d+"}:
             return ConversationHandler.END
-        context.user_data["directive_target"] = {"chat_id": chat_id, "page": page}
+        presets = await _build_directive_presets(chat_id, limit=6)
+        preset_buttons: list[str] = []
+        preset_map: dict[str, str] = {}
+        for idx, (label, preset_text) in enumerate(presets, start=1):
+            button_label = f"🧩 Preset {idx}"
+            preset_buttons.append(button_label)
+            preset_map[button_label] = preset_text
+        context.user_data["directive_target"] = {
+            "chat_id": chat_id,
+            "page": page,
+            "preset_map": preset_map,
+        }
         is_card = bool(getattr(getattr(query, "message", None), "photo", None))
         text, keyboard = await _render_chat_detail(
             chat_id,
             page,
-            heading="Direktive hinzufügen: Bitte jetzt eine normale Textnachricht senden (oder /cancel).",
+            heading="Direktive hinzufügen: unten Preset wählen oder eigenen Text senden (/cancel).",
             compact=is_card,
         )
         await _safe_edit_message(query, text, reply_markup=keyboard)
+        rows: list[list[KeyboardButton]] = []
+        for idx in range(0, len(preset_buttons), 2):
+            rows.append([KeyboardButton(item) for item in preset_buttons[idx : idx + 2]])
+        rows.append([KeyboardButton(directive_reply_kb_custom), KeyboardButton(directive_reply_kb_cancel)])
+        reply_keyboard = ReplyKeyboardMarkup(
+            keyboard=rows,
+            resize_keyboard=True,
+            one_time_keyboard=False,
+            input_field_placeholder="Preset wählen oder Direktive eingeben…",
+        )
+        info_lines = ["Direktiven-Presets (Demo):"]
+        for idx, (label, preset_text) in enumerate(presets, start=1):
+            info_lines.append(f"- 🧩 Preset {idx}: {_truncate_value(label, max_len=60)}")
+            info_lines.append(f"  {_truncate_value(preset_text, max_len=120)}")
+        info_lines.append("- ✍️ Eigener Text: manuelle Direktive senden")
+        info_lines.append("- ❌ Abbrechen: Eingabe beenden")
+        await context.bot.send_message(
+            chat_id=allowed_chat_id,
+            text=_limit_message("\n".join(info_lines), max_len=3000),
+            reply_markup=reply_keyboard,
+        )
         return directive_input_state
 
     async def directive_input_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not _authorized(update):
             return ConversationHandler.END
         context.user_data.pop("directive_target", None)
-        await _guarded_reply(update, "Direktiven-Eingabe abgebrochen.")
+        if update.message:
+            await update.message.reply_text("Direktiven-Eingabe abgebrochen.", reply_markup=ReplyKeyboardRemove())
+        else:
+            await _guarded_reply(update, "Direktiven-Eingabe abgebrochen.")
         return ConversationHandler.END
 
     async def directive_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2104,6 +2141,18 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             context.user_data.pop("directive_target", None)
             return ConversationHandler.END
         text = message.text.strip()
+        if text == directive_reply_kb_cancel:
+            context.user_data.pop("directive_target", None)
+            await message.reply_text("Direktiven-Editor beendet.", reply_markup=ReplyKeyboardRemove())
+            return ConversationHandler.END
+        if text == directive_reply_kb_custom:
+            await _guarded_reply(update, "Sende jetzt deine Direktive als normalen Text.")
+            return directive_input_state
+        preset_map_raw = target.get("preset_map")
+        if isinstance(preset_map_raw, dict):
+            preset_text = preset_map_raw.get(text)
+            if isinstance(preset_text, str) and preset_text.strip():
+                text = preset_text.strip()
         if not text or text.startswith("/"):
             await _guarded_reply(update, "Bitte Direktive als normalen Text senden (ohne Slash-Befehl).")
             return directive_input_state
@@ -2118,6 +2167,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             update,
             f"Direktive gespeichert: #{created.id} ({created.scope}) {created.text}",
         )
+        await message.reply_text("Reply-Keyboard geschlossen.", reply_markup=ReplyKeyboardRemove())
         if chat_id in infobox_targets:
             app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt."), update=None)
         return ConversationHandler.END
