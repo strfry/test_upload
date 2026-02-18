@@ -323,6 +323,31 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         except ValueError:
             return None
 
+    def _history_overview_lines(limit: int = 8) -> list[str]:
+        if not service.store:
+            return []
+        known = service.store.list_known_chats(limit=limit)
+        lines: list[str] = []
+        for item in known:
+            latest = service.store.latest_for_chat(item.chat_id)
+            if not latest:
+                continue
+            schema = latest.metadata.get("schema", "-") if isinstance(latest.metadata, dict) else "-"
+            action_count = len(latest.actions or [])
+            lines.append(
+                _truncate_value(
+                    f"- {latest.created_at:%Y-%m-%d %H:%M:%S} | {latest.title} ({latest.chat_id}) | "
+                    f"schema={schema} | actions={action_count}",
+                    max_len=260,
+                )
+            )
+            parts = _analysis_summary_parts(latest.analysis, limit=4)
+            if parts:
+                lines.append(_truncate_value("  Analysis: " + ", ".join(parts), max_len=260))
+            if latest.suggestion:
+                lines.append(_truncate_value("  Suggestion: " + latest.suggestion, max_len=260))
+        return lines
+
     def _chat_detail_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
         pending = service.get_pending_message(chat_id)
         is_running = bool(pending and pending.state == MessageState.SENDING_TYPING)
@@ -432,6 +457,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             [
                 InlineKeyboardButton("🔄 Refresh", callback_data=f"ml:{page}"),
                 InlineKeyboardButton("📦 Queue", callback_data="mq:0"),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton("🧠 Run Once", callback_data="mt:runonce"),
+                InlineKeyboardButton("🔁 Retries", callback_data="mt:retries"),
+                InlineKeyboardButton("📚 History", callback_data="mt:history"),
             ]
         )
         return InlineKeyboardMarkup(rows)
@@ -998,6 +1030,62 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         data = query.data or ""
 
+        if data.startswith("mt:"):
+            action = data.split(":", 1)[1].strip().lower()
+            if action == "runonce":
+                await _safe_edit_message(query, "Starte Einmaldurchlauf...")
+                summary = await service.run_once()
+                _kick_background_sync()
+                known_chats = _get_known_chats_cached(limit=80)
+                text = _chats_menu_text(known_chats, page=0)
+                text = _limit_message(
+                    f"Run Once abgeschlossen: Chats={summary.chat_count}, Gesendet={summary.sent_count}\n\n{text}"
+                )
+                keyboard = _chats_menu_keyboard(known_chats, page=0)
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+            if action == "retries":
+                attempts = service.list_recent_generation_attempts(limit=20)
+                if not attempts:
+                    await _safe_edit_message(query, "Keine Retry-/Attempt-Daten vorhanden.")
+                    return
+                lines = ["Letzte Retries/Attempts (chatübergreifend):"]
+                for item in attempts:
+                    status = "ok" if item.accepted else "reject"
+                    reason = f", reason={item.reject_reason}" if item.reject_reason else ""
+                    lines.append(
+                        _truncate_value(
+                            f"- {item.created_at:%Y-%m-%d %H:%M:%S} | {item.title} ({item.chat_id}) | "
+                            f"a{item.attempt_no}/{item.phase} {status}{reason}",
+                            max_len=260,
+                        )
+                    )
+                known_chats = _get_known_chats_cached(limit=80)
+                await _safe_edit_message(
+                    query,
+                    _limit_message("\n".join(lines)),
+                    reply_markup=_chats_menu_keyboard(known_chats, page=0),
+                )
+                return
+            if action == "history":
+                if not service.store:
+                    await _safe_edit_message(query, "Keine Datenbank konfiguriert.")
+                    return
+                history_lines = _history_overview_lines(limit=6)
+                if not history_lines:
+                    await _safe_edit_message(query, "Keine gespeicherten Analysen vorhanden.")
+                    return
+                lines = ["History (letzter Stand pro Chat):"] + history_lines
+                known_chats = _get_known_chats_cached(limit=80)
+                await _safe_edit_message(
+                    query,
+                    _limit_message("\n".join(lines)),
+                    reply_markup=_chats_menu_keyboard(known_chats, page=0),
+                )
+                return
+            await _safe_edit_message(query, "Unbekannte Tool-Aktion.")
+            return
+
         if data.startswith("ml:"):
             try:
                 page = int(data.split(":")[1])
@@ -1542,19 +1630,31 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if not service.store:
             await _guarded_reply(update, "Keine Datenbank konfiguriert.")
             return
-        entries = service.store.latest(limit=5)
-        if not entries:
+        lines = _history_overview_lines(limit=8)
+        if not lines:
             await _guarded_reply(update, "Keine gespeicherten Analysen vorhanden.")
             return
-        blocks: list[str] = []
-        for item in entries:
-            parts = [f"- {item.created_at:%Y-%m-%d %H:%M} | {item.title} ({item.chat_id})"]
-            if item.metadata:
-                parts.append("Meta=" + ",".join(f"{k}={v}" for k, v in item.metadata.items()))
-            if item.analysis:
-                parts.append("Analyse=" + json.dumps(item.analysis, ensure_ascii=False))
-            blocks.append("\n".join(parts))
-        await _guarded_reply_chunks(update, "Persistierte Analysen:\n\n" + "\n\n".join(blocks))
+        await _guarded_reply_chunks(update, "History (letzter Stand pro Chat):\n" + "\n".join(lines))
+
+    async def retries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        attempts = service.list_recent_generation_attempts(limit=20)
+        if not attempts:
+            await _guarded_reply(update, "Keine Retry-/Attempt-Daten vorhanden.")
+            return
+        lines = ["Letzte Retries/Attempts (chatübergreifend):"]
+        for item in attempts:
+            status = "ok" if item.accepted else "reject"
+            reason = f", reason={item.reject_reason}" if item.reject_reason else ""
+            lines.append(
+                _truncate_value(
+                    f"- {item.created_at:%Y-%m-%d %H:%M:%S} | {item.title} ({item.chat_id}) | "
+                    f"a{item.attempt_no}/{item.phase} {status}{reason}",
+                    max_len=260,
+                )
+            )
+        await _guarded_reply_chunks(update, "\n".join(lines))
 
     async def analysis_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):
@@ -1887,6 +1987,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app.add_handler(CommandHandler("chats", chats))
     app.add_handler(CommandHandler("last", last))
     app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("retries", retries))
     app.add_handler(CommandHandler("analysisget", analysis_get))
     app.add_handler(CommandHandler("analysisset", analysis_set))
     app.add_handler(CommandHandler("promptpreview", prompt_preview))
@@ -1917,5 +2018,5 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             allow_reentry=True,
         )
     )
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|pp|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|pp|mt|generate|send|stop|autoon|autooff|img|kv):"))
     return app
