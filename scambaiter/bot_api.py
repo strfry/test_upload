@@ -1162,6 +1162,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         _kick_background_sync()
+        register_command_menu = app.bot_data.get("register_command_menu")
+        if callable(register_command_menu):
+            await register_command_menu()
         known_chats = _get_known_chats_cached(limit=80)
         text = _chats_menu_text(known_chats, page=0)
         keyboard = _chats_menu_keyboard(known_chats, page=0)
@@ -2201,8 +2204,21 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             bring_to_front=True,
         )
 
+    def _command_shortcuts(limit: int = 7) -> tuple[list[BotCommand], dict[str, tuple[int, int]]]:
+        known_chats = _get_known_chats_cached(limit=80)
+        total_pages = max(1, math.ceil(len(known_chats) / chats_page_size))
+        chat_commands: list[BotCommand] = []
+        mapping: dict[str, tuple[int, int]] = {}
+        for idx, item in enumerate(known_chats[: max(0, min(limit, 7))], start=1):
+            page = min(total_pages - 1, (idx - 1) // chats_page_size)
+            command = f"c{idx}"
+            title = _truncate_value(str(item.title), max_len=22)
+            chat_commands.append(BotCommand(command, f"Chat: {title}"))
+            mapping[command] = (int(item.chat_id), int(page))
+        return chat_commands, mapping
+
     async def register_command_menu() -> None:
-        commands = [
+        base_commands = [
             BotCommand("chats", "Chat-Übersicht öffnen"),
             BotCommand("runonce", "Einmaldurchlauf starten"),
             BotCommand("retries", "Letzte Retries anzeigen"),
@@ -2212,16 +2228,47 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             BotCommand("analysisget", "Analysis für Chat-ID anzeigen"),
             BotCommand("analysisset", "Analysis für Chat-ID setzen"),
         ]
+        chat_commands, mapping = _command_shortcuts(limit=7)
+        commands = base_commands + chat_commands
+        app.bot_data["chat_shortcut_map"] = mapping
         try:
             await app.bot.set_my_commands(commands=commands, scope=BotCommandScopeChat(chat_id=allowed_chat_id))
         except Exception as exc:
             service.add_general_warning(f"Command-Menü konnte nicht gesetzt werden: {exc}")
+
+    async def open_chat_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            return
+        message = update.message
+        if not message or not message.text:
+            return
+        token = message.text.strip().split()[0]
+        if token.startswith("/"):
+            token = token[1:]
+        token = token.split("@", 1)[0].lower()
+        shortcut_map = app.bot_data.get("chat_shortcut_map")
+        if not isinstance(shortcut_map, dict):
+            register_command_menu = app.bot_data.get("register_command_menu")
+            if callable(register_command_menu):
+                await register_command_menu()
+            shortcut_map = app.bot_data.get("chat_shortcut_map")
+        if not isinstance(shortcut_map, dict) or token not in shortcut_map:
+            await _guarded_reply(update, "Unbekannter Chat-Shortcut. Bitte /chats nutzen.")
+            return
+        raw = shortcut_map.get(token)
+        if not (isinstance(raw, tuple) and len(raw) == 2):
+            await _guarded_reply(update, "Shortcut-Mapping ungültig. Bitte /chats nutzen.")
+            return
+        chat_id, page = raw
+        text, keyboard = await _render_chat_detail(int(chat_id), int(page), compact=False)
+        await update.message.reply_text(text, reply_markup=keyboard)
 
     app.bot_data["send_start_menu"] = send_start_menu
     app.bot_data["register_command_menu"] = register_command_menu
 
     app.add_handler(CommandHandler("runonce", run_once))
     app.add_handler(CommandHandler("chats", chats))
+    app.add_handler(CommandHandler(["c1", "c2", "c3", "c4", "c5", "c6", "c7"], open_chat_shortcut))
     app.add_handler(CommandHandler("last", last))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("retries", retries))
