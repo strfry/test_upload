@@ -42,12 +42,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     analysis_reply_kb_keyvalue = "🧩 key=value"
     analysis_reply_kb_json = "🧱 JSON merge"
     analysis_reply_kb_cancel = "❌ Abbrechen"
-    directive_reply_kb_custom = "✍️ Eigener Text"
     directive_reply_kb_cancel = "❌ Abbrechen"
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
     prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
-    directive_preset_cache: dict[int, tuple[int, list[tuple[str, str]]]] = {}
     anti_loop_preset_text = (
         "Allgemeine Anti-Loop-Regel: "
         "Ermittle pro Turn den Kern-Intent der letzten Assistant-Nachricht "
@@ -435,11 +433,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     InlineKeyboardButton("🔁 Retries", callback_data=f"ma:r:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("➕ Dir", callback_data=f"ma:da:{chat_id}:{page}"),
+                    InlineKeyboardButton("Direktive aktivieren", callback_data=f"ma:da:{chat_id}:{page}"),
                     InlineKeyboardButton("➖ Dir", callback_data=f"ma:dl:{chat_id}:{page}"),
-                ],
-                [
-                    InlineKeyboardButton("🧩 Presets", callback_data=f"ma:dp:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("✏️ An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
@@ -594,33 +589,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             rows.append([InlineKeyboardButton(label, callback_data=f"md:del:{chat_id}:{page}:{item.id}")])
         rows.append([InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mc:{chat_id}:{page}")])
         return InlineKeyboardMarkup(rows)
-
-    def _directive_preset_keyboard(chat_id: int, page: int, presets: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-        rows: list[list[InlineKeyboardButton]] = []
-        for idx, (label, _text) in enumerate(presets):
-            button_label = f"{idx + 1}. {_truncate_value(label, max_len=30)}"
-            rows.append([InlineKeyboardButton(button_label, callback_data=f"mp:add:{chat_id}:{page}:{idx}")])
-        rows.append(
-            [
-                InlineKeyboardButton("🔄 Neu generieren", callback_data=f"mp:regen:{chat_id}:{page}:0"),
-                InlineKeyboardButton("⬅️ Zurueck", callback_data=f"mp:back:{chat_id}:{page}:0"),
-            ]
-        )
-        return InlineKeyboardMarkup(rows)
-
-    def _directive_preset_card_text(chat_id: int, presets: list[tuple[str, str]]) -> str:
-        lines = [
-            f"Chat {chat_id}",
-            "",
-            f"Directive Presets (dynamisch, {len(presets)} Vorschlaege):",
-        ]
-        for idx, (label, text) in enumerate(presets, start=1):
-            lines.append(f"{idx}. {label}")
-            lines.append("   " + _truncate_value(text, max_len=170))
-        lines.append("")
-        lines.append("Waehle einen Vorschlag per Button. Er wird als Session-Direktive gespeichert.")
-        lines.append("Hinweis: Wirkung kann ueber previous_analysis erhalten bleiben.")
-        return _limit_message("\n".join(lines), max_len=3300)
 
     def _as_boolish(value: object) -> bool:
         if isinstance(value, bool):
@@ -1325,68 +1293,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, "Unbekannte Tool-Aktion.")
             return
 
-        if data.startswith("mp:"):
-            try:
-                _prefix, op, chat_id_raw, page_raw, idx_raw = data.split(":")
-                chat_id = int(chat_id_raw)
-                page = int(page_raw)
-                idx = int(idx_raw)
-            except (ValueError, IndexError):
-                await _safe_edit_message(query, "Ungueltige Preset-Aktion.")
-                return
-
-            if op == "back":
-                is_card = bool(getattr(getattr(query, "message", None), "photo", None))
-                text, keyboard = await _render_chat_detail(chat_id, page, compact=is_card)
-                await _safe_edit_message(query, text, reply_markup=keyboard)
-                return
-
-            if op == "regen":
-                presets = await _build_directive_presets(chat_id, limit=7)
-                directive_preset_cache[chat_id] = (page, presets)
-                text = _directive_preset_card_text(chat_id, presets)
-                keyboard = _directive_preset_keyboard(chat_id, page, presets)
-                await _safe_edit_message(query, text, reply_markup=keyboard)
-                return
-
-            if op == "add":
-                cached = directive_preset_cache.get(chat_id)
-                if not cached:
-                    await _safe_edit_message(query, "Preset-Liste ist abgelaufen. Bitte Presets erneut oeffnen.")
-                    return
-                _cached_page, presets = cached
-                if idx < 0 or idx >= len(presets):
-                    await _safe_edit_message(query, "Ungueltiger Preset-Index.")
-                    return
-                label, preset_text = presets[idx]
-                created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="session")
-                is_card = bool(getattr(getattr(query, "message", None), "photo", None))
-                if not created:
-                    text, keyboard = await _render_chat_detail(
-                        chat_id,
-                        page,
-                        heading="Preset konnte nicht gespeichert werden.",
-                        compact=is_card,
-                    )
-                    await _safe_edit_message(query, text, reply_markup=keyboard)
-                    return
-                text, keyboard = await _render_chat_detail(
-                    chat_id,
-                    page,
-                    heading=(
-                        f"Preset hinzugefuegt: {label} (session). "
-                        "Hinweis: Wirkung kann ueber previous_analysis/analysis-Keys erhalten bleiben."
-                    ),
-                    compact=is_card,
-                )
-                await _safe_edit_message(query, text, reply_markup=keyboard)
-                if chat_id in infobox_targets:
-                    app.create_task(_push_infobox_update(chat_id, heading=f"Directive Preset hinzugefuegt: {label}"), update=None)
-                return
-
-            await _safe_edit_message(query, "Unbekannte Preset-Aktion.")
-            return
-
         if data.startswith("ax:"):
             try:
                 _prefix, mode_raw, chat_id_raw, page_raw, offset_raw = data.split(":")
@@ -1822,14 +1728,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             await _safe_edit_message(query, text, reply_markup=delete_keyboard)
             return
 
-        if action == "dp":
-            presets = await _build_directive_presets(chat_id, limit=7)
-            directive_preset_cache[chat_id] = (page, presets)
-            text = _directive_preset_card_text(chat_id, presets)
-            keyboard = _directive_preset_keyboard(chat_id, page, presets)
-            await _safe_edit_message(query, text, reply_markup=keyboard)
-            return
-
         if action in {"ad", "a-"}:
             latest_entry = service.store.latest_for_chat(chat_id) if service.store else None
             analysis_data = latest_entry.analysis if latest_entry else None
@@ -2073,11 +1971,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return ConversationHandler.END
         if action not in {"da", "d+"}:
             return ConversationHandler.END
-        presets = await _build_directive_presets(chat_id, limit=6)
+        presets = await _build_directive_presets(chat_id, limit=7)
         preset_buttons: list[str] = []
         preset_map: dict[str, str] = {}
         for idx, (label, preset_text) in enumerate(presets, start=1):
-            button_label = f"🧩 Preset {idx}"
+            button_label = f"{idx}. {_truncate_value(label, max_len=24)}"
             preset_buttons.append(button_label)
             preset_map[button_label] = preset_text
         context.user_data["directive_target"] = {
@@ -2089,25 +1987,25 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         text, keyboard = await _render_chat_detail(
             chat_id,
             page,
-            heading="Direktive hinzufügen: unten Preset wählen oder eigenen Text senden (/cancel).",
+            heading="Direktive aktivieren: unten Vorschlag wählen oder frei tippen (/cancel).",
             compact=is_card,
         )
         await _safe_edit_message(query, text, reply_markup=keyboard)
         rows: list[list[KeyboardButton]] = []
         for idx in range(0, len(preset_buttons), 2):
             rows.append([KeyboardButton(item) for item in preset_buttons[idx : idx + 2]])
-        rows.append([KeyboardButton(directive_reply_kb_custom), KeyboardButton(directive_reply_kb_cancel)])
+        rows.append([KeyboardButton(directive_reply_kb_cancel)])
         reply_keyboard = ReplyKeyboardMarkup(
             keyboard=rows,
             resize_keyboard=True,
             one_time_keyboard=False,
-            input_field_placeholder="Preset wählen oder Direktive eingeben…",
+            input_field_placeholder="Vorschlag wählen oder Direktive eingeben…",
         )
-        info_lines = ["Direktiven-Presets (Demo):"]
+        info_lines = ["Direktiven-Vorschlaege:"]
         for idx, (label, preset_text) in enumerate(presets, start=1):
-            info_lines.append(f"- 🧩 Preset {idx}: {_truncate_value(label, max_len=60)}")
+            info_lines.append(f"- {idx}. {_truncate_value(label, max_len=60)}")
             info_lines.append(f"  {_truncate_value(preset_text, max_len=120)}")
-        info_lines.append("- ✍️ Eigener Text: manuelle Direktive senden")
+        info_lines.append("- Frei tippen: eigene Direktive senden")
         info_lines.append("- ❌ Abbrechen: Eingabe beenden")
         await context.bot.send_message(
             chat_id=allowed_chat_id,
@@ -2145,9 +2043,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             context.user_data.pop("directive_target", None)
             await message.reply_text("Direktiven-Editor beendet.", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
-        if text == directive_reply_kb_custom:
-            await _guarded_reply(update, "Sende jetzt deine Direktive als normalen Text.")
-            return directive_input_state
         preset_map_raw = target.get("preset_map")
         if isinstance(preset_map_raw, dict):
             preset_text = preset_map_raw.get(text)
@@ -2493,5 +2388,5 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             allow_reentry=True,
         )
     )
-    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|mp|ax|pp|mt|generate|send|stop|autoon|autooff|img|kv):"))
+    app.add_handler(CallbackQueryHandler(callback_action, pattern=r"^(ml|mq|mc|ma|md|me|ax|pp|mt|generate|send|stop|autoon|autooff|img|kv):"))
     return app
