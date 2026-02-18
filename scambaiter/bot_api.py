@@ -31,6 +31,19 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     infobox_targets: dict[int, set[tuple[int, int, int, str]]] = {}
     control_cards: dict[str, tuple[int, int]] = {}
     prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
+    anti_loop_preset_text = (
+        "Allgemeine Anti-Loop-Regel: "
+        "Ermittle pro Turn den Kern-Intent der letzten Assistant-Nachricht "
+        "(analysis.last_assistant_intent) und vergleiche ihn mit dem geplanten neuen Intent. "
+        "Wenn identisch oder semantisch gleich in den letzten 2 Assistant-Turns, ist Wiederholung verboten. "
+        "In diesem Fall muss die nächste Nachricht zuerst auf die jüngste User-Aussage reagieren und "
+        "einen neuen Fortschrittsschritt liefern (neues Subziel, neues Belegdetail oder neue konkrete Aktion). "
+        "Setze in analysis: loop_guard_active=true, repeated_intent=<intent>, next_intent=<new_intent>, "
+        "blocked_intents_next_turns=[<intent>] für 2 Turns. "
+        "Wenn User sagt, dass ein Nachweis nicht verfügbar ist (z.B. nicht auf der Website), "
+        "darf genau dieser Nachweis nicht erneut als Hauptfrage angefordert werden; "
+        "stattdessen alternatives verifizierbares Detail aus vorhandenem Material anfordern."
+    )
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -378,6 +391,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 [
                     InlineKeyboardButton("➕ Dir", callback_data=f"ma:da:{chat_id}:{page}"),
                     InlineKeyboardButton("➖ Dir", callback_data=f"ma:dl:{chat_id}:{page}"),
+                ],
+                [
+                    InlineKeyboardButton("🧩 Preset", callback_data=f"ma:dpal:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("✏️ An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
@@ -1495,6 +1511,36 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             delete_keyboard = _directive_delete_keyboard(chat_id, page)
             text = _limit_message("\n".join(lines))
             await _safe_edit_message(query, text, reply_markup=delete_keyboard)
+            return
+
+        if action == "dpal":
+            created = service.add_chat_directive(
+                chat_id=chat_id,
+                text=anti_loop_preset_text,
+                scope="session",
+            )
+            is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            if not created:
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading="Preset konnte nicht gespeichert werden.",
+                    compact=is_card,
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+            text, keyboard = await _render_chat_detail(
+                chat_id,
+                page,
+                heading=(
+                    "Preset aktiviert: Anti-Loop (General) als Session-Direktive. "
+                    "Hinweis: Persistenzwirkung erfolgt ueber previous_analysis/analysis-Keys."
+                ),
+                compact=is_card,
+            )
+            await _safe_edit_message(query, text, reply_markup=keyboard)
+            if chat_id in infobox_targets:
+                app.create_task(_push_infobox_update(chat_id, heading="Directive Preset hinzugefuegt."), update=None)
             return
 
         if action in {"ad", "a-"}:
