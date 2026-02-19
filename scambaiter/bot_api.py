@@ -469,8 +469,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     InlineKeyboardButton("🔁 Retries", callback_data=f"ma:r:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("➕ Direktive aktivieren", callback_data=f"ma:da:{chat_id}:{page}"),
-                    InlineKeyboardButton("🗂️ Direktiven anzeigen", callback_data=f"ma:dl:{chat_id}:{page}"),
+                    InlineKeyboardButton("🧩 Direktiven", callback_data=f"ma:da:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("✏️ An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
@@ -2195,7 +2194,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         except (ValueError, IndexError):
             await _safe_edit_message(query, "Ungueltige Aktion.")
             return ConversationHandler.END
-        if action not in {"da", "d+"}:
+        if action not in {"da", "d+", "dl", "d-"}:
             return ConversationHandler.END
         await _cleanup_context_messages(context, directive_context_messages_key)
         presets = await _build_directive_presets(chat_id, limit=7)
@@ -2219,6 +2218,23 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             input_field_placeholder="Direktive eingeben…",
         )
         target_chat_id = int(getattr(getattr(query, "message", None), "chat_id", allowed_chat_id))
+        active_directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=50)
+        if active_directives:
+            sent_head = await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=_limit_message(f"Aktive Direktiven ({len(active_directives)}):"),
+            )
+            _track_context_message(context, directive_context_messages_key, sent_head)
+            for item in active_directives:
+                sent_active = await context.bot.send_message(
+                    chat_id=target_chat_id,
+                    text=_limit_message(f"#{item.id} ({item.scope})\n{item.text}", max_len=3200),
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("Löschen", callback_data=f"md:del:{chat_id}:{page}:{item.id}")]]
+                    ),
+                )
+                _track_context_message(context, directive_context_messages_key, sent_active)
+
         info_lines = ["Direktiven-Presets (Inline):"]
         for idx, (label, preset_text) in enumerate(presets, start=1):
             add_active, once_active = _directive_preset_states(chat_id, preset_text)
@@ -2606,7 +2622,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     app.add_handler(CommandHandler("promptpreview", prompt_preview))
     app.add_handler(
         ConversationHandler(
-            entry_points=[CallbackQueryHandler(directive_input_start, pattern=r"^ma:(da|d\+):")],
+            entry_points=[CallbackQueryHandler(directive_input_start, pattern=r"^ma:(da|d\+|dl|d-):")],
             states={
                 directive_input_state: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, directive_input),
