@@ -634,15 +634,45 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return None
         return presets[index - 1]
 
-    def _directive_preset_keyboard(chat_id: int, page: int, preset_index: int, dryrun_running: bool = False) -> InlineKeyboardMarkup:
+    def _normalize_directive_text(value: str) -> str:
+        return " ".join(value.strip().lower().split())
+
+    def _directive_preset_states(chat_id: int, preset_text: str) -> tuple[bool, bool]:
+        directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=200)
+        needle = _normalize_directive_text(preset_text)
+        has_session = False
+        has_once = False
+        for item in directives:
+            if _normalize_directive_text(item.text) != needle:
+                continue
+            scope = str(item.scope).strip().lower()
+            if scope == "session":
+                has_session = True
+            elif scope == "once":
+                has_once = True
+            if has_session and has_once:
+                break
+        return has_session, has_once
+
+    def _directive_preset_keyboard(
+        chat_id: int,
+        page: int,
+        preset_index: int,
+        *,
+        add_active: bool = False,
+        once_active: bool = False,
+        dryrun_running: bool = False,
+    ) -> InlineKeyboardMarkup:
+        add_label = "✅ Aktiv" if add_active else "Add"
+        once_label = "✅ Once aktiv" if once_active else "Once"
         dryrun_label = "⏳ Dry-Run läuft" if dryrun_running else "Dry-Run"
         dryrun_cb = f"md:busy:{chat_id}:{page}:{preset_index}" if dryrun_running else f"md:pd:{chat_id}:{page}:{preset_index}"
         return InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Add", callback_data=f"md:pa:{chat_id}:{page}:{preset_index}"),
+                    InlineKeyboardButton(add_label, callback_data=f"md:pa:{chat_id}:{page}:{preset_index}"),
                     InlineKeyboardButton(dryrun_label, callback_data=dryrun_cb),
-                    InlineKeyboardButton("Once", callback_data=f"md:po:{chat_id}:{page}:{preset_index}"),
+                    InlineKeyboardButton(once_label, callback_data=f"md:po:{chat_id}:{page}:{preset_index}"),
                 ]
             ]
         )
@@ -1446,21 +1476,82 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     await _safe_edit_message(query, "Preset nicht gefunden.")
                     return
                 preset_label, preset_text = preset
+                add_active, once_active = _directive_preset_states(chat_id, preset_text)
                 if op == "pa":
-                    created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="session")
-                    if not created:
-                        await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
-                        return
-                    await _safe_edit_message(query, f"✅ Added #{created.id} ({created.scope}): {preset_label}")
+                    if add_active:
+                        directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=200)
+                        removed = False
+                        needle = _normalize_directive_text(preset_text)
+                        for item in directives:
+                            if str(item.scope).strip().lower() != "session":
+                                continue
+                            if _normalize_directive_text(item.text) != needle:
+                                continue
+                            removed = service.delete_chat_directive(chat_id=chat_id, directive_id=item.id) or removed
+                        await query.answer("Session-Direktive deaktiviert." if removed else "Keine Session-Direktive gefunden.")
+                    else:
+                        created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="session")
+                        if not created:
+                            await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
+                            return
+                        await query.answer("Session-Direktive aktiviert.")
+                    add_active, once_active = _directive_preset_states(chat_id, preset_text)
+                    source_message = getattr(query, "message", None)
+                    if source_message:
+                        try:
+                            await context.bot.edit_message_reply_markup(
+                                chat_id=int(source_message.chat_id),
+                                message_id=int(source_message.message_id),
+                                reply_markup=_directive_preset_keyboard(
+                                    chat_id,
+                                    page,
+                                    preset_index,
+                                    add_active=add_active,
+                                    once_active=once_active,
+                                    dryrun_running=False,
+                                ),
+                            )
+                        except BadRequest:
+                            pass
                     if chat_id in infobox_targets:
                         app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt."), update=None)
                     return
                 if op == "po":
-                    created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="once")
-                    if not created:
-                        await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
-                        return
-                    await _safe_edit_message(query, f"✅ Added once #{created.id}: {preset_label}")
+                    if once_active:
+                        directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=200)
+                        removed = False
+                        needle = _normalize_directive_text(preset_text)
+                        for item in directives:
+                            if str(item.scope).strip().lower() != "once":
+                                continue
+                            if _normalize_directive_text(item.text) != needle:
+                                continue
+                            removed = service.delete_chat_directive(chat_id=chat_id, directive_id=item.id) or removed
+                        await query.answer("Once-Direktive deaktiviert." if removed else "Keine Once-Direktive gefunden.")
+                    else:
+                        created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="once")
+                        if not created:
+                            await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
+                            return
+                        await query.answer("Once-Direktive aktiviert.")
+                    add_active, once_active = _directive_preset_states(chat_id, preset_text)
+                    source_message = getattr(query, "message", None)
+                    if source_message:
+                        try:
+                            await context.bot.edit_message_reply_markup(
+                                chat_id=int(source_message.chat_id),
+                                message_id=int(source_message.message_id),
+                                reply_markup=_directive_preset_keyboard(
+                                    chat_id,
+                                    page,
+                                    preset_index,
+                                    add_active=add_active,
+                                    once_active=once_active,
+                                    dryrun_running=False,
+                                ),
+                            )
+                        except BadRequest:
+                            pass
                     if chat_id in infobox_targets:
                         app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt (once)."), update=None)
                     return
@@ -1479,7 +1570,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await _safe_edit_message(
                     query,
                     _limit_message(started_text, max_len=3200),
-                    reply_markup=_directive_preset_keyboard(chat_id, page, preset_index, dryrun_running=True),
+                    reply_markup=_directive_preset_keyboard(
+                        chat_id,
+                        page,
+                        preset_index,
+                        add_active=add_active,
+                        once_active=once_active,
+                        dryrun_running=True,
+                    ),
                 )
 
                 target_chat_id = int(getattr(source_message, "chat_id", allowed_chat_id)) if source_message else allowed_chat_id
@@ -1512,7 +1610,14 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                                 chat_id=target_chat_id,
                                 message_id=target_message_id,
                                 text=final_text,
-                                reply_markup=_directive_preset_keyboard(chat_id, page, preset_index, dryrun_running=False),
+                                reply_markup=_directive_preset_keyboard(
+                                    chat_id,
+                                    page,
+                                    preset_index,
+                                    add_active=add_active,
+                                    once_active=once_active,
+                                    dryrun_running=False,
+                                ),
                             )
                         except BadRequest:
                             pass
@@ -2116,10 +2221,18 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         target_chat_id = int(getattr(getattr(query, "message", None), "chat_id", allowed_chat_id))
         info_lines = ["Direktiven-Presets (Inline):"]
         for idx, (label, preset_text) in enumerate(presets, start=1):
+            add_active, once_active = _directive_preset_states(chat_id, preset_text)
             sent_preset = await context.bot.send_message(
                 chat_id=target_chat_id,
                 text=_limit_message(f"{idx}. {label}\n\n{preset_text}", max_len=3200),
-                reply_markup=_directive_preset_keyboard(chat_id, page, idx, dryrun_running=False),
+                reply_markup=_directive_preset_keyboard(
+                    chat_id,
+                    page,
+                    idx,
+                    add_active=add_active,
+                    once_active=once_active,
+                    dryrun_running=False,
+                ),
             )
             _track_context_message(context, directive_context_messages_key, sent_preset)
         info_lines.append("- Add: speichert als Session-Direktive")
