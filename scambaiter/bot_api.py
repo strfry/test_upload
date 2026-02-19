@@ -217,6 +217,18 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 return
             raise
 
+    async def _safe_answer_query(query, text: str | None = None) -> None:
+        try:
+            if isinstance(text, str) and text.strip():
+                await query.answer(text=text)
+            else:
+                await query.answer()
+        except BadRequest as exc:
+            msg = str(exc).lower()
+            if "query is too old" in msg or "query id is invalid" in msg:
+                return
+            raise
+
     def _limit_message(text: str, max_len: int = menu_message_len) -> str:
         if len(text) <= max_len:
             return text
@@ -1252,7 +1264,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         query = update.callback_query
         if not query:
             return
-        await query.answer()
+        await _safe_answer_query(query)
 
         if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
             await _safe_edit_message(query, "Nicht autorisiert.")
@@ -1469,7 +1481,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 return
 
             if op == "busy":
-                await query.answer("Dry-Run läuft bereits…")
+                await _safe_answer_query(query, "Dry-Run läuft bereits…")
                 return
 
             if op in {"pa", "pd", "po"}:
@@ -1495,13 +1507,16 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                             if _normalize_directive_text(item.text) != needle:
                                 continue
                             removed = service.delete_chat_directive(chat_id=chat_id, directive_id=item.id) or removed
-                        await query.answer("Session-Direktive deaktiviert." if removed else "Keine Session-Direktive gefunden.")
+                        await _safe_answer_query(
+                            query,
+                            "Session-Direktive deaktiviert." if removed else "Keine Session-Direktive gefunden.",
+                        )
                     else:
                         created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="session")
                         if not created:
                             await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
                             return
-                        await query.answer("Session-Direktive aktiviert.")
+                        await _safe_answer_query(query, "Session-Direktive aktiviert.")
                     add_active, once_active = _directive_preset_states(chat_id, preset_text)
                     source_message = getattr(query, "message", None)
                     if source_message:
@@ -1534,13 +1549,16 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                             if _normalize_directive_text(item.text) != needle:
                                 continue
                             removed = service.delete_chat_directive(chat_id=chat_id, directive_id=item.id) or removed
-                        await query.answer("Once-Direktive deaktiviert." if removed else "Keine Once-Direktive gefunden.")
+                        await _safe_answer_query(
+                            query,
+                            "Once-Direktive deaktiviert." if removed else "Keine Once-Direktive gefunden.",
+                        )
                     else:
                         created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="once")
                         if not created:
                             await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
                             return
-                        await query.answer("Once-Direktive aktiviert.")
+                        await _safe_answer_query(query, "Once-Direktive aktiviert.")
                     add_active, once_active = _directive_preset_states(chat_id, preset_text)
                     source_message = getattr(query, "message", None)
                     if source_message:
@@ -2204,7 +2222,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         query = update.callback_query
         if not query:
             return ConversationHandler.END
-        await query.answer()
+        await _safe_answer_query(query)
         if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
             await _safe_edit_message(query, "Nicht autorisiert.")
             return ConversationHandler.END
@@ -2342,7 +2360,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         query = update.callback_query
         if not query:
             return ConversationHandler.END
-        await query.answer()
+        await _safe_answer_query(query)
         if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
             await _safe_edit_message(query, "Nicht autorisiert.")
             return ConversationHandler.END
@@ -2399,7 +2417,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         query = update.callback_query
         if not query:
             return ConversationHandler.END
-        await query.answer()
+        await _safe_answer_query(query)
         if not update.effective_chat or update.effective_chat.id != allowed_chat_id:
             await _safe_edit_message(query, "Nicht autorisiert.")
             return ConversationHandler.END
