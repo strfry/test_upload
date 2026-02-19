@@ -1770,13 +1770,15 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             service.set_chat_auto(chat_id, enabled=True)
             pending = service.get_pending_message(chat_id)
             if not pending:
-                known = _find_known_chat(chat_id)
-                await service.schedule_suggestion_generation(
-                    chat_id=chat_id,
-                    title=(known.title if known else str(chat_id)),
-                    trigger="bot-auto-on",
-                    auto_send=False,
-                )
+                restored = service.restore_pending_from_store(chat_id=chat_id, trigger="bot-auto-on-restore")
+                if not restored:
+                    known = _find_known_chat(chat_id)
+                    await service.schedule_suggestion_generation(
+                        chat_id=chat_id,
+                        title=(known.title if known else str(chat_id)),
+                        trigger="bot-auto-on",
+                        auto_send=False,
+                    )
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
                 chat_id,

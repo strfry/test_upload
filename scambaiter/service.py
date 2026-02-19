@@ -851,6 +851,9 @@ class BackgroundService:
         self._notify_pending_changed(chat_id)
         return True
 
+    def restore_pending_from_store(self, chat_id: int, trigger: str = "manual-restore") -> bool:
+        return self._restore_pending_from_store(chat_id=int(chat_id), trigger=str(trigger))
+
     async def _send_flow(self, chat_id: int) -> None:
         pending = self._pending_messages.get(chat_id)
         if not pending:
