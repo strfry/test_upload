@@ -481,6 +481,46 @@ class BackgroundService:
             )
         return results
 
+    async def run_dry_run_once(
+        self,
+        chat_id: int,
+        trigger: str = "directive-dry-run",
+        on_warning: Callable[[int, str], None] | None = None,
+    ) -> SuggestionResult | None:
+        context = await self.core.build_chat_context(chat_id)
+        if not context:
+            return None
+
+        prompt_context, language_hint, previous_analysis = self.build_prompt_context_for_chat(chat_id)
+        output = self.core.generate_output(
+            context,
+            language_hint=language_hint,
+            prompt_context=prompt_context,
+            on_warning=(lambda message, cid=chat_id: self._handle_generation_warning(cid, message, on_warning)),
+            on_attempt=(
+                lambda event, cid=chat_id, title=context.title: self._record_generation_attempt(
+                    chat_id=cid,
+                    title=title,
+                    trigger=trigger,
+                    event=event,
+                )
+            ),
+        )
+        merged_analysis = self._merge_analysis(previous_analysis if self.store else None, output.analysis)
+        result = SuggestionResult(
+            context=context,
+            suggestion=output.suggestion,
+            analysis=merged_analysis,
+            metadata=output.metadata,
+            actions=output.actions,
+        )
+
+        # Dry-run mutates neither pending queue nor stored chat analysis/suggestion snapshot.
+        self.last_results = [result] + self.last_results
+        if len(self.last_results) > 50:
+            self.last_results = self.last_results[:50]
+        return result
+
     def _consume_once_directives(self, chat_id: int, analysis: dict[str, object] | None) -> None:
         if not self.store or not isinstance(analysis, dict):
             return

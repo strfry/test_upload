@@ -1488,16 +1488,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 async def _finish_dry_run() -> None:
                     final_text: str
                     try:
-                        summary = await service.run_once(target_chat_ids={chat_id})
-                        suggestion = ""
-                        if service.store:
-                            latest = service.store.latest_for_chat(chat_id)
-                            if latest and isinstance(latest.suggestion, str):
-                                suggestion = latest.suggestion.strip()
+                        result = await service.run_dry_run_once(chat_id=chat_id, trigger="directive-dry-run")
+                        suggestion = result.suggestion.strip() if result and isinstance(result.suggestion, str) else ""
                         final_lines = [
                             base_text,
                             "",
-                            f"✅ Dry-Run fertig: Chats={summary.chat_count}, Gesendet={summary.sent_count}",
+                            "✅ Dry-Run fertig (Queue unverändert).",
+                            "🟢 Grünes Licht: Jetzt per weiterem Klick Queue Run auslösen.",
                         ]
                         if suggestion:
                             final_lines.extend(["", "Ergebnis:", _truncate_value(suggestion, max_len=900)])
