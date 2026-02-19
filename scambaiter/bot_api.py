@@ -51,7 +51,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     prompt_preview_cache: dict[int, tuple[int, list[str]]] = {}
     directive_delete_batches: dict[str, list[tuple[int, int]]] = {}
     directive_delete_batch_seq = {"value": 0}
-    picture_card_messages: dict[int, list[int]] = {}
     anti_loop_preset_text = (
         "Allgemeine Anti-Loop-Regel: "
         "Ermittle pro Turn den Kern-Intent der letzten Assistant-Nachricht "
