@@ -1848,7 +1848,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 text, keyboard = await _render_chat_detail(
                     chat_id,
                     page,
-                    heading="Aktuelle Wartezeit wird übersprungen.",
+                    heading="Aktuelle Phase wird übersprungen.",
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
@@ -1858,7 +1858,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 text, keyboard = await _render_chat_detail(
                     chat_id,
                     page,
-                    heading="Keine überspringbare Wartezeit aktiv.",
+                    heading="Keine überspringbare Phase aktiv.",
                     compact=is_card,
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
