@@ -160,15 +160,17 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 pass
 
     async def _clear_picture_cards(chat_id: int) -> None:
-        ids = picture_card_messages.pop(chat_id, [])
-        for msg_id in ids:
-            try:
-                await app.bot.delete_message(chat_id=allowed_chat_id, message_id=msg_id)
-            except BadRequest:
-                pass
-
-    def _record_picture_card(chat_id: int, message_id: int) -> None:
-        picture_card_messages.setdefault(chat_id, []).append(message_id)
+        try:
+            recent = await service.core.client.get_messages(allowed_chat_id, limit=40)
+        except Exception:
+            return
+        for msg in recent:
+            snippet = getattr(msg, "caption", None) or getattr(msg, "message", "")
+            if isinstance(snippet, str) and snippet.startswith("[Picture Card]"):
+                try:
+                    await app.bot.delete_message(chat_id=allowed_chat_id, message_id=int(msg.id))
+                except BadRequest:
+                    pass
 
     def _tg_units(text: str) -> int:
         return len(text.encode("utf-16-le")) // 2
@@ -1932,12 +1934,9 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     tail_messages.append(
                         f"[Picture Card]\nBild {idx+1} Caption {tail_idx}/{len(caption_pages)}:\n{tail_page}"
                     )
-            album = await context.bot.send_media_group(chat_id=allowed_chat_id, media=media_group)
-            for msg in album:
-                _record_picture_card(chat_id, int(getattr(msg, "message_id", 0)))
+            await context.bot.send_media_group(chat_id=allowed_chat_id, media=media_group)
             for tail_text in tail_messages:
-                msg = await context.bot.send_message(chat_id=allowed_chat_id, text=tail_text)
-                _record_picture_card(chat_id, int(msg.message_id))
+                await context.bot.send_message(chat_id=allowed_chat_id, text=tail_text)
             text, keyboard = await _render_chat_detail(
                 chat_id,
                 page,
