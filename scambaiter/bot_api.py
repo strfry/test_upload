@@ -92,6 +92,13 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         "Analysis-Memory nutzen: Bei Wiederholungsgefahr in analysis setzen "
         "loop_guard_active=true, repeated_intent, next_intent und blocked_intents_next_turns (2 Turns)."
     )
+    language_enforcement_preset_text = (
+        "Sprachregel strikt erzwingen: Antworte immer ausschließlich in der aktuell gesetzten Sprache "
+        "(analysis.language bzw. analysis.sprache). "
+        "Keine gemischte Sprache, keine Übersetzung ins Englische als Zusatz. "
+        "Wenn kein language/sprache gesetzt ist, übernimm die Sprache der jüngsten User-Nachricht "
+        "und setze analysis.language entsprechend."
+    )
 
     def _authorized(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.id == allowed_chat_id)
@@ -625,6 +632,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             ("Contract Detail Drilldown", contract_detail_drilldown_preset_text),
             ("No Early Registration", no_premature_registration_preset_text),
             ("Analysis Loop Memory", analysis_memory_preset_text),
+            ("Language Enforcement", language_enforcement_preset_text),
         ]
 
     def _directive_preset_by_index(index: int) -> tuple[str, str] | None:
@@ -676,10 +684,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             ]
         )
 
-    async def _build_directive_presets(chat_id: int, limit: int = 7) -> list[tuple[str, str]]:
+    async def _build_directive_presets(chat_id: int, limit: int = 8) -> list[tuple[str, str]]:
         _ = chat_id
         presets = _directive_preset_catalog()
-        return presets[: max(1, min(limit, 7))]
+        return presets[: max(1, min(limit, 8))]
 
     def _encode_key_token(key: str) -> str:
         raw = key.encode("utf-8")
@@ -2211,7 +2219,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if action not in {"da", "d+", "dl", "d-"}:
             return ConversationHandler.END
         await _cleanup_context_messages(context, directive_context_messages_key)
-        presets = await _build_directive_presets(chat_id, limit=7)
+        presets = await _build_directive_presets(chat_id, limit=8)
         context.user_data["directive_target"] = {
             "chat_id": chat_id,
             "page": page,
