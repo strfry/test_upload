@@ -470,6 +470,7 @@ class BackgroundService:
                     actions=output.actions,
                     metadata=output.metadata,
                 )
+                self._consume_once_directives(context.chat_id, merged_analysis)
 
             self._register_waiting_message(
                 context,
@@ -479,6 +480,34 @@ class BackgroundService:
                 schema=output.metadata.get("schema"),
             )
         return results
+
+    def _consume_once_directives(self, chat_id: int, analysis: dict[str, object] | None) -> None:
+        if not self.store or not isinstance(analysis, dict):
+            return
+        applied_raw = analysis.get("operator_applied")
+        if not isinstance(applied_raw, list) or not applied_raw:
+            return
+        applied_ids: set[int] = set()
+        for item in applied_raw:
+            if isinstance(item, int):
+                applied_ids.add(item)
+                continue
+            if isinstance(item, str):
+                value = item.strip()
+                if not value:
+                    continue
+                try:
+                    applied_ids.add(int(value))
+                except ValueError:
+                    continue
+        if not applied_ids:
+            return
+        directives = self.store.list_directives(chat_id=chat_id, active_only=True, limit=200)
+        for directive in directives:
+            if directive.scope.strip().lower() != "once":
+                continue
+            if directive.id in applied_ids:
+                self.store.delete_directive(chat_id=chat_id, directive_id=directive.id)
 
     def _record_generation_attempt(
         self,

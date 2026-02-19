@@ -39,6 +39,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     queue_page_size = 8
     directive_input_state = 1
     analysis_input_state = 2
+    directive_context_messages_key = "directive_context_messages"
+    analysis_context_messages_key = "analysis_context_messages"
     analysis_reply_kb_keyvalue = "🧩 key=value"
     analysis_reply_kb_json = "🧱 JSON merge"
     analysis_reply_kb_cancel = "❌ Abbrechen"
@@ -116,6 +118,38 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 chunk += line
         if chunk:
             await _guarded_reply(update, chunk.rstrip())
+
+    def _track_context_message(
+        context: ContextTypes.DEFAULT_TYPE,
+        storage_key: str,
+        message_obj: object | None,
+    ) -> None:
+        if message_obj is None:
+            return
+        chat_id = getattr(message_obj, "chat_id", None)
+        message_id = getattr(message_obj, "message_id", None)
+        if not isinstance(chat_id, int) or not isinstance(message_id, int):
+            return
+        items = context.user_data.get(storage_key)
+        if not isinstance(items, list):
+            items = []
+            context.user_data[storage_key] = items
+        items.append((chat_id, message_id))
+
+    async def _cleanup_context_messages(
+        context: ContextTypes.DEFAULT_TYPE,
+        storage_key: str,
+    ) -> None:
+        items = context.user_data.pop(storage_key, None)
+        if not isinstance(items, list):
+            return
+        for chat_id, message_id in items:
+            if not isinstance(chat_id, int) or not isinstance(message_id, int):
+                continue
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except BadRequest:
+                pass
 
     def _tg_units(text: str) -> int:
         return len(text.encode("utf-16-le")) // 2
@@ -435,8 +469,8 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                     InlineKeyboardButton("🔁 Retries", callback_data=f"ma:r:{chat_id}:{page}"),
                 ],
                 [
-                    InlineKeyboardButton("Direktive aktivieren", callback_data=f"ma:da:{chat_id}:{page}"),
-                    InlineKeyboardButton("➖ Dir", callback_data=f"ma:dl:{chat_id}:{page}"),
+                    InlineKeyboardButton("➕ Direktive aktivieren", callback_data=f"ma:da:{chat_id}:{page}"),
+                    InlineKeyboardButton("🗂️ Direktiven anzeigen", callback_data=f"ma:dl:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton("✏️ An Edit", callback_data=f"ma:ae:{chat_id}:{page}"),
@@ -583,81 +617,40 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         )
         return InlineKeyboardMarkup(rows)
 
-    def _as_boolish(value: object) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "y"}
-        return False
+    def _directive_preset_catalog() -> list[tuple[str, str]]:
+        return [
+            ("Anti-Loop (General)", anti_loop_preset_text),
+            ("Role Consistency", role_consistency_preset_text),
+            ("Latest User First", last_user_priority_preset_text),
+            ("No Re-Ask Public Page", no_repeat_public_page_preset_text),
+            ("Contract Detail Drilldown", contract_detail_drilldown_preset_text),
+            ("No Early Registration", no_premature_registration_preset_text),
+            ("Analysis Loop Memory", analysis_memory_preset_text),
+        ]
 
-    async def _build_directive_presets(chat_id: int, limit: int = 7) -> list[tuple[str, str]]:
-        latest_analysis: dict[str, object] = {}
-        if service.store:
-            latest = service.store.latest_for_chat(chat_id)
-            if latest and isinstance(latest.analysis, dict):
-                latest_analysis = dict(latest.analysis)
+    def _directive_preset_by_index(index: int) -> tuple[str, str] | None:
+        presets = _directive_preset_catalog()
+        if index < 1 or index > len(presets):
+            return None
+        return presets[index - 1]
 
-        chat_context = await service.core.build_chat_context(chat_id)
-        last_user_text = ""
-        last_assistant_text = ""
-        if chat_context and chat_context.messages:
-            for item in reversed(chat_context.messages):
-                if not last_user_text and item.role == "user":
-                    last_user_text = item.text.strip()
-                if not last_assistant_text and item.role == "assistant":
-                    last_assistant_text = item.text.strip()
-                if last_user_text and last_assistant_text:
-                    break
-
-        active_directives = service.list_chat_directives(chat_id, active_only=True, limit=50)
-        active_norm = {" ".join(item.text.lower().split()) for item in active_directives}
-        seen_norm: set[str] = set()
-        candidates: list[tuple[str, str]] = []
-
-        def add_candidate(label: str, text: str, when: bool = True) -> None:
-            if not when:
-                return
-            norm = " ".join(text.lower().split())
-            if norm in seen_norm or norm in active_norm:
-                return
-            seen_norm.add(norm)
-            candidates.append((label, text))
-
-        last_user_l = last_user_text.lower()
-        last_assistant_l = last_assistant_text.lower()
-        combined = " ".join(
+    def _directive_preset_keyboard(chat_id: int, page: int, preset_index: int, dryrun_running: bool = False) -> InlineKeyboardMarkup:
+        dryrun_label = "⏳ Dry-Run läuft" if dryrun_running else "Dry-Run"
+        dryrun_cb = f"md:busy:{chat_id}:{page}:{preset_index}" if dryrun_running else f"md:pd:{chat_id}:{page}:{preset_index}"
+        return InlineKeyboardMarkup(
             [
-                last_user_l,
-                last_assistant_l,
-                json.dumps(latest_analysis, ensure_ascii=False).lower() if latest_analysis else "",
+                [
+                    InlineKeyboardButton("Add", callback_data=f"md:pa:{chat_id}:{page}:{preset_index}"),
+                    InlineKeyboardButton(dryrun_label, callback_data=dryrun_cb),
+                    InlineKeyboardButton("Once", callback_data=f"md:po:{chat_id}:{page}:{preset_index}"),
+                ]
             ]
         )
-        user_no_website = bool(
-            re.search(
-                r"(not stated.*website|not on (the )?website|already explained|steht nicht.*website)",
-                last_user_l,
-            )
-        )
-        asks_public_link_again = any(token in last_assistant_l for token in ("link", "website", "fee", "terms", "page"))
-        mentions_contract = any(token in combined for token in ("contract", "agreement", "klausel", "vertrag"))
-        registration_push = any(
-            token in last_user_l for token in ("register", "sign up", "open account", "verify account", "deposit now")
-        )
-        link_received = _as_boolish(latest_analysis.get("link_received")) or _as_boolish(latest_analysis.get("received_link"))
 
-        add_candidate("Anti-Loop (General)", anti_loop_preset_text, when=True)
-        add_candidate("Role Consistency", role_consistency_preset_text, when=True)
-        add_candidate("Latest User First", last_user_priority_preset_text, when=True)
-        add_candidate(
-            "No Re-Ask Public Page",
-            no_repeat_public_page_preset_text,
-            when=(user_no_website or (asks_public_link_again and link_received)),
-        )
-        add_candidate("Contract Detail Drilldown", contract_detail_drilldown_preset_text, when=(mentions_contract or user_no_website))
-        add_candidate("No Early Registration", no_premature_registration_preset_text, when=registration_push)
-        add_candidate("Analysis Loop Memory", analysis_memory_preset_text, when=True)
-
-        return candidates[: max(1, min(limit, 7))]
+    async def _build_directive_presets(chat_id: int, limit: int = 7) -> list[tuple[str, str]]:
+        _ = chat_id
+        presets = _directive_preset_catalog()
+        return presets[: max(1, min(limit, 7))]
 
     def _encode_key_token(key: str) -> str:
         raw = key.encode("utf-8")
@@ -1438,6 +1431,98 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await _safe_edit_message(query, "Ungueltige Aktion.")
                 return
 
+            if op == "busy":
+                await query.answer("Dry-Run läuft bereits…")
+                return
+
+            if op in {"pa", "pd", "po"}:
+                try:
+                    preset_index = int(target_raw)
+                except ValueError:
+                    await _safe_edit_message(query, "Ungueltiges Preset.")
+                    return
+                preset = _directive_preset_by_index(preset_index)
+                if not preset:
+                    await _safe_edit_message(query, "Preset nicht gefunden.")
+                    return
+                preset_label, preset_text = preset
+                if op == "pa":
+                    created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="session")
+                    if not created:
+                        await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
+                        return
+                    await _safe_edit_message(query, f"✅ Added #{created.id} ({created.scope}): {preset_label}")
+                    if chat_id in infobox_targets:
+                        app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt."), update=None)
+                    return
+                if op == "po":
+                    created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="once")
+                    if not created:
+                        await _safe_edit_message(query, f"⚠️ Preset konnte nicht hinzugefuegt werden: {preset_label}")
+                        return
+                    await _safe_edit_message(query, f"✅ Added once #{created.id}: {preset_label}")
+                    if chat_id in infobox_targets:
+                        app.create_task(_push_infobox_update(chat_id, heading="Direktive hinzugefügt (once)."), update=None)
+                    return
+                created = service.add_chat_directive(chat_id=chat_id, text=preset_text, scope="dryrun")
+                if not created:
+                    await _safe_edit_message(query, f"⚠️ Dry-Run konnte nicht vorbereitet werden: {preset_label}")
+                    return
+
+                source_message = getattr(query, "message", None)
+                base_text = ""
+                if source_message:
+                    base_text = str(getattr(source_message, "text", "") or getattr(source_message, "caption", "") or "")
+                if not base_text:
+                    base_text = f"{preset_index}. {preset_label}\n\n{preset_text}"
+                started_text = base_text + "\n\n⏳ Dry-Run läuft…"
+                await _safe_edit_message(
+                    query,
+                    _limit_message(started_text, max_len=3200),
+                    reply_markup=_directive_preset_keyboard(chat_id, page, preset_index, dryrun_running=True),
+                )
+
+                target_chat_id = int(getattr(source_message, "chat_id", allowed_chat_id)) if source_message else allowed_chat_id
+                target_message_id = int(getattr(source_message, "message_id", 0)) if source_message else 0
+
+                async def _finish_dry_run() -> None:
+                    final_text: str
+                    try:
+                        summary = await service.run_once(target_chat_ids={chat_id})
+                        suggestion = ""
+                        if service.store:
+                            latest = service.store.latest_for_chat(chat_id)
+                            if latest and isinstance(latest.suggestion, str):
+                                suggestion = latest.suggestion.strip()
+                        final_lines = [
+                            base_text,
+                            "",
+                            f"✅ Dry-Run fertig: Chats={summary.chat_count}, Gesendet={summary.sent_count}",
+                        ]
+                        if suggestion:
+                            final_lines.extend(["", "Ergebnis:", _truncate_value(suggestion, max_len=900)])
+                        final_text = _limit_message("\n".join(final_lines), max_len=3200)
+                    except Exception as exc:
+                        final_text = _limit_message(base_text + f"\n\n⚠️ Dry-Run fehlgeschlagen: {exc}", max_len=3200)
+                    finally:
+                        service.delete_chat_directive(chat_id=chat_id, directive_id=created.id)
+                        if chat_id in infobox_targets:
+                            app.create_task(_push_infobox_update(chat_id, heading="Dry-Run ausgeführt."), update=None)
+
+                    if target_message_id > 0:
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=target_chat_id,
+                                message_id=target_message_id,
+                                text=final_text,
+                                reply_markup=_directive_preset_keyboard(chat_id, page, preset_index, dryrun_running=False),
+                            )
+                        except BadRequest:
+                            pass
+
+                app.create_task(_finish_dry_run())
+                return
+
             if op == "cancel":
                 batch_id = target_raw.strip()
                 entries = directive_delete_batches.pop(batch_id, [])
@@ -1718,7 +1803,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         if action in {"dl", "d-"}:
-            directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=10)
+            directives = service.list_chat_directives(chat_id=chat_id, active_only=True, limit=50)
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             if not directives:
                 text, keyboard = await _render_chat_detail(
@@ -1733,9 +1818,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             # Keep batch_id delimiter-safe for callback_data parsing (":" is used as separator).
             batch_id = f"{chat_id}-{directive_delete_batch_seq['value']}"
             created_messages: list[tuple[int, int]] = []
+            target_chat_id = int(getattr(getattr(query, "message", None), "chat_id", allowed_chat_id))
 
             cancel_message = await context.bot.send_message(
-                chat_id=allowed_chat_id,
+                chat_id=target_chat_id,
                 text=_limit_message(
                     f"Direktiven fuer Chat {chat_id} ({len(directives)} Eintraege).\n"
                     "Abbrechen loescht alle unten erzeugten Direktiven-Nachrichten."
@@ -1748,10 +1834,10 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
             for item in directives:
                 msg = await context.bot.send_message(
-                    chat_id=allowed_chat_id,
+                    chat_id=target_chat_id,
                     text=_limit_message(f"#{item.id} ({item.scope})\n{item.text}", max_len=3200),
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("(X) Loeschen", callback_data=f"md:del:{chat_id}:{page}:{item.id}")]]
+                        [[InlineKeyboardButton("Löschen", callback_data=f"md:del:{chat_id}:{page}:{item.id}")]]
                     ),
                 )
                 created_messages.append((int(msg.chat_id), int(msg.message_id)))
@@ -2009,52 +2095,53 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return ConversationHandler.END
         if action not in {"da", "d+"}:
             return ConversationHandler.END
+        await _cleanup_context_messages(context, directive_context_messages_key)
         presets = await _build_directive_presets(chat_id, limit=7)
-        preset_buttons: list[str] = []
-        preset_map: dict[str, str] = {}
-        for idx, (label, preset_text) in enumerate(presets, start=1):
-            button_label = f"{idx}. {_truncate_value(label, max_len=24)}"
-            preset_buttons.append(button_label)
-            preset_map[button_label] = preset_text
         context.user_data["directive_target"] = {
             "chat_id": chat_id,
             "page": page,
-            "preset_map": preset_map,
         }
         is_card = bool(getattr(getattr(query, "message", None), "photo", None))
         text, keyboard = await _render_chat_detail(
             chat_id,
             page,
-            heading="Direktive aktivieren: unten Vorschlag wählen oder frei tippen (/cancel).",
+            heading="Direktive aktivieren: Preset per Inline-Button oder frei tippen.",
             compact=is_card,
         )
         await _safe_edit_message(query, text, reply_markup=keyboard)
-        rows: list[list[KeyboardButton]] = []
-        for idx in range(0, len(preset_buttons), 2):
-            rows.append([KeyboardButton(item) for item in preset_buttons[idx : idx + 2]])
-        rows.append([KeyboardButton(directive_reply_kb_cancel)])
+        rows: list[list[KeyboardButton]] = [[KeyboardButton(directive_reply_kb_cancel)]]
         reply_keyboard = ReplyKeyboardMarkup(
             keyboard=rows,
             resize_keyboard=True,
             one_time_keyboard=False,
-            input_field_placeholder="Vorschlag wählen oder Direktive eingeben…",
+            input_field_placeholder="Direktive eingeben…",
         )
-        info_lines = ["Direktiven-Vorschlaege:"]
+        target_chat_id = int(getattr(getattr(query, "message", None), "chat_id", allowed_chat_id))
+        info_lines = ["Direktiven-Presets (Inline):"]
         for idx, (label, preset_text) in enumerate(presets, start=1):
-            info_lines.append(f"- {idx}. {_truncate_value(label, max_len=60)}")
-            info_lines.append(f"  {_truncate_value(preset_text, max_len=120)}")
+            sent_preset = await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=_limit_message(f"{idx}. {label}\n\n{preset_text}", max_len=3200),
+                reply_markup=_directive_preset_keyboard(chat_id, page, idx, dryrun_running=False),
+            )
+            _track_context_message(context, directive_context_messages_key, sent_preset)
+        info_lines.append("- Add: speichert als Session-Direktive")
+        info_lines.append("- Dry-Run: einmalige Generierung mit temporaerer Direktive")
+        info_lines.append("- Once: loescht sich nach erster Anwendung (operator_applied)")
         info_lines.append("- Frei tippen: eigene Direktive senden")
         info_lines.append("- ❌ Abbrechen: Eingabe beenden")
-        await context.bot.send_message(
-            chat_id=allowed_chat_id,
+        sent_info = await context.bot.send_message(
+            chat_id=target_chat_id,
             text=_limit_message("\n".join(info_lines), max_len=3000),
             reply_markup=reply_keyboard,
         )
+        _track_context_message(context, directive_context_messages_key, sent_info)
         return directive_input_state
 
     async def directive_input_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not _authorized(update):
             return ConversationHandler.END
+        await _cleanup_context_messages(context, directive_context_messages_key)
         context.user_data.pop("directive_target", None)
         if update.message:
             await update.message.reply_text("Direktiven-Eingabe abgebrochen.", reply_markup=ReplyKeyboardRemove())
@@ -2074,24 +2161,22 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         raw_chat_id = target.get("chat_id")
         raw_page = target.get("page")
         if not isinstance(raw_chat_id, int) or not isinstance(raw_page, int):
+            await _cleanup_context_messages(context, directive_context_messages_key)
             context.user_data.pop("directive_target", None)
             return ConversationHandler.END
         text = message.text.strip()
         if text == directive_reply_kb_cancel:
+            await _cleanup_context_messages(context, directive_context_messages_key)
             context.user_data.pop("directive_target", None)
             await message.reply_text("Direktiven-Editor beendet.", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
-        preset_map_raw = target.get("preset_map")
-        if isinstance(preset_map_raw, dict):
-            preset_text = preset_map_raw.get(text)
-            if isinstance(preset_text, str) and preset_text.strip():
-                text = preset_text.strip()
         if not text or text.startswith("/"):
             await _guarded_reply(update, "Bitte Direktive als normalen Text senden (ohne Slash-Befehl).")
             return directive_input_state
         chat_id = raw_chat_id
         page = raw_page
         created = service.add_chat_directive(chat_id=chat_id, text=text, scope="session")
+        await _cleanup_context_messages(context, directive_context_messages_key)
         context.user_data.pop("directive_target", None)
         if not created:
             await _guarded_reply(update, "Direktive konnte nicht gespeichert werden.")
@@ -2123,6 +2208,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return ConversationHandler.END
         if action not in {"ak", "a+", "ae"}:
             return ConversationHandler.END
+        await _cleanup_context_messages(context, analysis_context_messages_key)
         mode = "quick" if action == "ae" else "new"
         context.user_data["analysis_target"] = {"chat_id": chat_id, "page": page, "mode": mode}
         is_card = bool(getattr(getattr(query, "message", None), "photo", None))
@@ -2148,7 +2234,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 one_time_keyboard=False,
                 input_field_placeholder="key=value oder JSON senden…",
             )
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=allowed_chat_id,
                 text=(
                     "Reply-Keyboard aktiv (Demo).\n"
@@ -2158,6 +2244,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 ),
                 reply_markup=reply_keyboard,
             )
+            _track_context_message(context, analysis_context_messages_key, sent)
         return analysis_input_state
 
     async def analysis_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2207,6 +2294,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     async def analysis_input_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not _authorized(update):
             return ConversationHandler.END
+        await _cleanup_context_messages(context, analysis_context_messages_key)
         context.user_data.pop("analysis_target", None)
         if update.message:
             await update.message.reply_text("Analysis-Eingabe abgebrochen.", reply_markup=ReplyKeyboardRemove())
@@ -2227,18 +2315,22 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         edit_mode = str(target.get("mode", "new")).strip().lower()
         edit_key = target.get("key")
         if not isinstance(raw_chat_id, int):
+            await _cleanup_context_messages(context, analysis_context_messages_key)
             context.user_data.pop("analysis_target", None)
             return ConversationHandler.END
         text = message.text.strip()
         if text == analysis_reply_kb_cancel:
+            await _cleanup_context_messages(context, analysis_context_messages_key)
             context.user_data.pop("analysis_target", None)
             await message.reply_text("Analysis-Editor beendet.", reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
         if text == analysis_reply_kb_keyvalue:
-            await _guarded_reply(update, "Format: key=value (Beispiel: loop_guard_active=true)")
+            sent = await message.reply_text("Format: key=value (Beispiel: loop_guard_active=true)")
+            _track_context_message(context, analysis_context_messages_key, sent)
             return analysis_input_state
         if text == analysis_reply_kb_json:
-            await _guarded_reply(update, "Format: JSON-Objekt zum Mergen, z.B. {\"loop_guard_active\": true}")
+            sent = await message.reply_text("Format: JSON-Objekt zum Mergen, z.B. {\"loop_guard_active\": true}")
+            _track_context_message(context, analysis_context_messages_key, sent)
             return analysis_input_state
         if edit_mode != "edit":
             try:
@@ -2259,6 +2351,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 for key_obj, value_obj in parsed_obj.items():
                     current[str(key_obj)] = value_obj
                 updated = service.store.update_latest_analysis(raw_chat_id, current)
+                await _cleanup_context_messages(context, analysis_context_messages_key)
                 context.user_data.pop("analysis_target", None)
                 if not updated:
                     await _guarded_reply(update, "Analysis konnte nicht aktualisiert werden.")
@@ -2295,16 +2388,19 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         if not service.store:
             await _guarded_reply(update, "Keine Datenbank konfiguriert.")
+            await _cleanup_context_messages(context, analysis_context_messages_key)
             context.user_data.pop("analysis_target", None)
             return ConversationHandler.END
         latest_entry = service.store.latest_for_chat(raw_chat_id)
         if not latest_entry:
             await _guarded_reply(update, "Keine Analyse fuer diesen Chat gefunden.")
+            await _cleanup_context_messages(context, analysis_context_messages_key)
             context.user_data.pop("analysis_target", None)
             return ConversationHandler.END
         current = dict(latest_entry.analysis or {})
         current[key] = value
         updated = service.store.update_latest_analysis(raw_chat_id, current)
+        await _cleanup_context_messages(context, analysis_context_messages_key)
         context.user_data.pop("analysis_target", None)
         if not updated:
             await _guarded_reply(update, "Analysis konnte nicht aktualisiert werden.")
