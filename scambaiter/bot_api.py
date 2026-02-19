@@ -463,12 +463,18 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
     def _chat_detail_keyboard(chat_id: int, page: int) -> InlineKeyboardMarkup:
         pending = service.get_pending_message(chat_id)
         is_running = bool(pending and pending.state == MessageState.SENDING_TYPING)
+        is_paused = bool(pending and pending.state == MessageState.PAUSED)
         auto_enabled = service.is_chat_auto_enabled(chat_id)
         can_skip_waiting = bool(
             auto_enabled and pending and pending.state in {MessageState.WAITING, MessageState.SENDING_TYPING}
         )
-        run_label = "⏭️ Skip" if (is_running or can_skip_waiting) else "▶️ Queue Run"
-        run_action = "sk" if (is_running or can_skip_waiting) else "q"
+        if is_paused:
+            run_label = "▶️ Continue Queue"
+            run_action = "q"
+        else:
+            run_label = "⏭️ Skip" if (is_running or can_skip_waiting) else "▶️ Queue Run"
+            run_action = "sk" if (is_running or can_skip_waiting) else "q"
+        stop_label = "⏹️ Stop" if is_paused else "⏸️ Pause"
         auto_on_label = "🟢 Auto an" if auto_enabled else "⚪ Auto an"
         auto_off_label = "⚪ Auto aus" if auto_enabled else "🔴 Auto aus"
         return InlineKeyboardMarkup(
@@ -476,7 +482,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 [
                     InlineKeyboardButton("🧠 Generate", callback_data=f"ma:g:{chat_id}:{page}"),
                     InlineKeyboardButton(run_label, callback_data=f"ma:{run_action}:{chat_id}:{page}"),
-                    InlineKeyboardButton("⏹️ Stop", callback_data=f"ma:x:{chat_id}:{page}"),
+                    InlineKeyboardButton(stop_label, callback_data=f"ma:x:{chat_id}:{page}"),
                 ],
                 [
                     InlineKeyboardButton(auto_on_label, callback_data=f"ma:on:{chat_id}:{page}"),
@@ -511,6 +517,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             MessageState.GENERATING: "G",
             MessageState.WAITING: "W",
             MessageState.SENDING_TYPING: "S",
+            MessageState.PAUSED: "P",
             MessageState.SENT: "OK",
             MessageState.ESCALATED: "H",
             MessageState.CANCELLED: "X",
@@ -1867,7 +1874,18 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 return
 
         if action == "x":
-            result = await service.abort_send(chat_id, trigger="bot-stop-button")
+            pending = service.get_pending_message(chat_id)
+            if pending and pending.state == MessageState.PAUSED:
+                service.set_chat_auto(chat_id, enabled=False)
+                result = await service.abort_send(chat_id, trigger="bot-stop-button")
+                if "Auto aus" not in result:
+                    result = result + " | Auto aus."
+            else:
+                paused = await service.pause_queue(chat_id, trigger="bot-pause-button")
+                if paused:
+                    result = "Queue pausiert. Mit Continue Queue fortsetzen oder Stop zum Beenden."
+                else:
+                    result = "Keine pausierbare Queue aktiv."
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
             text, keyboard = await _render_chat_detail(
                 chat_id, page, heading=result, compact=is_card

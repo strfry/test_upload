@@ -26,6 +26,7 @@ class MessageState(str, Enum):
     GENERATING = "generating"
     WAITING = "waiting"
     SENDING_TYPING = "sending_typing"
+    PAUSED = "paused"
     SENT = "sent"
     ESCALATED = "escalated"
     CANCELLED = "cancelled"
@@ -120,6 +121,43 @@ class BackgroundService:
             return False
         self._skip_current_action.add(int(chat_id))
         return True
+
+    async def pause_queue(self, chat_id: int, trigger: str = "manual-pause") -> bool:
+        pending = self._pending_messages.get(chat_id)
+        if not pending:
+            return False
+        if pending.state == MessageState.PAUSED:
+            return True
+
+        if pending.state == MessageState.SENDING_TYPING:
+            task = self._chat_tasks.get(chat_id)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            actions = list(pending.action_queue or [])
+            if actions and isinstance(pending.current_action_index, int):
+                idx = max(1, min(len(actions), pending.current_action_index))
+                pending.action_queue = actions[idx - 1 :]
+            pending.state = MessageState.PAUSED
+            pending.trigger = trigger
+            pending.wait_until = None
+            pending.current_action_until = None
+            self._notify_pending_changed(chat_id)
+            return True
+
+        if pending.state == MessageState.WAITING:
+            self._cancel_chat_task(chat_id)
+            pending.state = MessageState.PAUSED
+            pending.trigger = trigger
+            pending.wait_until = None
+            pending.current_action_until = None
+            self._notify_pending_changed(chat_id)
+            return True
+
+        return False
 
     def _consume_skip_request(self, chat_id: int) -> bool:
         if int(chat_id) in self._skip_current_action:
@@ -807,7 +845,7 @@ class BackgroundService:
             self._notify_pending_changed(chat_id)
             return True
 
-        if pending.state not in {MessageState.WAITING, MessageState.ERROR}:
+        if pending.state not in {MessageState.WAITING, MessageState.ERROR, MessageState.PAUSED}:
             return False
 
         self._cancel_chat_task(chat_id)
@@ -1029,7 +1067,7 @@ class BackgroundService:
             self._notify_pending_changed(chat_id)
             return f"Gesendete Nachricht {pending.sent_message_id} wurde gelöscht."
 
-        if pending.state in {MessageState.WAITING, MessageState.GENERATING}:
+        if pending.state in {MessageState.WAITING, MessageState.GENERATING, MessageState.PAUSED}:
             pending.state = MessageState.CANCELLED
             pending.trigger = trigger
             self._notify_pending_changed(chat_id)
@@ -1087,6 +1125,7 @@ class BackgroundService:
             MessageState.GENERATING,
             MessageState.WAITING,
             MessageState.SENDING_TYPING,
+            MessageState.PAUSED,
             MessageState.ESCALATED,
         }:
             return False
