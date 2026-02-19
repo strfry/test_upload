@@ -573,6 +573,14 @@ class BackgroundService:
         heuristic_score = float(heuristic_score_value) if isinstance(heuristic_score_value, (int, float)) else None
         flags_value = event.get("heuristic_flags")
         heuristic_flags = [str(item) for item in flags_value] if isinstance(flags_value, list) else []
+        prompt_tokens_value = event.get("prompt_tokens")
+        completion_tokens_value = event.get("completion_tokens")
+        total_tokens_value = event.get("total_tokens")
+        reasoning_tokens_value = event.get("reasoning_tokens")
+        prompt_tokens = int(prompt_tokens_value) if isinstance(prompt_tokens_value, (int, float)) else None
+        completion_tokens = int(completion_tokens_value) if isinstance(completion_tokens_value, (int, float)) else None
+        total_tokens = int(total_tokens_value) if isinstance(total_tokens_value, (int, float)) else None
+        reasoning_tokens = int(reasoning_tokens_value) if isinstance(reasoning_tokens_value, (int, float)) else None
 
         if self.store:
             self.store.save_generation_attempt(
@@ -589,6 +597,10 @@ class BackgroundService:
                 raw_excerpt=raw_excerpt,
                 suggestion=suggestion,
                 schema=schema,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                reasoning_tokens=reasoning_tokens,
             )
             self._notify_pending_changed(chat_id)
             return
@@ -611,6 +623,10 @@ class BackgroundService:
             raw_excerpt=raw_excerpt,
             suggestion=suggestion,
             schema=schema,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            reasoning_tokens=reasoning_tokens,
         )
         bucket = self._recent_generation_attempts.setdefault(int(chat_id), [])
         bucket.insert(0, synthetic)

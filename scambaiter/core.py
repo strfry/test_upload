@@ -514,6 +514,34 @@ def _normalize_text_content(content: object) -> str:
     return ""
 
 
+def _extract_usage_fields(usage: object) -> dict[str, int | None]:
+    def _read(obj: object, key: str) -> object | None:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def _to_int(value: object | None) -> int | None:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        return None
+
+    prompt_tokens = _to_int(_read(usage, "prompt_tokens"))
+    completion_tokens = _to_int(_read(usage, "completion_tokens"))
+    total_tokens = _to_int(_read(usage, "total_tokens"))
+    details = _read(usage, "completion_tokens_details")
+    reasoning_tokens = _to_int(_read(details, "reasoning_tokens"))
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "reasoning_tokens": reasoning_tokens,
+    }
+
+
 class ScambaiterCore:
     def __init__(self, config: AppConfig, store: AnalysisStore | None = None) -> None:
         self.config = config
@@ -692,6 +720,7 @@ class ScambaiterCore:
                 }
             )
 
+        convo_events: list[dict[str, str]] = []
         for item in context.messages:
             ts_utc = item.timestamp.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             event_payload = {
@@ -704,7 +733,28 @@ class ScambaiterCore:
                 event_payload["message_id"] = item.message_id
             if item.reply_to is not None:
                 event_payload["reply_to"] = item.reply_to
-            messages.append({"role": item.role, "content": json.dumps(event_payload, ensure_ascii=False)})
+            convo_events.append({"role": item.role, "content": json.dumps(event_payload, ensure_ascii=False)})
+
+        if self.config.prompt_middle_trim_enabled:
+            keep_head = max(1, int(self.config.prompt_middle_trim_keep_head))
+            keep_tail = max(1, int(self.config.prompt_middle_trim_keep_tail))
+            max_chars = max(1500, int(self.config.prompt_middle_trim_max_chars))
+            total_chars = sum(len(item.get("content", "")) for item in convo_events)
+            min_events_for_trim = keep_head + keep_tail + 2
+            if total_chars > max_chars and len(convo_events) >= min_events_for_trim:
+                head_slice = convo_events[:keep_head]
+                tail_slice = convo_events[-keep_tail:]
+                omitted_count = max(0, len(convo_events) - len(head_slice) - len(tail_slice))
+                marker = {
+                    "role": "system",
+                    "content": (
+                        f"Kontext gekürzt: {omitted_count} mittlere Nachrichten ausgelassen "
+                        "um Tokenverbrauch zu begrenzen."
+                    ),
+                }
+                convo_events = head_slice + [marker] + tail_slice
+
+        messages.extend(convo_events)
 
         return messages
 
@@ -1061,6 +1111,7 @@ class ScambaiterCore:
             choice = completion.choices[0]
             finish_reason = (getattr(choice, "finish_reason", None) or "").strip().lower()
             usage = getattr(completion, "usage", None)
+            usage_fields = _extract_usage_fields(usage)
             if usage is not None:
                 self._debug(f"Model-Usage (Versuch {attempt}): {usage}")
             if finish_reason:
@@ -1089,6 +1140,7 @@ class ScambaiterCore:
                             "raw_excerpt": truncate_for_log(raw, max_len=1000),
                             "suggestion": None,
                             "schema": None,
+                            **usage_fields,
                         }
                     )
                 print(
@@ -1099,6 +1151,7 @@ class ScambaiterCore:
                     language_system_prompt=language_system_prompt,
                     on_attempt=on_attempt,
                     attempt_no=attempt,
+                    usage_fields=usage_fields,
                 )
                 if repaired is not None:
                     if on_warning:
@@ -1139,6 +1192,7 @@ class ScambaiterCore:
                             "raw_excerpt": truncate_for_log(raw, max_len=1000),
                             "suggestion": suggestion,
                             "schema": metadata.get("schema"),
+                            **usage_fields,
                         }
                     )
                 return current_output
@@ -1154,6 +1208,7 @@ class ScambaiterCore:
                             "raw_excerpt": truncate_for_log(raw, max_len=1000),
                             "suggestion": suggestion,
                             "schema": metadata.get("schema"),
+                            **usage_fields,
                         }
                     )
                 return current_output
@@ -1173,6 +1228,7 @@ class ScambaiterCore:
                         "raw_excerpt": truncate_for_log(raw, max_len=1000),
                         "suggestion": suggestion,
                         "schema": metadata.get("schema"),
+                        **usage_fields,
                     }
                 )
 
@@ -1199,6 +1255,7 @@ class ScambaiterCore:
         language_system_prompt: str | None = None,
         on_attempt: GenerationAttemptCallback | None = None,
         attempt_no: int = 0,
+        usage_fields: dict[str, int | None] | None = None,
     ) -> ModelOutput | None:
         candidate = (source_text or "").strip()
         if not candidate:
@@ -1250,6 +1307,12 @@ class ScambaiterCore:
         except Exception as exc:
             print(f"[WARN] Repair-Request fehlgeschlagen: {format_model_exception_details(exc)}")
             return None
+        repair_usage_fields = _extract_usage_fields(getattr(repair_completion, "usage", None))
+        base_usage_fields = dict(usage_fields or {})
+        usage_payload = {**base_usage_fields}
+        for key, value in repair_usage_fields.items():
+            if isinstance(value, int):
+                usage_payload[key] = (usage_payload.get(key) or 0) + value
 
         repair_raw = _normalize_text_content(repair_completion.choices[0].message.content)
         repaired = parse_structured_model_output(repair_raw)
@@ -1266,6 +1329,7 @@ class ScambaiterCore:
                         "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
                         "suggestion": None,
                         "schema": None,
+                        **usage_payload,
                     }
                 )
             return None
@@ -1282,6 +1346,7 @@ class ScambaiterCore:
                         "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
                         "suggestion": repaired.suggestion,
                         "schema": repaired.metadata.get("schema"),
+                        **usage_payload,
                     }
                 )
             return None
@@ -1297,6 +1362,7 @@ class ScambaiterCore:
                         "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
                         "suggestion": repaired.suggestion,
                         "schema": repaired.metadata.get("schema"),
+                        **usage_payload,
                     }
                 )
             return None
@@ -1311,6 +1377,7 @@ class ScambaiterCore:
                     "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
                     "suggestion": repaired.suggestion,
                     "schema": repaired.metadata.get("schema"),
+                    **usage_payload,
                 }
             )
         return repaired

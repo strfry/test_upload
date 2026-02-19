@@ -23,6 +23,10 @@ class AppConfig:
     bot_token: str | None
     auto_interval_seconds: int
     analysis_db_path: str
+    prompt_middle_trim_enabled: bool
+    prompt_middle_trim_max_chars: int
+    prompt_middle_trim_keep_head: int
+    prompt_middle_trim_keep_tail: int
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -83,4 +87,8 @@ def load_config() -> AppConfig:
         bot_token=env_str("SCAMBAITER_BOT_TOKEN"),
         auto_interval_seconds=env_int("SCAMBAITER_AUTO_INTERVAL_SECONDS", 120),
         analysis_db_path=env_str("SCAMBAITER_ANALYSIS_DB_PATH", "scambaiter.sqlite3") or "scambaiter.sqlite3",
+        prompt_middle_trim_enabled=env_flag("SCAMBAITER_PROMPT_MIDDLE_TRIM", default=True),
+        prompt_middle_trim_max_chars=env_int("SCAMBAITER_PROMPT_MIDDLE_TRIM_MAX_CHARS", 9000),
+        prompt_middle_trim_keep_head=env_int("SCAMBAITER_PROMPT_MIDDLE_TRIM_KEEP_HEAD", 4),
+        prompt_middle_trim_keep_tail=env_int("SCAMBAITER_PROMPT_MIDDLE_TRIM_KEEP_TAIL", 10),
     )

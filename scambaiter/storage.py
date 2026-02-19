@@ -59,6 +59,10 @@ class StoredGenerationAttempt:
     raw_excerpt: str | None
     suggestion: str | None
     schema: str | None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 class AnalysisStore:
@@ -129,10 +133,18 @@ class AnalysisStore:
                     heuristic_flags_json TEXT,
                     raw_excerpt TEXT,
                     suggestion TEXT,
-                    schema TEXT
+                    schema TEXT,
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens INTEGER,
+                    reasoning_tokens INTEGER
                 )
                 """
             )
+            self._ensure_column(conn, "generation_attempts", "prompt_tokens", "INTEGER")
+            self._ensure_column(conn, "generation_attempts", "completion_tokens", "INTEGER")
+            self._ensure_column(conn, "generation_attempts", "total_tokens", "INTEGER")
+            self._ensure_column(conn, "generation_attempts", "reasoning_tokens", "INTEGER")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_generation_attempts_chat_id_id ON generation_attempts (chat_id, id DESC)"
             )
@@ -345,6 +357,10 @@ class AnalysisStore:
         raw_excerpt: str | None,
         suggestion: str | None,
         schema: str | None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
     ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         flags_json = json.dumps(list(heuristic_flags or []), ensure_ascii=False)
@@ -354,9 +370,10 @@ class AnalysisStore:
                 INSERT INTO generation_attempts (
                     created_at, chat_id, title, trigger, attempt_no, phase,
                     parsed_ok, accepted, reject_reason, heuristic_score,
-                    heuristic_flags_json, raw_excerpt, suggestion, schema
+                    heuristic_flags_json, raw_excerpt, suggestion, schema,
+                    prompt_tokens, completion_tokens, total_tokens, reasoning_tokens
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -373,6 +390,10 @@ class AnalysisStore:
                     raw_excerpt,
                     suggestion,
                     schema,
+                    (int(prompt_tokens) if isinstance(prompt_tokens, int) else None),
+                    (int(completion_tokens) if isinstance(completion_tokens, int) else None),
+                    (int(total_tokens) if isinstance(total_tokens, int) else None),
+                    (int(reasoning_tokens) if isinstance(reasoning_tokens, int) else None),
                 ),
             )
 
@@ -382,7 +403,8 @@ class AnalysisStore:
                 """
                 SELECT id, created_at, chat_id, title, trigger, attempt_no, phase,
                        parsed_ok, accepted, reject_reason, heuristic_score,
-                       heuristic_flags_json, raw_excerpt, suggestion, schema
+                       heuristic_flags_json, raw_excerpt, suggestion, schema,
+                       prompt_tokens, completion_tokens, total_tokens, reasoning_tokens
                 FROM generation_attempts
                 WHERE chat_id = ?
                 ORDER BY id DESC
@@ -398,7 +420,8 @@ class AnalysisStore:
                 """
                 SELECT id, created_at, chat_id, title, trigger, attempt_no, phase,
                        parsed_ok, accepted, reject_reason, heuristic_score,
-                       heuristic_flags_json, raw_excerpt, suggestion, schema
+                       heuristic_flags_json, raw_excerpt, suggestion, schema,
+                       prompt_tokens, completion_tokens, total_tokens, reasoning_tokens
                 FROM generation_attempts
                 ORDER BY id DESC
                 LIMIT ?
@@ -474,6 +497,10 @@ class AnalysisStore:
             raw_excerpt=(str(row[12]) if row[12] is not None else None),
             suggestion=(str(row[13]) if row[13] is not None else None),
             schema=(str(row[14]) if row[14] is not None else None),
+            prompt_tokens=(int(row[15]) if row[15] is not None else None),
+            completion_tokens=(int(row[16]) if row[16] is not None else None),
+            total_tokens=(int(row[17]) if row[17] is not None else None),
+            reasoning_tokens=(int(row[18]) if row[18] is not None else None),
         )
 
     def image_description_get(self, image_hash: str) -> StoredImageDescription | None:

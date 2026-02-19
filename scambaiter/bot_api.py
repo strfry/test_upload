@@ -2041,15 +2041,22 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
+            total_prompt = sum(item.prompt_tokens or 0 for item in attempts)
+            total_completion = sum(item.completion_tokens or 0 for item in attempts)
+            total_all = sum(item.total_tokens or 0 for item in attempts)
             lines = [f"Chat {chat_id}", "", f"Retries ({len(attempts)}):"]
+            lines.append(f"Token-Summe: prompt={total_prompt}, completion={total_completion}, total={total_all}")
             for idx, item in enumerate(attempts, start=1):
                 status = "ok" if item.accepted else "reject"
                 reason = f" | reason={item.reject_reason}" if item.reject_reason else ""
                 schema = f" | schema={item.schema}" if item.schema else ""
+                token_part = (
+                    f" | tok p/c/t={item.prompt_tokens or 0}/{item.completion_tokens or 0}/{item.total_tokens or 0}"
+                )
                 lines.append(
                     _truncate_value(
                         f"{idx}. {item.created_at:%Y-%m-%d %H:%M:%S} | a{item.attempt_no}/{item.phase} | "
-                        f"{status}{reason}{schema}",
+                        f"{status}{reason}{schema}{token_part}",
                         max_len=220,
                     )
                 )
@@ -2093,14 +2100,21 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         if not attempts:
             await _guarded_reply(update, "Keine Retry-/Attempt-Daten vorhanden.")
             return
-        lines = ["Letzte Retries/Attempts (chatübergreifend):"]
+        total_prompt = sum(item.prompt_tokens or 0 for item in attempts)
+        total_completion = sum(item.completion_tokens or 0 for item in attempts)
+        total_all = sum(item.total_tokens or 0 for item in attempts)
+        lines = [
+            "Letzte Retries/Attempts (chatübergreifend):",
+            f"Token-Summe: prompt={total_prompt}, completion={total_completion}, total={total_all}",
+        ]
         for item in attempts:
             status = "ok" if item.accepted else "reject"
             reason = f", reason={item.reject_reason}" if item.reject_reason else ""
+            token_part = f", tok={item.prompt_tokens or 0}/{item.completion_tokens or 0}/{item.total_tokens or 0}"
             lines.append(
                 _truncate_value(
                     f"- {item.created_at:%Y-%m-%d %H:%M:%S} | {item.title} ({item.chat_id}) | "
-                    f"a{item.attempt_no}/{item.phase} {status}{reason}",
+                    f"a{item.attempt_no}/{item.phase} {status}{reason}{token_part}",
                     max_len=260,
                 )
             )
