@@ -1178,6 +1178,18 @@ class ScambaiterCore:
                 metadata=metadata,
                 actions=structured.actions,
             )
+            action_types = {str(action.get("type", "")).strip().lower() for action in current_output.actions if isinstance(action, dict)}
+            if "noop" in action_types and "send_message" in action_types:
+                filtered_actions = [
+                    action for action in current_output.actions if str(action.get("type", "")).strip().lower() != "send_message"
+                ]
+                current_output = ModelOutput(
+                    raw=current_output.raw,
+                    suggestion=current_output.suggestion,
+                    analysis=current_output.analysis,
+                    metadata=current_output.metadata,
+                    actions=filtered_actions,
+                )
             last_output = current_output
             has_send_message = any(str(action.get("type")) == "send_message" for action in current_output.actions)
             if has_send_message and suggestion and not looks_like_reasoning_output(suggestion):
