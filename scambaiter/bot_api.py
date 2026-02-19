@@ -464,8 +464,11 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
         pending = service.get_pending_message(chat_id)
         is_running = bool(pending and pending.state == MessageState.SENDING_TYPING)
         auto_enabled = service.is_chat_auto_enabled(chat_id)
-        run_label = "⏭️ Skip" if is_running else "▶️ Queue Run"
-        run_action = "sk" if is_running else "q"
+        can_skip_waiting = bool(
+            auto_enabled and pending and pending.state in {MessageState.WAITING, MessageState.SENDING_TYPING}
+        )
+        run_label = "⏭️ Skip" if (is_running or can_skip_waiting) else "▶️ Queue Run"
+        run_action = "sk" if (is_running or can_skip_waiting) else "q"
         auto_on_label = "🟢 Auto an" if auto_enabled else "⚪ Auto an"
         auto_off_label = "⚪ Auto aus" if auto_enabled else "🔴 Auto aus"
         return InlineKeyboardMarkup(
@@ -1824,8 +1827,33 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         if action == "sk":
-            skipped = service.request_skip_current_action(chat_id)
             is_card = bool(getattr(getattr(query, "message", None), "photo", None))
+            pending = service.get_pending_message(chat_id)
+            auto_enabled = service.is_chat_auto_enabled(chat_id)
+
+            if pending and pending.state == MessageState.WAITING and auto_enabled:
+                started = await service.trigger_send(chat_id, trigger="bot-skip-waiting")
+                if started:
+                    text, keyboard = await _render_chat_detail(
+                        chat_id,
+                        page,
+                        heading="Wartephase übersprungen. Sendeablauf gestartet.",
+                        compact=is_card,
+                    )
+                    await _safe_edit_message(query, text, reply_markup=keyboard)
+                    return
+
+            skipped = service.request_skip_current_action(chat_id)
+            if skipped:
+                text, keyboard = await _render_chat_detail(
+                    chat_id,
+                    page,
+                    heading="Aktuelle Wartezeit wird übersprungen.",
+                    compact=is_card,
+                )
+                await _safe_edit_message(query, text, reply_markup=keyboard)
+                return
+
             if not skipped:
                 text, keyboard = await _render_chat_detail(
                     chat_id,
@@ -1835,14 +1863,6 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
-            text, keyboard = await _render_chat_detail(
-                chat_id,
-                page,
-                heading="Aktuelle Wartezeit wird übersprungen.",
-                compact=is_card,
-            )
-            await _safe_edit_message(query, text, reply_markup=keyboard)
-            return
 
         if action == "x":
             result = await service.abort_send(chat_id, trigger="bot-stop-button")
