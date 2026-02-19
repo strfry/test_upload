@@ -11,6 +11,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    InputMediaPhoto,
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -157,6 +158,17 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             except BadRequest:
                 pass
+
+    async def _clear_picture_cards(chat_id: int) -> None:
+        ids = picture_card_messages.pop(chat_id, [])
+        for msg_id in ids:
+            try:
+                await app.bot.delete_message(chat_id=allowed_chat_id, message_id=msg_id)
+            except BadRequest:
+                pass
+
+    def _record_picture_card(chat_id: int, message_id: int) -> None:
+        picture_card_messages.setdefault(chat_id, []).append(message_id)
 
     def _tg_units(text: str) -> int:
         return len(text.encode("utf-16-le")) // 2
@@ -1894,6 +1906,7 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
             return
 
         if action == "i":
+            await _clear_picture_cards(chat_id)
             keyboard = _chat_detail_keyboard(chat_id, page)
             await _safe_edit_message(query, f"Chat {chat_id}\n\nLade letzte Bilder...", reply_markup=keyboard)
             images = await service.core.get_recent_images_with_captions_for_control_channel(chat_id, limit=3)
@@ -1907,27 +1920,24 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
                 )
                 await _safe_edit_message(query, text, reply_markup=keyboard)
                 return
-            for image_bytes, caption in images:
+            media_group: list[InputMediaPhoto] = []
+            tail_messages: list[str] = []
+            for idx, (image_bytes, caption) in enumerate(images):
                 caption_pages = _paginate_text(caption, max_len=card_caption_len)
-                first_caption = _limit_caption(caption_pages[0] if caption_pages else "")
-                try:
-                    await context.bot.send_photo(
-                        chat_id=allowed_chat_id,
-                        photo=InputFile(image_bytes, filename=f"chat_{chat_id}.jpg"),
-                        caption=first_caption,
+                main_caption = _limit_caption(caption_pages[0] if caption_pages else "")
+                caption_text = f"[Picture Card]\n{main_caption}" if idx == 0 else main_caption
+                media = InputMediaPhoto(media=image_bytes, caption=caption_text if idx == 0 else None)
+                media_group.append(media)
+                for tail_idx, tail_page in enumerate(caption_pages[1:], start=2):
+                    tail_messages.append(
+                        f"[Picture Card]\nBild {idx+1} Caption {tail_idx}/{len(caption_pages)}:\n{tail_page}"
                     )
-                except BadRequest as exc:
-                    if not _is_caption_too_long_error(exc):
-                        raise
-                    await context.bot.send_photo(
-                        chat_id=allowed_chat_id,
-                        photo=InputFile(image_bytes, filename=f"chat_{chat_id}.jpg"),
-                    )
-                for idx, tail_page in enumerate(caption_pages[1:], start=2):
-                    await context.bot.send_message(
-                        chat_id=allowed_chat_id,
-                        text=f"Bild-Caption {idx}/{len(caption_pages)}:\n{tail_page}",
-                    )
+            album = await context.bot.send_media_group(chat_id=allowed_chat_id, media=media_group)
+            for msg in album:
+                _record_picture_card(chat_id, int(getattr(msg, "message_id", 0)))
+            for tail_text in tail_messages:
+                msg = await context.bot.send_message(chat_id=allowed_chat_id, text=tail_text)
+                _record_picture_card(chat_id, int(msg.message_id))
             text, keyboard = await _render_chat_detail(
                 chat_id,
                 page,
