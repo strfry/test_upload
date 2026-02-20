@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 import re
+from datetime import datetime
 
 from telegram import (
     BotCommand,
@@ -28,6 +30,7 @@ from telegram.ext import (
     filters,
 )
 
+from scambaiter.core import ModelExceptionEvent
 from scambaiter.service import BackgroundService, MessageState, PendingMessage
 
 
@@ -1240,8 +1243,44 @@ def create_bot_app(token: str, service: BackgroundService, allowed_chat_id: int)
 
         app.create_task(_post_warning(), update=None)
 
+    def _on_model_exception(event: ModelExceptionEvent) -> None:
+        async def _post_exception_file() -> None:
+            caption = (
+                f"LLM-Exception: {event.title} ({event.chat_id}) | "
+                f"Versuch {event.attempt_no} | Phase {event.phase}"
+            )
+            payload_lines = [
+                f"Chat: {event.title} ({event.chat_id})",
+                f"Versuch: {event.attempt_no}",
+                f"Phase: {event.phase}",
+                "",
+                "Prompt:",
+                event.prompt_json,
+                "",
+                "Failed Generation:",
+                event.failed_generation or "<leer>",
+                "",
+                "Error Details:",
+                event.error_details,
+            ]
+            payload = "\n".join(payload_lines)
+            buffer = io.BytesIO(payload.encode("utf-8"))
+            filename = f"llm_exception_{event.chat_id}_{datetime.utcnow():%Y%m%d%H%M%S}.txt"
+            buffer.seek(0)
+            try:
+                await app.bot.send_document(
+                    chat_id=allowed_chat_id,
+                    document=InputFile(buffer, filename=filename),
+                    caption=_limit_message(caption, max_len=3000),
+                )
+            except BadRequest as exc:
+                print(f"[WARN] Modell-Ausnahme konnte nicht geschickt werden: {exc}")
+
+        app.create_task(_post_exception_file(), update=None)
+
     service.add_pending_listener(_on_pending_changed)
     service.add_warning_listener(_on_warning)
+    service.add_model_exception_listener(_on_model_exception)
 
     async def run_once(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _authorized(update):

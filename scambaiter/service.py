@@ -9,8 +9,9 @@ from typing import Callable
 
 PendingListener = Callable[[int, "PendingMessage | None"], None]
 WarningListener = Callable[[str], None]
+ModelExceptionListener = Callable[[ModelExceptionEvent], None]
 
-from scambaiter.core import ChatContext, ScambaiterCore, SuggestionResult
+from scambaiter.core import ChatContext, ModelExceptionEvent, ScambaiterCore, SuggestionResult
 from scambaiter.storage import AnalysisStore, StoredDirective, StoredGenerationAttempt
 
 
@@ -84,6 +85,7 @@ class BackgroundService:
         self._skip_current_action: set[int] = set()
         self._pending_listeners: list[PendingListener] = []
         self._warning_listeners: list[WarningListener] = []
+        self._model_exception_listeners: list[ModelExceptionListener] = []
         self._general_warnings: list[str] = []
         self._recent_generation_attempts: dict[int, list[StoredGenerationAttempt]] = {}
         if self.core.config.hf_max_tokens < 1000:
@@ -96,6 +98,9 @@ class BackgroundService:
 
     def add_warning_listener(self, listener: WarningListener) -> None:
         self._warning_listeners.append(listener)
+
+    def add_model_exception_listener(self, listener: ModelExceptionListener) -> None:
+        self._model_exception_listeners.append(listener)
 
     def list_chat_directives(self, chat_id: int, active_only: bool = True, limit: int = 50) -> list[StoredDirective]:
         if not self.store:
@@ -488,6 +493,7 @@ class BackgroundService:
                         event=event,
                     )
                 ),
+                on_model_exception=self._notify_model_exception_listeners,
             )
             merged_analysis = self._merge_analysis(previous_analysis if self.store else None, output.analysis)
             result = SuggestionResult(
@@ -828,6 +834,16 @@ class BackgroundService:
         self.add_general_warning(f"Chat {chat_id}: {message}")
         if on_warning:
             on_warning(chat_id, message)
+
+    def _notify_model_exception_listeners(self, event: ModelExceptionEvent) -> None:
+        listeners = list(self._model_exception_listeners)
+        if not listeners:
+            return
+        for listener in listeners:
+            try:
+                listener(event)
+            except Exception as exc:
+                print(f"[WARN] Model exception listener failed: {exc}")
 
     async def trigger_send(self, chat_id: int, trigger: str = "manual") -> bool:
         pending = self._pending_messages.get(chat_id)

@@ -230,6 +230,17 @@ class ModelOutput:
     metadata: dict[str, str]
     actions: list[dict[str, object]]
 
+
+@dataclass
+class ModelExceptionEvent:
+    chat_id: int
+    title: str
+    attempt_no: int
+    phase: str
+    prompt_json: str
+    failed_generation: str | None
+    error_details: str
+
 GenerationAttemptCallback = Callable[[dict[str, object]], None]
 
 
@@ -1014,6 +1025,7 @@ class ScambaiterCore:
         prompt_context: dict[str, object] | None = None,
         on_warning: Callable[[str], None] | None = None,
         on_attempt: GenerationAttemptCallback | None = None,
+        on_model_exception: Callable[[ModelExceptionEvent], None] | None = None,
     ) -> ModelOutput:
         last_output: ModelOutput | None = None
         language_system_prompt = self.build_language_system_prompt(language_hint)
@@ -1065,6 +1077,24 @@ class ScambaiterCore:
                     f"in Versuch {attempt}: {error_detail}"
                 )
                 failed_generation = extract_failed_generation_from_exception(exc)
+                if on_model_exception:
+                    try:
+                        prompt_json = json.dumps(messages, ensure_ascii=False, indent=2)
+                    except Exception as prompt_exc:
+                        prompt_json = f"<failed to serialize prompt: {prompt_exc}>"
+                    event = ModelExceptionEvent(
+                        chat_id=context.chat_id,
+                        title=context.title,
+                        attempt_no=attempt,
+                        phase="initial",
+                        prompt_json=prompt_json,
+                        failed_generation=failed_generation,
+                        error_details=error_detail,
+                    )
+                    try:
+                        on_model_exception(event)
+                    except Exception as listener_exc:
+                        self._debug(f"Model exception listener failed: {listener_exc}")
                 if on_attempt:
                     on_attempt(
                         {
