@@ -4,6 +4,11 @@ import json
 from typing import Any
 
 
+def _is_json_validate_failed(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "json_validate_failed" in text or "failed to validate json" in text
+
+
 def call_hf_openai_chat(
     *,
     token: str,
@@ -23,6 +28,8 @@ def call_hf_openai_chat(
         base_url=(base_url or "https://router.huggingface.co/v1").rstrip("/"),
         timeout=timeout_seconds,
     )
+
+    # First attempt: provider-side JSON mode.
     try:
         response = client.chat.completions.create(
             model=model,
@@ -31,7 +38,20 @@ def call_hf_openai_chat(
             messages=messages,
         )
     except Exception as exc:  # pragma: no cover - network/provider edge
-        raise RuntimeError(str(exc)) from exc
+        # Some HF-backed models intermittently fail provider JSON validation.
+        # Fallback: retry once without response_format and let our local parser validate.
+        if _is_json_validate_failed(exc):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                )
+            except Exception as retry_exc:  # pragma: no cover - network/provider edge
+                raise RuntimeError(str(retry_exc)) from retry_exc
+        else:
+            raise RuntimeError(str(exc)) from exc
+
     value = json.loads(response.model_dump_json())
     return value if isinstance(value, dict) else {}
 
