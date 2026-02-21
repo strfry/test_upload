@@ -42,3 +42,10 @@ OpenClaw ←— Telegram Channel — Maid↔ScamBaiterControl —→ ScamBaiterC
 - Der Client baut pro User eigene `history`-Stores (z. B. pro-ID-Dateien) und verwendet die gleichen prompt-Templates, damit Analysis/Suggestions konsistent bleiben.
 - Nachrichten werden nur als Vorschläge generiert. Freigabe und manueller Send (z. B. `/start`, `/send1`) bleiben beim User, der die Buttons ausführt.
 - Feedback wird lokal gespeichert (trace_id/analysis/pending) damit spätere Prompts die früheren Manual-Sends berücksichtigen.
+
+## Event-Modell
+
+- `event_type` deckt die eigentlichen Chat-Ereignisse ab (`message`, `photo`, `forward`, `typing_interval`).
+- `role` ist auf die Klarrollen `manual`, `scammer`, `scambaiter`, `system` begrenzt; `typing_interval` und ähnliche technische Events gehen als `role=system` in die History.
+- Escalation ist kein separates History-Event, sondern eine Control-Action, die in `meta` (z. B. `actions`) oder im Pending-Log vermerkt wird.
+- Beim Prompt-Build filtert der Client einfach `role IN ('scammer','scambaiter','manual')` und `event_type IN ('message','photo')`, sodass das LLM nur relevante Inhalte sieht.
