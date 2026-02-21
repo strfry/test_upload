@@ -957,25 +957,14 @@ def _resolve_target_and_role_without_active(
     return sender_id, "scammer"
 
 
-def _extract_primary_user_first_name(message: Message) -> str | None:
-    sender = getattr(message, "from_user", None)
-    first_name = getattr(sender, "first_name", None)
-    if isinstance(first_name, str) and first_name.strip():
-        return first_name.strip()
-    return None
-
-
 def _build_forward_payload(message: Message, role: str) -> dict[str, Any]:
     event_type = _infer_event_type(message)
     source_message_id = _build_source_message_id(message)
-    primary_user_first_name = _extract_primary_user_first_name(message)
     meta: dict[str, Any] = {
         "control_chat_id": int(message.chat_id),
         "control_message_id": int(message.message_id),
         "forward_profile": _extract_forward_profile_info(message),
     }
-    if isinstance(primary_user_first_name, str):
-        meta["primary_user_first_name"] = primary_user_first_name
     return {
         "event_type": event_type,
         "source_message_id": source_message_id,

@@ -545,7 +545,7 @@ class AnalysisStore:
                 {
                     "event_type": "message",
                     "role": "system",
-                    "text": f"profile_update: {row['field_path']} = {rendered} ({row['source']})",
+                    "text": f"profile_update: {row['field_path']} = {rendered}",
                     "ts_utc": str(row["changed_at"]),
                     "meta": {"kind": "profile_change", "change_id": int(row["id"])},
                 }
