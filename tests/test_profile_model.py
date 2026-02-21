@@ -41,6 +41,27 @@ class ProfileModelTest(unittest.TestCase):
             self.assertTrue(system_msgs)
             self.assertTrue(any("profile_update:" in str(item.get("text", "")) for item in system_msgs))
 
+    def test_profile_system_messages_deduplicate_by_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.upsert_chat_profile(
+                chat_id=9010,
+                patch={"identity": {"display_name": "Alice"}},
+                source="botapi_forward",
+                changed_at="2026-02-21T20:20:00Z",
+            )
+            store.upsert_chat_profile(
+                chat_id=9010,
+                patch={"identity": {"display_name": "Alice B"}},
+                source="telethon",
+                changed_at="2026-02-21T20:21:00Z",
+            )
+            system_msgs = store.list_profile_system_messages(chat_id=9010, limit=10)
+            updates = [m for m in system_msgs if "identity.display_name" in str(m.get("text", ""))]
+            self.assertEqual(1, len(updates))
+            self.assertIn("Alice B", str(updates[0].get("text", "")))
+
     def test_profile_patch_from_forward_profile_maps_identity(self) -> None:
         patch = _profile_patch_from_forward_profile(
             {

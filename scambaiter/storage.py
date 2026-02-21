@@ -518,15 +518,23 @@ class AnalysisStore:
         ]
 
     def list_profile_system_messages(self, chat_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        # Keep only the latest change per field_path to avoid repeating old profile churn
+        # in every prompt view.
         rows = self._conn.execute(
             """
             SELECT id, field_path, new_value_json, source, changed_at
             FROM profile_change_log
             WHERE chat_id = ?
+              AND id IN (
+                SELECT MAX(id)
+                FROM profile_change_log
+                WHERE chat_id = ?
+                GROUP BY field_path
+              )
             ORDER BY id DESC
             LIMIT ?
             """,
-            (chat_id, limit),
+            (chat_id, chat_id, limit),
         ).fetchall()
         rows = list(reversed(rows))
         messages: list[dict[str, Any]] = []

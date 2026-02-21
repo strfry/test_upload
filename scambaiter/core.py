@@ -340,7 +340,7 @@ class ScambaiterCore:
                     "meta": event.meta,
                 }
             )
-        profile_updates = self.store.list_profile_system_messages(chat_id=chat_id, limit=20)
+        profile_updates = self.store.list_profile_system_messages(chat_id=chat_id, limit=6)
         for item in profile_updates:
             prompt_events.append(
                 {
