@@ -5,8 +5,9 @@ Dieses Dokument beschreibt den vereinbarten Umsetzungsweg in lesbarer Form.
 Es ist kein Prompt, sondern die Referenz fuer Reihenfolge, Verantwortlichkeiten und Abnahmekriterien.
 
 ## Leitentscheidung
-- Telethon bleibt im Core als Quelle fuer Telegram-Kontext.
-- Die Ausfuehrung von Nachrichtenaktionen wird an einen externen Executor/Nachrichtenempfaenger abgegeben.
+- Telethon ist separater Integrationsbaustein und der einzige automatische Sender/Empfaenger.
+- `ScamBaiterControl` ist der Steuerbot fuer Slash/UI und History-Aufbau via User-Forwards.
+- Core und Service bereiten Vorschlaege vor und protokollieren, senden aber nicht selbst.
 - Der externe Integrationsvertrag bleibt stabil ueber Input-/Output-Schemas plus Feedback.
 
 ## Umsetzungsphasen
@@ -16,7 +17,7 @@ Ergebnis:
 - Core-Capabilities fuer Analyse, Prompt-Erzeugung und Vorschlagsgenerierung sind klar getrennt.
 - Der externe Vertrag beschreibt Datenformate, nicht die Orchestrierungsreihenfolge.
 - `docs/client_api_reference.md` ist die verbindliche Contract-Quelle.
-- Externe Steuerung bleibt first-level Slash-kompatibel (`/prompt`, `/analyse`, `/chats`) und ist klar vom internen LLM-Schema getrennt.
+- Externe Steuerung bleibt first-level Slash-kompatibel (`/prompt`, `/analyse`, `/queue`, `/chats`) und ist klar vom internen LLM-Schema getrennt.
 
 Abnahme:
 - Die dokumentierten Slash-Kommandos werden korrekt auf Runtime-Kommandos abgebildet.
@@ -24,23 +25,27 @@ Abnahme:
 
 ### Phase 2: Telethon-kontext und Persistenz stabilisieren
 Ergebnis:
-- Kontextgewinnung (History, Typing, Medien) bleibt in Telethon-basierten Core-Komponenten.
-- Store deckt Analyse, Versuche, Bildcache und Profilfoto-Referenzen ab.
+- Kontextgewinnung (History, Typing, Medien) wird ueber Telethon und Forward-Ingestion in denselben Event-Store gefuehrt.
+- Store deckt Analyse, Versuche, Event-Modell, Bildcache und Profilfoto-Referenzen ab.
 - Logging in `logs/conversations/<conversation>.log` ist fuer Betrieb nutzbar.
 
 Abnahme:
-- Kontextdaten aus Telethon erscheinen reproduzierbar im Prompt-Kontext.
+- Kontextdaten aus Telethon und User-Forwards erscheinen reproduzierbar im Prompt-Kontext.
 - Bild-/Profilcaches koennen wiederverwendet werden (keine unnötigen Uploads).
 
-### Phase 3: Executor-Split fuer Bot API
+### Phase 3: Control-Bot API konsolidieren
 Ergebnis:
-- `python-telegram-bot`-Ausfuehrung wird in externen Client verlagert.
-- Externer Client uebernimmt Zustellung, Retry und sichtbare Monitoring-Oberflaeche.
+- `ScamBaiterControl`-Kommandos und Alias-Mapping sind stabil dokumentiert.
+- `/suggest` wird nicht als Agent-Command verwendet; die Ausfuehrung referenziert konkrete Vorschlaege ueber `/queue <suggestion_id>`.
+- Steueraktionen aus Chat und Inline-Menues sind deterministisch im Service abgebildet.
+- Prompt-Aufbereitung nutzt immer den gesamten Verlauf und kuerzt bei Tokenlimit vom Gespraechsbeginn.
+- Prompt-Zeitstempel sind immer in `HH:MM`; Store behaelt volle Zeitdaten.
 - Scambaiter bleibt auf Analyse/Suggestion/Feedback-Verarbeitung fokussiert.
 
 Abnahme:
-- Externer Client kann Actions sicher ausfuehren und Feedback zurueckschreiben.
-- Core laeuft ohne direkte Zustellabhaengigkeit.
+- Agent/Benutzer kann den gesamten Lauf ausschliesslich ueber Bot-Steuerkommandos bedienen.
+- Service-Zustaende und Actions bleiben nachvollziehbar im Store.
+- Freigegebene Sends laufen nur ueber Telethon-Deliverypfad; Core/Service senden nicht direkt.
 
 ### Phase 4: Monitoring und Feedback-Schleife
 Ergebnis:
@@ -56,12 +61,17 @@ Abnahme:
 - Providerpfad: HF zuerst, optional OpenAI-Fallback.
 - Promptquellen: `prompts/<channel>/<conversation>.json` + Richtlinien aus `docs/backlog.md` und `docs/prompt_cases/`.
 - Datenhaltung: `analyses`, `directives`, `generation_attempts`, `image_entries`, `profile_photos`, Gespraechslogs.
+- Profilschema: `docs/profile_schema_draft.md` mit Telethon als kanonischer Quelle und BotAPI-Forward als Teilmengen-Quelle.
 
 ## Teststrategie
 - Contract-Tests fuer Command-Kompatibilitaet und Alias-Mapping.
 - Integrations-Tests fuer Core-Capabilities inklusive Provider-Fallback.
-- Telethon-Integrationstest fuer Kontextaufbereitung.
-- Externer-Executor-Simulation mit realistischem Feedback-Lifecycle.
+- Telethon-Integrationstest fuer Empfang und Sendepfad.
+- Forward-Ingestion-Test: User-Forwards werden mit originalem `event_type` gespeichert und als `role=manual` markiert, falls noch unbekannt.
+- Control-Bot-Simulation mit realistischem Feedback- und Zustands-Lifecycle.
+- Prompt-Builder-Test: kompletter Verlauf bis Limit, danach Kuerzung vom Anfang; Zeitformat im Prompt immer `HH:MM`.
+- Escalation-Test: Kontrollaktionen werden als `meta` protokolliert und sind auswertbar.
+- Profilschema-Test: BotAPI-Forward fuellt nur Teilfelder, Telethon-Anreicherung setzt fehlende Felder (`bio`, `profile_media`) deterministisch.
 
 ## Geltungsbereich und Grenzen
 In Scope:
@@ -70,5 +80,5 @@ In Scope:
 - Stabiler Integrationsvertrag
 
 Out of Scope:
-- UI-Design und Operationslogik des externen Clients
+- UI-Redesign ausserhalb des bestehenden Bot-Steuerkonzepts
 - Plattformspezifische Orchestrierung ausserhalb des Repositories

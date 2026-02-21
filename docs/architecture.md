@@ -5,33 +5,46 @@ Scambaiter ist die Analyse- und Vorschlags-Engine fuer Scam-Dialoge.
 Die Engine erzeugt strukturierte Analyse, Antworttext und Action-Plan, fuehrt Nachrichten aber nicht selbst aus.
 
 Die zentrale Architekturentscheidung ist:
-- Telethon bleibt im Core fuer Telegram-Kontextgewinnung.
-- Die Zustellung (Send/Queue/Delete) liegt bei einem externen API-Client als Executor/Nachrichtenempfaenger.
+- Telethon ist ein eigener Teil und der einzige automatische Telegram-Sender plus Empfaenger.
+- Der Telegram-Bot `ScamBaiterControl` ist die Steueroberflaeche fuer Slash-Kommandos, Inline-Aktionen und Monitoring.
+- Benutzer plus Control-Kanal entscheiden ueber Freigabe; Core bereitet nur vor und protokolliert.
+- OpenClaw ist nur eine Referenz fuer UI-Muster (z. B. Inline-Buttons), nicht fuer echten Versand.
 
 ## Systemgrenzen
 
-### Im Core (Scambaiter)
-- Chat-Historie lesen, Ordner scannen, Typing-Hints aufnehmen (Telethon).
+### Im Core (ScambaiterCore)
 - Prompt-Kontext aufbauen aus Verlauf, `previous_analysis`, Direktiven und optionalen Live-Signalen.
 - Modellaufrufe (HF-first, optional OpenAI-Fallback) fuer Analyse und Vorschlaege.
 - JSON-Validierung und Normalisierung von Actions.
-- Persistenz von Analyse, Generierungsversuchen, Bildcache und Profilfoto-Referenzen.
+- Persistenz von Analyse, Generierungsversuchen, Event-Store, Bildcache und Profilfoto-Referenzen.
 
-### Im externen Client (Executor)
-- Action-Plan konsumieren und reale Delivery-Aktionen ausfuehren.
-- Monitoring/UX bereitstellen (Bot API, Dashboard, Alerts).
-- Feedback an Scambaiter zurueckmelden (gesendet, verworfen, Fehler).
+### Im Telethon-Teil
+- Live-Nachrichten empfangen und als Events persistieren.
+- Telegram-Delivery als einziger automatischer Sender ausfuehren.
+- Volle Rohdaten fuer Store erfassen (nicht prompt-optimiert kuerzen).
+
+### Im Control-Kanal (`ScamBaiterControl`)
+- Benutzer und Agent steuern den Lauf ueber Slash-Kommandos und Inline-Aktionen.
+- Der Bot liefert Status, Analysen, Prompt-Preview und Bedienaktionen.
+- Der Bot kapselt Telegram-spezifische Darstellung (`chat_id`, `text`, `reply_to`, `inline_keyboard`).
+- Entscheidungen (z. B. Run, Stop, Analyse setzen, Queue) werden in den Core-Service rueckgespielt.
+- Feedback (approve/reject, send_state) fliesst zurueck in Core und Store.
+- Der Bot kann History aus User-Forwards aufbauen; das ist der primaere Aufbauweg fuer neue Chats.
+
+### Externe Gateways (Referenz, nicht Sender)
+- Externe Systeme koennen UI-Muster oder Workflows inspirieren.
+- Sie duerfen keine finale Versandrolle fuer Scambaiting-Nachrichten uebernehmen.
 
 ## Hauptkomponenten
 
 ### `ScambaiterCore`
 - Verantwortlich fuer Modellinteraktion und strukturierte Antwortgenerierung.
-- Nutzt Telethon fuer Kontext- und Medienzugriff.
-- Gibt strukturierte Ergebnisse zurueck (`analysis`, `message`, `actions`, Metadaten).
+- Nutzt den Event-Store als Wahrheit fuer Prompt-Kontext.
+- Gibt strukturierte Ergebnisse zurueck (`analysis`, `message`, `actions`, Metadaten), ohne selbst zu senden.
 
 ### `BackgroundService`
 - Orchestriert Scans, Pending-Zustaende, Vorschlagsgenerierung und Statusverwaltung.
-- Fuehrt Queue-Logik auf Core-Seite, ohne die externe Zustellungshoheit zu verletzen.
+- Fuehrt Queue- und Freigabelogik auf Core-Seite, ohne selbst Delivery auszufuehren.
 - Bindeglied zwischen Core, Store und Integrationsschicht.
 
 ### `AnalysisStore`
@@ -39,6 +52,7 @@ Die zentrale Architekturentscheidung ist:
   - Analysen und Modellausgaben
   - Direktiven
   - Generierungsversuche
+  - Events (`event_type`, `role`, Voll-Metadaten)
   - `image_entries` (caption/file_id cache)
   - `profile_photos`
 
@@ -46,13 +60,13 @@ Die zentrale Architekturentscheidung ist:
 Der externe Vertrag ist in `docs/client_api_reference.md` versioniert.
 
 Wichtige Leitlinien:
-- Scambaiter beschreibt Inputs/Outputs und Feedback-Formate, aber keine feste Client-Orchestrierung.
-- Die Reihenfolge und Art der Aufrufe ist Aufgabe des externen Client-Agenten.
+- Scambaiter beschreibt Inputs/Outputs und Feedback-Formate der Steuerkommandos.
+- Reihenfolge und Art der Aufrufe erfolgen im Control-Kanal durch Benutzer/Agent.
 - Feedback ist verpflichtend, damit Traceability und Nachsteuerung funktionieren.
 - Breaking Changes am Vertrag erfordern Schema-Versionssprung.
 
 ### Trennung der API-Ebenen
-- Externe Client/BotAPI-Steuerung laeuft ueber first-level Slash-Kommandos wie `/prompt`, `/analyse`, `/chats` (siehe `docs/client_api_reference.md`).
+- Externe Client/BotAPI-Steuerung laeuft ueber first-level Slash-Kommandos wie `/prompt`, `/analyse`, `/queue`, `/chats` (siehe `docs/client_api_reference.md`).
 - Das interne LLM-Vertragsschema `scambait.llm.v1` bleibt eine Core-Engine-Schnittstelle und ist nicht die externe Agent-API.
 
 ## Medien- und Kartenmodell
@@ -66,15 +80,27 @@ Fachregeln und Guardrails liegen in:
 - `docs/prompt_cases/`
 - `docs/snippets/prompt_konkretheit.txt`
 - `docs/event_schema_draft.md`
+- `docs/profile_schema_draft.md`
 
 Diese Quellen definieren die inhaltlichen Erwartungen an Analysefelder, Eskalationsverhalten, Loop-Vermeidung und Themenfokus.
 
 ## Referenz-Datenfluss
-1. Core sammelt Kontext ueber Telethon und Store.
+1. Telethon und/oder User-Forwards liefern Ereignisse in den Event-Store.
 2. Core erzeugt Prompt und fragt das Modell.
-3. Core liefert strukturiertes Ergebnis an den externen Client.
-4. Externer Client fuehrt Delivery aus und sendet Feedback.
-5. Store und Monitoring-Events bilden die Nachvollziehbarkeit fuer Betrieb und Verbesserung.
+3. Core liefert strukturiertes Ergebnis und Zustandsinfos an den Control-Bot `ScamBaiterControl`.
+4. Control erzeugt die Telegram-Darstellung (Text, Buttons, Reply-Bezug) und steuert Freigaben.
+5. Telethon fuehrt die eigentliche Zustellung aus; Feedback und Escalations landen als Store-Metadaten.
+
+## Prompt-Aufbereitung
+- Prompt bekommt grundsaetzlich den gesamten Verlauf aus dem Store.
+- Wenn das Token-Limit erreicht wird, werden alte Event-Anfaenge entfernt, bis der Prompt passt.
+- Zeitangaben werden fuer den Prompt immer auf `HH:MM` reduziert.
+- Store behaelt immer die vollstaendige Zeit-/Telegram-Information.
+
+## Kommunikationskanaele
+- Telegram Live-Transport laeuft ueber Telethon (Senden/Empfangen).
+- `ScamBaiterControl` ist der Control-Kanal fuer Slash/UI und Forward-basierte History-Ergaenzung.
+- Core bleibt zustandsfuehrende Analyse-/Vorschlags-Engine ohne eigene UI-Interpretation und ohne direkte Sendelogik.
 
 ## Migrationsnotiz
-Die Zielarchitektur ist kompatibel mit dem aktuellen Codezustand: Telethon bleibt, waehrend `python-telegram-bot` schrittweise in den externen Executor verlagert wird.
+Die Zielarchitektur priorisiert eine Neuimplementierung vom Event-Store nach oben: zuerst History-Ingestion (inkl. Forwards), dann Prompt-Build, dann Control-Flow, danach Delivery-Integrationen.

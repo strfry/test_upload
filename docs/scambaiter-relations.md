@@ -3,38 +3,45 @@
 ## Rolleschema
 
 ```
-OpenClaw ←— Telegram Channel — Maid↔ScamBaiterControl —→ ScamBaiterCore ←— Telethon Client — Maid↔Jonathan
-OpenClaw ←— Telegram Channel — Maid↔ScamBaiterControl —→ ScamBaiterCore ←— Telethon Client — Maid↔Julia (Scammer)
+OpenClaw (reference only)
+        \
+         \ UI examples + /history style
+          \
+ScamBaiterControl (BotAPI control channel) <-> ScamBaiterCore <-> Event Store <-> Telethon
+                                                                       ^
+                                                                       |
+                                                           Telegram live transport
 ```
 
-- **OpenClaw** bleibt der Agent/Gateway für Telegram, zeigt Buttons und gibt Beispiele (Inline-Views). Er ist nicht der Absender.
-- **ScamBaiterControl** ist der interne Client, der die View‑Logik (Buttons, Typing, Inline-Keyboards) steuert und JSON-Payloads an OpenClaw sendet/empfängt.
-- **Scambaiter Core** plus **Telethon Client** bilden gemeinsam die Analyse‑Engine: Core generiert `analysis/message/actions` (HF or OpenAI), Telethon liefert History/Media und erhält Feedback.
-- Jonathan und Julia („Scammer“) sind jeweils die Nutzer, die über ScamBaiterControl an die Core/Telethon‑Schicht angeschlossen sind.
+- **OpenClaw** bleibt Referenz fuer UI-Muster und Summaries; kein aktiver Sender.
+- **ScamBaiterControl** steuert Slash-Kommandos, Inline-Buttons, Monitoring und Forward-Ingestion.
+- **Scambaiter Core** erzeugt `analysis/message/actions` und bleibt ohne direkte Sendelogik.
+- **Telethon** ist der einzige automatische Sender und Empfaenger fuer Telegram.
 
 ## Kommunikationskanäle
 
-1. **Telegram ↔ OpenClaw** – Normaler Bot-Channel (Bot API). OpenClaw verweist auf Inline-Buttons und channelspezifische Config (allowlist, party stream). 
-2. **OpenClaw ↔ ScamBaiterControl** – Skill-/tool-call (`tool.scambaiter.*`) mit JSON-Payloads für neue Nachrichten + Entscheidungen.
-3. **ScamBaiterControl ↔ ScambaiterCore** – CLI/HTTP (`analyze`, `prompt`, `suggest`, `executor`). Der Core liefert strukturierte Ergebnisse, der Client gestaltet Telegram-JSONs.
-4. **ScamBaiterControl ↔ Telethon** – History, typing/simulate_typing, Typing-Notifications, bei Bedarf auch Scheduler/Queue.
+1. **Telegram ↔ Telethon** - Live-Empfang und Delivery.
+2. **Telegram User ↔ ScamBaiterControl** - Control-Chat, Slash-Kommandos, Inline-Aktionen, Forwards.
+3. **ScamBaiterControl ↔ ScambaiterCore** - Analyse/Prompt/Queue/History APIs.
+4. **Core ↔ Store** - Events, Analysen, Direktiven, Escalation-Meta.
 
 ## Data Flow Example
 
 ```yaml
-- Update: Scammer sagt etwas
-- Telethon: liefert Kontext an Core (history, directives)
-- Core: generiert JSON (analysis, message, actions)
-- ScamBaiterControl: Verwendet Inline-Keyboard-UI + simulate_typing, verschickt Telegram-JSON an OpenClaw
-- OpenClaw: sendet finale Telegram-Nachricht an Julia
-- Feedback: Approve/Reject → ScamBaiterControl → Core/Store (pending, trace_id)
+- Update: User forwardet eine Scammer-Nachricht in den Control-Chat
+- ScamBaiterControl: validiert und speichert Event (gleicher event_type, role=manual falls neu)
+- Core: baut Prompt aus voller Store-History, kuerzt bei Tokenlimit vom Anfang
+- Core: generiert analysis/message/actions
+- Control: zeigt Vorschlag + Inline-Buttons (Queue/Approve/Reject)
+- Telethon: sendet erst nach Freigabe/Queue-Entscheidung
+- Store: schreibt Feedback und Escalation unter meta
 ```
 
 ## Hinweise
 
-- Typing-Notifications werden vom Client geloggt und in `analysis.typing_summary` zusammengefasst (pattern, sessions, gaps).
-- Nur ScamBaiterControl + der Benutzer dürfen Nachrichten senden; OpenClaw bietet nur Beispiele, keine Verantwortung.
-- Die CLI-Entrypoints (`analyze`, `suggest`, `executor`) sollten den Vertrag aus `docs/client_api_reference.md` erfüllen, damit der Skill über OpenClaw-Channel konsistent bleibt.
+- Typing-Intervalle sind optionale Systemevents und triggern alleine keine Generation.
+- Nur Telethon sendet automatisch; Benutzerfreigaben kommen ueber ScamBaiterControl.
+- OpenClaw bleibt dokumentarische Referenz ohne operative Sendekompetenz.
 
 ## Light deployment (future multiuser)
 
@@ -48,4 +55,4 @@ OpenClaw ←— Telegram Channel — Maid↔ScamBaiterControl —→ ScamBaiterC
 - `event_type` deckt die eigentlichen Chat-Ereignisse ab (`message`, `photo`, `forward`, `typing_interval`).
 - `role` ist auf die Klarrollen `manual`, `scammer`, `scambaiter`, `system` begrenzt; `typing_interval` und ähnliche technische Events gehen als `role=system` in die History.
 - Escalation ist kein separates History-Event, sondern eine Control-Action, die in `meta` (z. B. `actions`) oder im Pending-Log vermerkt wird.
-- Beim Prompt-Build filtert der Client einfach `role IN ('scammer','scambaiter','manual')` und `event_type IN ('message','photo')`, sodass das LLM nur relevante Inhalte sieht.
+- Beim Prompt-Build wird zuerst der gesamte Verlauf verwendet; bei Limit werden die aeltesten Events entfernt. Zeitangaben gehen als `HH:MM` in den Prompt.
