@@ -82,3 +82,16 @@ In Scope:
 Out of Scope:
 - UI-Redesign ausserhalb des bestehenden Bot-Steuerkonzepts
 - Plattformspezifische Orchestrierung ausserhalb des Repositories
+
+## Aktueller Handover / Nächste Schritte
+
+- Fokus bleibt auf **Phase 3 (Control-Bot API konsolidieren)**.
+- Offene Arbeitspunkte:
+  1. Slash-Contract vollständig konsistent halten (`/prompt`, `/analyse`, `/queue`, `/chats`, `/history`).
+  2. `/suggest` nicht als Agent-Command verwenden; Ausführung nur über queue-/approval-basierte Pfade.
+  3. Queue-/Action-Lifecycle je `trace_id` klar im Store sichtbar machen.
+  4. Prompt-Ansicht stabil auf Reply-JSON-Sektionen halten (`schema`, `analysis`, `message`, `actions`, `raw`) und nur relevante Prompt-Events verwenden.
+  5. Iterative Feinhärtung der Dry-Run-Fehlerdarstellung und Attempt-Diagnostik (`phase`, `accepted`, `reject_reason`).
+
+- Übergabehinweis: Umsetzung läuft auf `branch/opencraw`; letzte Änderungen sind Prompt-Card/Attempt-Diagnostik/Cleanup für Profile-Noise.
+
