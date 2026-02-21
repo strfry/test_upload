@@ -1,44 +1,74 @@
-# Implementation Plan
+# Implementierungsreferenz
 
-## Objective
-Document the refactor that turns Scambaiter into a transport-agnostic, CLI-driven core with HF/OpenAI fallback, alongside the supporting architecture updates (card cache, log stores, Bot API cleanup, feedback hooks) that external clients and monitoring layers rely on.
+## Zweck
+Dieses Dokument beschreibt den vereinbarten Umsetzungsweg in lesbarer Form.  
+Es ist kein Prompt, sondern die Referenz fuer Reihenfolge, Verantwortlichkeiten und Abnahmekriterien.
 
-## Components & Steps
+## Leitentscheidung
+- Telethon bleibt im Core als Quelle fuer Telegram-Kontext.
+- Die Ausfuehrung von Nachrichtenaktionen wird an einen externen Executor/Nachrichtenempfaenger abgegeben.
+- Der externe Integrationsvertrag bleibt stabil ueber Input-/Output-Schemas plus Feedback.
 
-1. **Core CLI commands**
-   - Implement a CLI entrypoint (e.g., `scam_baiter.py` or new module) exposing `analyze`, `prompt-builder`, `suggest`, and `executor`. Each command consumes structured JSON payloads (sender, channel, conversation ID, history, metadata) and emits JSON results (analysis, prompts, suggestions, provider metadata).
-   - `analyze` produces risk/tone/CTA tags plus sanitized summaries.
-   - `prompt-builder` merges whatever template exists under `prompts/<channel>/<conv>.json` with history and analysis tags, outputs prompt text and recorded prompt version for auditing.
-   - `suggest` posts the constructed prompt to HuggingFace router (`https://router.huggingface.co/hf-inference/models/{model}`) using `HF_TOKEN`; on router failure it falls back to `https://api-inference.huggingface.co/models/{model}` or a configurable OpenAI-compatible URI when `--provider openai` is specified. It returns `text`, provider name, tokens, and fallback hints (for monitoring).
-   - `executor` decides whether to auto-send or queue a draft, recording decision metadata in a feedback store (e.g., `feedback` table or log).
+## Umsetzungsphasen
 
-2. **Persistence & caching**
-   - Extend `AnalysisStore` with `image_entries` (chat_id, cache_key, caption, optional file_id, updated_at) and `profile_photos` tables plus helper APIs (`image_entry_get`, `image_entry_upsert`, `list_image_entries`, `has_image_entries`, `profile_photo_get/set`).
-   - Maintain `logs/conversations/<conv>.log` with inbound/outbound events, provider info, tokens, and success/error metadata for monitoring and auditing.
+### Phase 1: Vertrag und Core-Capabilities festigen
+Ergebnis:
+- Core-Capabilities fuer Analyse, Prompt-Erzeugung und Vorschlagsgenerierung sind klar getrennt.
+- Der externe Vertrag beschreibt Datenformate, nicht die Orchestrierungsreihenfolge.
+- `docs/client_api_reference.md` ist die verbindliche Contract-Quelle.
+- Externe Steuerung bleibt first-level Slash-kompatibel (`/prompt`, `/analyse`, `/chats`) und ist klar vom internen LLM-Schema getrennt.
 
-3. **Bot API & card registry**
-   - Add `card_registry` state in `bot_api.py` so every posted card (control menu, infobox, picture group, prompts) registers its `message_id`s, enabling `_cleanup_card_messages` to delete them reliably and log any failures.
-   - Update the “🖼️ Bilder” button flow to read from `image_entries`, only upload missing cards, normalize captions (`[Picture Card]` removed), register every message, and allow “Löschen” to call `_cleanup_card_messages`.
-   - Cache profile photos from scans and card posts, rendering user cards purely from stored Telegram `file_id`s to avoid repeated uploads.
+Abnahme:
+- Die dokumentierten Slash-Kommandos werden korrekt auf Runtime-Kommandos abgebildet.
+- Analyse- und Prompt-Antworten bleiben fuer den Agenten maschinenlesbar interpretierbar.
 
-4. **Architecture doc & plan sync**
-   - Update `docs/architecture.md` (already reflects much of this) to explicitly describe the CLI commands, HF/OpenAI fallback providers, prompt templates (`prompts/<channel>/<conv>.json`), `card_registry`, `image_entries`, `profile_photos`, Bot API monitoring role, logging directories, and policy/backlog references (Anti-Loop, Konkretheit, prompt_cases).
-   - Cross-reference `docs/backlog.md`, `docs/prompt_cases`, `docs/snippets`, and `docs/event_schema_draft.md` so readers understand policy/test input sources.
-   - Mention that the UI is an external Bot API client providing advanced monitoring and interacts with Scambaiter via the new CLI commands/responses.
+### Phase 2: Telethon-kontext und Persistenz stabilisieren
+Ergebnis:
+- Kontextgewinnung (History, Typing, Medien) bleibt in Telethon-basierten Core-Komponenten.
+- Store deckt Analyse, Versuche, Bildcache und Profilfoto-Referenzen ab.
+- Logging in `logs/conversations/<conversation>.log` ist fuer Betrieb nutzbar.
 
-5. **Monitoring & feedback**
-   - Ensure every CLI invocation logs provider/tokens and stores audit info either via `logs/conversations` or a feedback table to resurface in dashboards.  
-   - Track when suggestions are actually sent (executor) so the external monitoring layer can adjust prompt weights or training dumps.
+Abnahme:
+- Kontextdaten aus Telethon erscheinen reproduzierbar im Prompt-Kontext.
+- Bild-/Profilcaches koennen wiederverwendet werden (keine unnötigen Uploads).
 
-## Testing & Validation
+### Phase 3: Executor-Split fuer Bot API
+Ergebnis:
+- `python-telegram-bot`-Ausfuehrung wird in externen Client verlagert.
+- Externer Client uebernimmt Zustellung, Retry und sichtbare Monitoring-Oberflaeche.
+- Scambaiter bleibt auf Analyse/Suggestion/Feedback-Verarbeitung fokussiert.
 
-- CLI unit and integration coverage for each command, including provider fallback and prompt template merging.  
-- Image-cache flow tests ensuring `image_entries` and `card_registry` stay in sync and cleanup works.  
-- Manual Bot API run verifying “🖼️ Bilder” button uses cached images and profile photos do not trigger new uploads.  
-- End-to-end run with external UI simulation writing payload JSON and invoking the CLI chain, verifying logs, suggestions, and feedback entries.
+Abnahme:
+- Externer Client kann Actions sicher ausfuehren und Feedback zurueckschreiben.
+- Core laeuft ohne direkte Zustellabhaengigkeit.
 
-## Assumptions
+### Phase 4: Monitoring und Feedback-Schleife
+Ergebnis:
+- Stage-Events und Feedback erlauben eindeutige Nachverfolgung pro `trace_id`.
+- Provider-Wahl, Latenz und Fehlerpfade sind messbar.
+- Prompt- und Richtlinienoptimierung ist auf Basis realer Rueckmeldungen moeglich.
 
-- Default `suggest` host is `https://router.huggingface.co` (HF router) and `HF_TOKEN` is set (e.g., `deepseek-ai/DeepSeek-R1` for development).  
-- External UI/monitoring client communicates via the Bot API, not a new transport library, and uses structured JSON outputs for dashboards.  
-- Prompt templates under `prompts/<channel>/<conv>.json` are maintained manually; prompt-builder records the concatenated prompt text/version for audits.
+Abnahme:
+- Monitoring zeigt End-to-End-Lauf inkl. Fallback-Information.
+- Gesendete vs. verworfene Vorschlaege sind sauber auswertbar.
+
+## Technische Schwerpunkte
+- Providerpfad: HF zuerst, optional OpenAI-Fallback.
+- Promptquellen: `prompts/<channel>/<conversation>.json` + Richtlinien aus `docs/backlog.md` und `docs/prompt_cases/`.
+- Datenhaltung: `analyses`, `directives`, `generation_attempts`, `image_entries`, `profile_photos`, Gespraechslogs.
+
+## Teststrategie
+- Contract-Tests fuer Command-Kompatibilitaet und Alias-Mapping.
+- Integrations-Tests fuer Core-Capabilities inklusive Provider-Fallback.
+- Telethon-Integrationstest fuer Kontextaufbereitung.
+- Externer-Executor-Simulation mit realistischem Feedback-Lifecycle.
+
+## Geltungsbereich und Grenzen
+In Scope:
+- Core-Analyse und Vorschlagsgenerierung
+- Persistenz und Nachvollziehbarkeit
+- Stabiler Integrationsvertrag
+
+Out of Scope:
+- UI-Design und Operationslogik des externen Clients
+- Plattformspezifische Orchestrierung ausserhalb des Repositories

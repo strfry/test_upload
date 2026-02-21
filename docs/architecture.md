@@ -1,42 +1,80 @@
 # Architekturübersicht
 
-## Einstieg & Betriebsmodi
-- `scam_baiter.py` lädt die Umgebung, verbindet `AnalysisStore` und `ScambaiterCore` und entscheidet, ob ein einmaliger Batchlauf oder der BotAPI-Betrieb mit `BackgroundService` und `create_bot_app` startet. Der Batchlauf iteriert durch die Chats im konfigurierten Telegram-Ordner und speichert alle Modellantworten, während das Bot-Setup dauerhaft Polling, `/runonce`-befehle und automatische Intervalle steuert.
+## Ziel und Rahmen
+Scambaiter ist die Analyse- und Vorschlags-Engine fuer Scam-Dialoge.  
+Die Engine erzeugt strukturierte Analyse, Antworttext und Action-Plan, fuehrt Nachrichten aber nicht selbst aus.
 
-## Konfiguration
-- `scambaiter/config.py` normalisiert alle Umgebungsvariablen und liefert den unveränderlichen `AppConfig`, der Telegram- und HuggingFace-Zugangsdaten, Flags für Send/Interaktiv, Prompt-Trimmparameter und den Pfad zur Analyse-DB bereitstellt.
+Die zentrale Architekturentscheidung ist:
+- Telethon bleibt im Core fuer Telegram-Kontextgewinnung.
+- Die Zustellung (Send/Queue/Delete) liegt bei einem externen API-Client als Executor/Nachrichtenempfaenger.
 
-## Core & Prompt-Pipeline
-- `ScambaiterCore` liest Chats per Telethon, extrahiert Nachrichten inklusive Bildbeschreibungen über das HuggingFace-Vision-Modell, und ergänzt Kontext-Informationen aus `previous_analysis`, `operator.directives` und Live-Typing-Hints. Das Ergebnis sind strukturierte Prompt-Stacks plus Systeminstruktionen, die das Modell zu einem gültigen JSON-Schema (`scambait.llm.v1`) führen.
-- Die Antwortverarbeitung validiert Actions, normalisiert Typing/Wait-Dauern, erkennt reasoning output und führt bei Bedarf Reparaturversuche durch. Hilfsfunktionen liefern Debug-Summaries, Bild- und Profilfunktionen sowie Typing-Hints für den Service.
+## Systemgrenzen
 
-## BackgroundService & Queue-Handling
-- Der Service orchestriert Scanzyklen, bekannte Chats, Pending-Message-Zustände und Aktionstasks. Jede Chat-Zeitlinie besitzt genau einen aktiven Task (Generierung oder Sendung), Action-Queues enthalten `mark_read`, `simulate_typing`, `wait`, `send_message`, `edit_message`, `noop` oder `escalate_to_human`, und Pausen/Skip/Auto-Flags greifen über Helper.
-- Er vermittelt zwischen Core, Storage und Bot: Er liefert Prompt-Kontext mit `previous_analysis`, `operator`, `planned_queue` und Typing-Hints, speichert Generationsergebnisse, inkrementiert `loop_guard`-Direktiven, verwaltet `StoredGenerationAttempt`-Logs und triggert automatische Sendungen oder manuelle `trigger_send`.
+### Im Core (Scambaiter)
+- Chat-Historie lesen, Ordner scannen, Typing-Hints aufnehmen (Telethon).
+- Prompt-Kontext aufbauen aus Verlauf, `previous_analysis`, Direktiven und optionalen Live-Signalen.
+- Modellaufrufe (HF-first, optional OpenAI-Fallback) fuer Analyse und Vorschlaege.
+- JSON-Validierung und Normalisierung von Actions.
+- Persistenz von Analyse, Generierungsversuchen, Bildcache und Profilfoto-Referenzen.
 
-## Media- & Karteninfrastruktur
-- Die neue `card_registry` verfolgt pro Chat/Kartentyp alle verschickten `message_id`s, damit das BotUI-System gezielt Karten (Kontrollkarten, Infoboxen, Bilder, Menüs) aufräumen und Fehlermeldungen beim Löschen protokollieren kann. Jede Karte ruft `_register_card_messages` nach dem Posting, und `_cleanup_card_messages` sorgt für konsistente Aufräumversuche.
-- Die `🖼️ Bilder`-Taste liest stattdessen aus der zentralen `image_entries`-Tabelle (Cache aus Beschreibung + optionaler `file_id`), uploadet nur noch fehlende Karten, normalisiert Captions auf reine Beschreibungen und begleitet evtl. Tail-Nachrichten mit eigenen Registrierungen. Persistierte `image_entries` enthalten `chat_id`, `cache_key`, `caption`, optional `file_id` und `updated_at` und werden sowohl beim Core (Cache-Key via SHA-Hash plus Sprache) als auch beim Bot gepflegt.
-- Profilbilder werden bei Scan oder Rendering in `profile_photos` mit Telegram-`file_id` gehalten, so dass User-Cards und Infoboxen nur gecachte Fotos posten können; bei Uploads wird der neue `file_id` zurückgeschrieben.
+### Im externen Client (Executor)
+- Action-Plan konsumieren und reale Delivery-Aktionen ausfuehren.
+- Monitoring/UX bereitstellen (Bot API, Dashboard, Alerts).
+- Feedback an Scambaiter zurueckmelden (gesendet, verworfen, Fehler).
 
-## Persistenz
-- `AnalysisStore` bietet SQLite-Tabellen für Analysen, `directives`, `generation_attempts`, `image_entries` und `profile_photos`. Neben den bisherigen gespeicherten Modellantworten liefert sie CRUD-Operationen für Direktiven, Image-Cache-Zugriffe (`image_entry_get`, `image_entry_upsert`, `list_image_entries`, `has_image_entries`) und Profilfotos (`profile_photo_get/set`), um Core und Bot mit historisierten Kontextfarben zu versorgen.
+## Hauptkomponenten
 
-## Policy-, Guardrail- & Prompt-Referenzen
-- Das Backlog (Docs) enthält laufende Richtlinien: bei fehlenden Fakten `escalate_to_human` mit `analysis.missing_facts`/`suggested_analysis_keys`, Anti-Loop-Regel mit `loop_guard_active`/`blocked_intents_next_turns`, Rollenkonsistenz (Sender/Empfänger klarhalten) sowie Konkretheits-Hints (`docs/snippets/prompt_konkretheit.txt`). Diese Richtlinien fließen über `operator.directives` ebenso wie durch heuristische Guards im Prompt direkt ein.
-- `docs/prompt_cases` beschreibt Smoke-Tests für Eskalationslogik (Continue möglich vs. Konflikt), Loop-Vermeidung (`no_repeat_validator_contact`) sowie Fokus auf die letzte User-Frage. Diese JSON-Fixtures plus die Guidelines dienen als Referenz dafür, welche `actions`, `analysis`-Felder und `message.text`-Verhalten erwartet werden.
+### `ScambaiterCore`
+- Verantwortlich fuer Modellinteraktion und strukturierte Antwortgenerierung.
+- Nutzt Telethon fuer Kontext- und Medienzugriff.
+- Gibt strukturierte Ergebnisse zurueck (`analysis`, `message`, `actions`, Metadaten).
 
-## Kontextmodell & Tests
-- Der Event-Schema-Entwurf (`docs/event_schema_draft.md`) legt nahe, Konversationen als strukturierte Events (`text_message`, `image_message`, `typing`, `read_receipt`) zu modellieren, was beim Aufbau des `prompt_context` und bei zukünftigen Telemetrie- oder Export-Funktionen helfen soll.
-- `scripts/prompt_runner.py` repliziert die Prompt-Erstellung offline, exportiert Curl-Requests und erlaubt Tests via JSON-Fixtures, während `scripts/loop_analyzer.py` Transkripte scannt, Intents extrahiert (z. B. Validator, Wallet, Fees, Next Step) und Wiederholungen signalisiert.
+### `BackgroundService`
+- Orchestriert Scans, Pending-Zustaende, Vorschlagsgenerierung und Statusverwaltung.
+- Fuehrt Queue-Logik auf Core-Seite, ohne die externe Zustellungshoheit zu verletzen.
+- Bindeglied zwischen Core, Store und Integrationsschicht.
 
-## Datenfluss (vereinfacht)
-1. `scam_baiter.py` lädt Config + Store, startet Core und entscheidet Modus.
-2. BackgroundService scannt Chats, bereitet Prompt-Context vor (u. a. `previous_analysis`, `directives`, Typing-Hints) und ruft Core.
-3. Core baut Prompt, ruft HF an, analysiert JSON, führt Reparaturen/Heuristiken aus und liefert Suggestion + Actions + Analysis.
-4. Service persistiert Ergebnisse, steuert Action-Queues (inkl. Media-Karten, Waiting, Send) und aktualisiert `loop_guard`, `image_entries` und `profile_photos`.
-5. Bot-App zeigt Menüs, Chat-Details, Bildkarten und Analysis-Infos, nutzt `card_registry`/`image_entries`/`profile_photos` und bietet Steuerbefehle (Chats, History, Prompt-Preview, Bild-Buttons).
+### `AnalysisStore`
+- SQLite-Store fuer:
+  - Analysen und Modellausgaben
+  - Direktiven
+  - Generierungsversuche
+  - `image_entries` (caption/file_id cache)
+  - `profile_photos`
 
-## Weiterführende Hinweise
-- Environment-Variablen (Telegram/HF-Authentisierung, Folder-Name, Flags) bestimmen Laufzeitverhalten; die Config-Schicht stellt sie in `AppConfig` bereit.
-- Persistierte `analysis`-Objekte (Sprache, Loop-Indikatoren, Direktiven-IDs) werden von `BackgroundService.build_prompt_context_for_chat` wieder eingespielt.
+## API-Vertrag fuer Integrationen
+Der externe Vertrag ist in `docs/client_api_reference.md` versioniert.
+
+Wichtige Leitlinien:
+- Scambaiter beschreibt Inputs/Outputs und Feedback-Formate, aber keine feste Client-Orchestrierung.
+- Die Reihenfolge und Art der Aufrufe ist Aufgabe des externen Client-Agenten.
+- Feedback ist verpflichtend, damit Traceability und Nachsteuerung funktionieren.
+- Breaking Changes am Vertrag erfordern Schema-Versionssprung.
+
+### Trennung der API-Ebenen
+- Externe Client/BotAPI-Steuerung laeuft ueber first-level Slash-Kommandos wie `/prompt`, `/analyse`, `/chats` (siehe `docs/client_api_reference.md`).
+- Das interne LLM-Vertragsschema `scambait.llm.v1` bleibt eine Core-Engine-Schnittstelle und ist nicht die externe Agent-API.
+
+## Medien- und Kartenmodell
+- Bildbeschreibungen und File-Referenzen werden in `image_entries` gehalten.
+- Profilbilder werden als wiederverwendbare `file_id` in `profile_photos` gepflegt.
+- Falls interne Kartenlogik noch genutzt wird (Uebergangsphase), muessen alle geposteten Nachrichten registriert und kontrolliert geloescht werden.
+
+## Prompt- und Policy-Basis
+Fachregeln und Guardrails liegen in:
+- `docs/backlog.md`
+- `docs/prompt_cases/`
+- `docs/snippets/prompt_konkretheit.txt`
+- `docs/event_schema_draft.md`
+
+Diese Quellen definieren die inhaltlichen Erwartungen an Analysefelder, Eskalationsverhalten, Loop-Vermeidung und Themenfokus.
+
+## Referenz-Datenfluss
+1. Core sammelt Kontext ueber Telethon und Store.
+2. Core erzeugt Prompt und fragt das Modell.
+3. Core liefert strukturiertes Ergebnis an den externen Client.
+4. Externer Client fuehrt Delivery aus und sendet Feedback.
+5. Store und Monitoring-Events bilden die Nachvollziehbarkeit fuer Betrieb und Verbesserung.
+
+## Migrationsnotiz
+Die Zielarchitektur ist kompatibel mit dem aktuellen Codezustand: Telethon bleibt, waehrend `python-telegram-bot` schrittweise in den externen Executor verlagert wird.
