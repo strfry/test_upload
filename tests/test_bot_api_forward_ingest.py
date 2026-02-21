@@ -34,12 +34,17 @@ class _FakeMessage:
         with_forward_origin: bool,
         forward_message_id: int | None = 7788,
         forward_date_equals_message_date: bool = False,
+        sender_first_name: str | None = "Jonathan",
     ) -> None:
         self.chat_id = chat_id
         self.message_id = message_id
         self.text = text
         self.caption = caption
         self.photo = [object()] if has_photo else None
+        if sender_first_name is None:
+            self.from_user = None
+        else:
+            self.from_user = type("FromUser", (), {"first_name": sender_first_name})()
         self.date = datetime(2026, 2, 21, 14, 5, 0, tzinfo=timezone.utc)
         if with_forward_origin:
             origin_date = self.date if forward_date_equals_message_date else datetime(2026, 2, 21, 13, 59, 0, tzinfo=timezone.utc)
@@ -216,6 +221,20 @@ class BotApiForwardIngestTest(unittest.TestCase):
             self.assertEqual("scammer", record.role)
             events = store.list_events(chat_id=1234, limit=10)
             self.assertEqual(1, len(events))
+
+    def test_forward_payload_contains_primary_user_first_name(self) -> None:
+        message = _FakeMessage(
+            chat_id=5000,
+            message_id=24,
+            text="hello",
+            caption=None,
+            has_photo=False,
+            with_forward_origin=True,
+            sender_first_name="Jonathan",
+        )
+        payload = _build_forward_payload(message, role="scammer")
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        self.assertEqual("Jonathan", meta.get("primary_user_first_name"))
 
     def test_resolve_target_and_role_without_active_for_scammer_sender(self) -> None:
         message = _FakeMessage(

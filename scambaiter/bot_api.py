@@ -737,20 +737,32 @@ def _resolve_target_and_role_without_active(
     return sender_id, "scammer"
 
 
+def _extract_primary_user_first_name(message: Message) -> str | None:
+    sender = getattr(message, "from_user", None)
+    first_name = getattr(sender, "first_name", None)
+    if isinstance(first_name, str) and first_name.strip():
+        return first_name.strip()
+    return None
+
+
 def _build_forward_payload(message: Message, role: str) -> dict[str, Any]:
     event_type = _infer_event_type(message)
     source_message_id = _build_source_message_id(message)
+    primary_user_first_name = _extract_primary_user_first_name(message)
+    meta: dict[str, Any] = {
+        "control_chat_id": int(message.chat_id),
+        "control_message_id": int(message.message_id),
+        "forward_profile": _extract_forward_profile_info(message),
+    }
+    if isinstance(primary_user_first_name, str):
+        meta["primary_user_first_name"] = primary_user_first_name
     return {
         "event_type": event_type,
         "source_message_id": source_message_id,
         "role": role,
         "text": _extract_text(message),
         "ts_utc": _event_ts_utc_for_store(message),
-        "meta": {
-            "control_chat_id": int(message.chat_id),
-            "control_message_id": int(message.message_id),
-            "forward_profile": _extract_forward_profile_info(message),
-        },
+        "meta": meta,
     }
 
 
@@ -853,11 +865,6 @@ def _flush_pending_forwards(
 def ingest_forwarded_message(store: Any, target_chat_id: int, message: Message) -> Any:
     role = _infer_role_from_forward(message, target_chat_id=target_chat_id)
     payload = _build_forward_payload(message, role=role)
-    forward_meta = {
-        "control_chat_id": int(message.chat_id),
-        "control_message_id": int(message.message_id),
-    }
-    payload["meta"] = forward_meta
     return _ingest_forward_payload(store=store, target_chat_id=target_chat_id, payload=payload)
 
 
