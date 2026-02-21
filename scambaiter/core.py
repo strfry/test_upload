@@ -331,6 +331,12 @@ class ScambaiterCore:
         events = self.store.list_events(chat_id=chat_id, limit=5000)
         prompt_events: list[dict[str, Any]] = []
         for event in events:
+            # Legacy rows may contain synthetic profile_update system messages from older builds.
+            # Skip these in prompt context to avoid profile noise amplification.
+            if str(getattr(event, "role", "")) == "system":
+                text_value = getattr(event, "text", None)
+                if isinstance(text_value, str) and text_value.strip().startswith("profile_update:"):
+                    continue
             prompt_events.append(
                 {
                     "event_type": event.event_type,
