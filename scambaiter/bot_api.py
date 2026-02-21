@@ -349,6 +349,84 @@ def _render_prompt_card_text(chat_id: int, prompt_events: list[dict[str, Any]], 
     return "\n".join(lines)
 
 
+PROMPT_SECTION_LABELS: dict[str, str] = {
+    "ov": "Overview",
+    "sys": "System",
+    "ev": "Events",
+    "raw": "Raw",
+}
+
+
+def _trim_block(text: str, max_len: int = 3800) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _prompt_keyboard(chat_id: int, active_section: str = "ov") -> InlineKeyboardMarkup:
+    def _btn(code: str) -> InlineKeyboardButton:
+        label = PROMPT_SECTION_LABELS.get(code, code)
+        if code == active_section:
+            label = f"• {label}"
+        return InlineKeyboardButton(label, callback_data=f"sc:psec:{code}:{chat_id}")
+
+    return InlineKeyboardMarkup(
+        [
+            [_btn("ov"), _btn("sys")],
+            [_btn("ev"), _btn("raw")],
+            [
+                InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
+                InlineKeyboardButton("Delete", callback_data="sc:prompt_delete"),
+            ],
+        ]
+    )
+
+
+def _render_prompt_section_text(
+    *,
+    chat_id: int,
+    prompt_events: list[dict[str, Any]],
+    model_messages: list[dict[str, str]],
+    section: str,
+) -> str:
+    if section == "sys":
+        system_parts = [m.get("content", "") for m in model_messages if str(m.get("role")) == "system"]
+        lines = ["Prompt Section: System", f"chat_id: /{chat_id}", f"count: {len(system_parts)}", "---"]
+        for idx, chunk in enumerate(system_parts, start=1):
+            compact = " ".join(str(chunk).split())
+            if len(compact) > 900:
+                compact = compact[:897] + "..."
+            lines.append(f"[{idx}] {compact}")
+        return _trim_block("\n".join(lines))
+
+    if section == "ev":
+        lines = ["Prompt Section: Events", f"chat_id: /{chat_id}", f"count: {len(prompt_events)}", "---"]
+        tail = prompt_events[-36:]
+        for item in tail:
+            role = str(item.get("role", "unknown"))
+            time = str(item.get("time") or "--:--")
+            text = str(item.get("text") or "")
+            compact = " ".join(text.split())
+            if len(compact) > 180:
+                compact = compact[:177] + "..."
+            lines.append(f"{time} {role}: {compact}")
+        return _trim_block("\n".join(lines))
+
+    if section == "raw":
+        user_payloads = [m.get("content", "") for m in model_messages if str(m.get("role")) == "user"]
+        lines = ["Prompt Section: Raw", f"chat_id: /{chat_id}", f"payloads: {len(user_payloads)}", "---"]
+        tail = user_payloads[-10:]
+        for idx, item in enumerate(tail, start=max(1, len(user_payloads) - len(tail) + 1)):
+            compact = " ".join(str(item).split())
+            if len(compact) > 240:
+                compact = compact[:237] + "..."
+            lines.append(f"[{idx}] {compact}")
+        return _trim_block("\n".join(lines))
+
+    # default overview
+    return _render_prompt_card_text(chat_id=chat_id, prompt_events=prompt_events)
+
+
 async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     allowed_chat_id = app.bot_data.get("allowed_chat_id")
@@ -374,23 +452,75 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Core unavailable")
         return
     prompt_events = core.build_prompt_events(chat_id=chat_id)
-    prompt_text = _render_prompt_card_text(chat_id=chat_id, prompt_events=prompt_events)
+    model_messages = core.build_model_messages(chat_id=chat_id)
+    prompt_text = _render_prompt_section_text(
+        chat_id=chat_id,
+        prompt_events=prompt_events,
+        model_messages=model_messages,
+        section="ov",
+    )
     sent = await message.reply_text(
         prompt_text,
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
-                    InlineKeyboardButton("Delete", callback_data="sc:prompt_delete"),
-                ]
-            ]
-        ),
+        reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="ov"),
     )
     sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
     sent_messages.append(int(sent.message_id))
     if len(sent_messages) > 500:
         del sent_messages[: len(sent_messages) - 500]
     await query.answer("Prompt generated")
+
+
+async def _handle_prompt_section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 4:
+        await query.answer("Invalid section")
+        return
+    _, _, section, chat_raw = parts
+    if section not in PROMPT_SECTION_LABELS:
+        await query.answer("Invalid section")
+        return
+    try:
+        chat_id = int(chat_raw)
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    service = app.bot_data.get("service")
+    core = getattr(service, "core", None)
+    if core is None:
+        await query.answer("Core unavailable")
+        return
+    prompt_events = core.build_prompt_events(chat_id=chat_id)
+    model_messages = core.build_model_messages(chat_id=chat_id)
+    prompt_text = _render_prompt_section_text(
+        chat_id=chat_id,
+        prompt_events=prompt_events,
+        model_messages=model_messages,
+        section=section,
+    )
+    try:
+        await query.edit_message_text(
+            prompt_text,
+            reply_markup=_prompt_keyboard(chat_id=chat_id, active_section=section),
+        )
+    except Exception:
+        await message.reply_text(
+            prompt_text,
+            reply_markup=_prompt_keyboard(chat_id=chat_id, active_section=section),
+        )
+    await query.answer(f"Section: {PROMPT_SECTION_LABELS.get(section, section)}")
 
 
 async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1142,6 +1272,7 @@ def create_bot_app(token: str, service: Any, allowed_chat_id: int | None = None)
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(MessageHandler(filters.Regex(r"^/(?:c)?[0-9]+(?:\s.*)?$"), _cmd_chat_id_shortcut))
     app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:ov|sys|ev|raw):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
