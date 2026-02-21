@@ -226,6 +226,23 @@ def _validate_actions(actions_value: object, reply: str) -> list[dict[str, Any]]
     return normalized_actions
 
 
+def _build_repair_messages(failed_generation: str) -> list[dict[str, str]]:
+    clipped = failed_generation.strip()
+    if len(clipped) > 12000:
+        clipped = clipped[:12000]
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_CONTRACT},
+        {
+            "role": "system",
+            "content": (
+                "Repair task: previous output violated the JSON contract. "
+                "Return only a corrected scambait.llm.v1 JSON object."
+            ),
+        },
+        {"role": "user", "content": json.dumps({"failed_generation": clipped}, ensure_ascii=True)},
+    ]
+
+
 def parse_structured_model_output(text: str) -> ModelOutput | None:
     cleaned = strip_think_segments(text)
     try:
@@ -365,23 +382,129 @@ class ScambaiterCore:
         if not token or not model:
             raise RuntimeError("HF_TOKEN/HF_MODEL missing")
         max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))
-        messages = self.build_model_messages(chat_id=chat_id)
-        response_json = call_hf_openai_chat(
-            token=token,
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            # Dry run is pinned to HF router to avoid accidental provider drift via HF_BASE_URL.
-            base_url=None,
+
+        attempts: list[dict[str, Any]] = []
+        initial_messages = self.build_model_messages(chat_id=chat_id)
+        initial_prompt = {"messages": initial_messages, "max_tokens": max_tokens}
+
+        try:
+            initial_response = call_hf_openai_chat(
+                token=token,
+                model=model,
+                messages=initial_messages,
+                max_tokens=max_tokens,
+                # Dry run is pinned to HF router to avoid accidental provider drift via HF_BASE_URL.
+                base_url=None,
+            )
+            initial_text = extract_result_text(initial_response)
+        except Exception as exc:
+            attempts.append(
+                {
+                    "phase": "initial",
+                    "status": "error",
+                    "accepted": False,
+                    "reject_reason": "provider_error",
+                    "error_message": str(exc),
+                    "prompt_json": initial_prompt,
+                    "response_json": {},
+                    "result_text": "",
+                }
+            )
+            return {
+                "provider": "huggingface_openai_compat",
+                "model": model,
+                "prompt_json": initial_prompt,
+                "response_json": {},
+                "result_text": "",
+                "valid_output": False,
+                "parsed_output": None,
+                "error_message": str(exc),
+                "attempts": attempts,
+            }
+
+        parsed = parse_structured_model_output(initial_text)
+        attempts.append(
+            {
+                "phase": "initial",
+                "status": "ok" if parsed is not None else "invalid",
+                "accepted": parsed is not None,
+                "reject_reason": None if parsed is not None else "contract_validation_failed",
+                "error_message": None,
+                "prompt_json": initial_prompt,
+                "response_json": initial_response,
+                "result_text": initial_text,
+            }
         )
-        result_text = extract_result_text(response_json)
-        parsed = parse_structured_model_output(result_text)
+
+        final_prompt = initial_prompt
+        final_response = initial_response
+        final_text = initial_text
+
+        if parsed is None:
+            repair_messages = _build_repair_messages(initial_text)
+            repair_prompt = {"messages": repair_messages, "max_tokens": max_tokens}
+            try:
+                repair_response = call_hf_openai_chat(
+                    token=token,
+                    model=model,
+                    messages=repair_messages,
+                    max_tokens=max_tokens,
+                    base_url=None,
+                )
+                repair_text = extract_result_text(repair_response)
+                repaired = parse_structured_model_output(repair_text)
+                attempts.append(
+                    {
+                        "phase": "repair",
+                        "status": "ok" if repaired is not None else "invalid",
+                        "accepted": repaired is not None,
+                        "reject_reason": None if repaired is not None else "contract_validation_failed",
+                        "error_message": None,
+                        "prompt_json": repair_prompt,
+                        "response_json": repair_response,
+                        "result_text": repair_text,
+                    }
+                )
+                if repaired is not None:
+                    parsed = repaired
+                    final_prompt = repair_prompt
+                    final_response = repair_response
+                    final_text = repair_text
+                else:
+                    final_prompt = repair_prompt
+                    final_response = repair_response
+                    final_text = repair_text
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "phase": "repair",
+                        "status": "error",
+                        "accepted": False,
+                        "reject_reason": "provider_error",
+                        "error_message": str(exc),
+                        "prompt_json": repair_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                    }
+                )
+                return {
+                    "provider": "huggingface_openai_compat",
+                    "model": model,
+                    "prompt_json": repair_prompt,
+                    "response_json": {},
+                    "result_text": "",
+                    "valid_output": False,
+                    "parsed_output": None,
+                    "error_message": str(exc),
+                    "attempts": attempts,
+                }
+
         return {
             "provider": "huggingface_openai_compat",
             "model": model,
-            "prompt_json": {"messages": messages, "max_tokens": max_tokens},
-            "response_json": response_json,
-            "result_text": result_text,
+            "prompt_json": final_prompt,
+            "response_json": final_response,
+            "result_text": final_text,
             "valid_output": parsed is not None,
             "parsed_output": {
                 "analysis": parsed.analysis,
@@ -391,6 +514,8 @@ class ScambaiterCore:
             }
             if parsed is not None
             else None,
+            "error_message": None if parsed is not None else "invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)",
+            "attempts": attempts,
         }
 
     def generate_output(

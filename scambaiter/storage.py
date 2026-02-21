@@ -76,6 +76,10 @@ class GenerationAttempt:
     result_text: str
     status: str
     error_message: str | None
+    attempt_no: int
+    phase: str
+    accepted: bool
+    reject_reason: str | None
     created_at: str
 
 
@@ -158,10 +162,9 @@ class AnalysisStore:
             )
             """
         )
-        self._conn.execute("DROP TABLE IF EXISTS generation_attempts")
         self._conn.execute(
             """
-            CREATE TABLE generation_attempts (
+            CREATE TABLE IF NOT EXISTS generation_attempts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
                 provider TEXT NOT NULL,
@@ -171,10 +174,15 @@ class AnalysisStore:
                 result_text TEXT NOT NULL,
                 status TEXT NOT NULL,
                 error_message TEXT,
+                attempt_no INTEGER NOT NULL DEFAULT 1,
+                phase TEXT NOT NULL DEFAULT 'initial',
+                accepted INTEGER NOT NULL DEFAULT 0,
+                reject_reason TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        self._ensure_generation_attempt_columns()
         self._conn.commit()
 
     def save(
@@ -536,6 +544,26 @@ class AnalysisStore:
             )
         return messages
 
+    def _ensure_generation_attempt_columns(self) -> None:
+        rows = self._conn.execute("PRAGMA table_info(generation_attempts)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "attempt_no" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1")
+        if "phase" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN phase TEXT NOT NULL DEFAULT 'initial'")
+        if "accepted" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0")
+        if "reject_reason" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN reject_reason TEXT")
+
+    def next_attempt_no(self, chat_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) FROM generation_attempts WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        current = int(row[0]) if row is not None and row[0] is not None else 0
+        return current + 1
+
     def save_generation_attempt(
         self,
         chat_id: int,
@@ -547,13 +575,19 @@ class AnalysisStore:
         status: str,
         error_message: str | None = None,
         created_at: str | None = None,
+        attempt_no: int | None = None,
+        phase: str = "initial",
+        accepted: bool = False,
+        reject_reason: str | None = None,
     ) -> GenerationAttempt:
         ts = created_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        attempt_no_value = int(attempt_no if attempt_no is not None else self.next_attempt_no(chat_id))
         cur = self._conn.execute(
             """
             INSERT INTO generation_attempts(
-                chat_id, provider, model, prompt_json, response_json, result_text, status, error_message, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chat_id, provider, model, prompt_json, response_json, result_text, status, error_message,
+                attempt_no, phase, accepted, reject_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id,
@@ -564,6 +598,10 @@ class AnalysisStore:
                 result_text,
                 status,
                 error_message,
+                attempt_no_value,
+                phase,
+                1 if accepted else 0,
+                reject_reason,
                 ts,
             ),
         )
@@ -578,13 +616,18 @@ class AnalysisStore:
             result_text=result_text,
             status=status,
             error_message=error_message,
+            attempt_no=attempt_no_value,
+            phase=phase,
+            accepted=bool(accepted),
+            reject_reason=reject_reason,
             created_at=ts,
         )
 
     def list_generation_attempts(self, chat_id: int, limit: int = 20) -> list[GenerationAttempt]:
         rows = self._conn.execute(
             """
-            SELECT id, chat_id, provider, model, prompt_json, response_json, result_text, status, error_message, created_at
+            SELECT id, chat_id, provider, model, prompt_json, response_json, result_text, status,
+                   error_message, attempt_no, phase, accepted, reject_reason, created_at
             FROM generation_attempts
             WHERE chat_id = ?
             ORDER BY id DESC
@@ -603,6 +646,10 @@ class AnalysisStore:
                 result_text=str(row["result_text"]),
                 status=str(row["status"]),
                 error_message=row["error_message"],
+                attempt_no=int(row["attempt_no"]),
+                phase=str(row["phase"]),
+                accepted=bool(int(row["accepted"])),
+                reject_reason=row["reject_reason"],
                 created_at=str(row["created_at"]),
             )
             for row in rows

@@ -427,6 +427,7 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
     result_text = ""
     status = "ok"
     error_message: str | None = None
+    attempt_records: list[dict[str, Any]] = []
     try:
         dry_run_result = core.run_hf_dry_run(chat_id)
         provider = str(dry_run_result.get("provider") or provider)
@@ -436,21 +437,64 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
         parsed_output = dry_run_result.get("parsed_output") if isinstance(dry_run_result.get("parsed_output"), dict) else None
         result_text = str(dry_run_result.get("result_text") or "")
         valid_output = bool(dry_run_result.get("valid_output"))
-        if not valid_output:
-            raise RuntimeError("invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)")
+        error_message = str(dry_run_result.get("error_message") or "").strip() or None
+        records = dry_run_result.get("attempts")
+        if isinstance(records, list):
+            attempt_records = [item for item in records if isinstance(item, dict)]
+        if (not valid_output) or error_message:
+            status = "error"
     except Exception as exc:
         status = "error"
         error_message = str(exc)
-    attempt = store.save_generation_attempt(
-        chat_id=chat_id,
-        provider=provider,
-        model=model or "unknown",
-        prompt_json=prompt_json,
-        response_json=response_json,
-        result_text=result_text,
-        status=status,
-        error_message=error_message,
-    )
+
+    base_attempt_no = store.next_attempt_no(chat_id)
+    saved_attempt = None
+    if attempt_records:
+        for idx, rec in enumerate(attempt_records):
+            rec_prompt = rec.get("prompt_json") if isinstance(rec.get("prompt_json"), dict) else prompt_json
+            rec_response = rec.get("response_json") if isinstance(rec.get("response_json"), dict) else response_json
+            rec_text = str(rec.get("result_text") or "")
+            rec_status = str(rec.get("status") or ("ok" if bool(rec.get("accepted")) else "invalid"))
+            rec_error = rec.get("error_message")
+            if rec_error is not None:
+                rec_error = str(rec_error)
+            rec_phase = str(rec.get("phase") or "initial")
+            rec_accepted = bool(rec.get("accepted"))
+            rec_reject_reason = rec.get("reject_reason")
+            if rec_reject_reason is not None:
+                rec_reject_reason = str(rec_reject_reason)
+            saved_attempt = store.save_generation_attempt(
+                chat_id=chat_id,
+                provider=provider,
+                model=model or "unknown",
+                prompt_json=rec_prompt,
+                response_json=rec_response,
+                result_text=rec_text,
+                status=rec_status,
+                error_message=rec_error,
+                attempt_no=base_attempt_no + idx,
+                phase=rec_phase,
+                accepted=rec_accepted,
+                reject_reason=rec_reject_reason,
+            )
+    else:
+        saved_attempt = store.save_generation_attempt(
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            prompt_json=prompt_json,
+            response_json=response_json,
+            result_text=result_text,
+            status=status,
+            error_message=error_message,
+            attempt_no=base_attempt_no,
+            phase="initial",
+            accepted=(status == "ok"),
+            reject_reason=None if status == "ok" else "provider_error",
+        )
+
+    attempt = saved_attempt
+
     if status == "ok":
         if isinstance(parsed_output, dict):
             message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
