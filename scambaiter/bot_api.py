@@ -80,6 +80,73 @@ def _render_html_copy_block(text: str) -> str:
     return "<b>Message text (copy)</b>\n<pre>" + escaped + "</pre>"
 
 
+def _classify_dry_run_error(error_message: str) -> tuple[str, str]:
+    normalized = (error_message or "").strip().lower()
+    if "hf_token/hf_model missing" in normalized:
+        return (
+            "Missing provider configuration",
+            "Set HF_TOKEN and HF_MODEL in secrets.sh, then restart the bot.",
+        )
+    if "openai package missing" in normalized:
+        return (
+            "Dependency missing",
+            "Install the openai package in the project venv and restart.",
+        )
+    if "invalid model output contract" in normalized:
+        return (
+            "Model output contract violation",
+            "Model response did not match scambait.llm.v1. Inspect result excerpt and adjust prompt/model.",
+        )
+    if "sqlite objects created in a thread" in normalized:
+        return (
+            "Thread/DB mismatch",
+            "Dry run touched SQLite from a different thread. Keep DB work in the main thread.",
+        )
+    return (
+        "Dry run execution error",
+        "Check provider/model connectivity and inspect the stored attempt payload.",
+    )
+
+
+def _render_html_error_block(
+    *,
+    attempt_id: int,
+    chat_id: int,
+    provider: str,
+    model: str,
+    error_message: str | None,
+    result_text: str | None,
+) -> str:
+    title, hint = _classify_dry_run_error(error_message or "")
+    reason = html.escape((error_message or "unknown error").strip())
+    if len(reason) > 1200:
+        reason = reason[:1197] + "..."
+
+    excerpt = html.escape((result_text or "").strip())
+    if len(excerpt) > 1400:
+        excerpt = excerpt[:1397] + "..."
+
+    lines = [
+        f"<b>Dry run failed</b> (attempt #{attempt_id} for /{chat_id})",
+        f"<b>provider:</b> <code>{html.escape(provider or 'unknown')}</code>",
+        f"<b>model:</b> <code>{html.escape(model or 'unknown')}</code>",
+        f"<b>class:</b> {html.escape(title)}",
+        "",
+        "<b>error</b>",
+        f"<pre>{reason}</pre>",
+    ]
+    if excerpt:
+        lines.extend([
+            "<b>result excerpt</b>",
+            f"<pre>{excerpt}</pre>",
+        ])
+    lines.extend([
+        "<b>hint</b>",
+        html.escape(hint),
+    ])
+    return "\n".join(lines)
+
+
 async def _send_control_text(
     application: Application,
     message: Message,
@@ -437,10 +504,19 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
                 text=f"Dry run saved as attempt #{attempt.id} for /{chat_id}\n{preview}",
             )
     else:
+        error_block = _render_html_error_block(
+            attempt_id=attempt.id,
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            error_message=error_message,
+            result_text=result_text,
+        )
         await _send_control_text(
             application=app,
             message=message,
-            text=f"Dry run failed and was saved as attempt #{attempt.id} for /{chat_id}: {error_message}",
+            text=error_block,
+            parse_mode=ParseMode.HTML,
         )
 
 
