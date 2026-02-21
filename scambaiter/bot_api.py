@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from typing import Any
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from .model_client import call_hf_openai_chat, extract_result_text
 
 def _resolve_store(service: Any) -> Any:
     store = getattr(service, "store", None)
@@ -347,25 +347,21 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
     model = str((getattr(core.config, "hf_model", None) or "").strip())
     prompt_json: dict[str, Any] = {}
     response_json: dict[str, Any] = {}
+    parsed_output: dict[str, Any] | None = None
     result_text = ""
     status = "ok"
     error_message: str | None = None
     try:
-        token = str((getattr(core.config, "hf_token", None) or "").strip())
-        if not token or not model:
-            raise RuntimeError("HF_TOKEN/HF_MODEL missing")
-        max_tokens = int(getattr(core.config, "hf_max_tokens", 1500))
-        prompt_messages = core.build_model_messages(chat_id=chat_id)
-        prompt_json = {"messages": prompt_messages, "max_tokens": max_tokens}
-        response_json = await asyncio.to_thread(
-            call_hf_openai_chat,
-            token=token,
-            model=model,
-            messages=prompt_messages,
-            max_tokens=max_tokens,
-            base_url=None,
-        )
-        result_text = extract_result_text(response_json)
+        dry_run_result = await asyncio.to_thread(core.run_hf_dry_run, chat_id)
+        provider = str(dry_run_result.get("provider") or provider)
+        model = str(dry_run_result.get("model") or model)
+        prompt_json = dry_run_result.get("prompt_json") if isinstance(dry_run_result.get("prompt_json"), dict) else {}
+        response_json = dry_run_result.get("response_json") if isinstance(dry_run_result.get("response_json"), dict) else {}
+        parsed_output = dry_run_result.get("parsed_output") if isinstance(dry_run_result.get("parsed_output"), dict) else None
+        result_text = str(dry_run_result.get("result_text") or "")
+        valid_output = bool(dry_run_result.get("valid_output"))
+        if not valid_output:
+            raise RuntimeError("invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)")
     except Exception as exc:
         status = "error"
         error_message = str(exc)
@@ -380,7 +376,10 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
         error_message=error_message,
     )
     if status == "ok":
-        preview = (result_text or "<empty-result>").strip()
+        if isinstance(parsed_output, dict):
+            preview = json.dumps(parsed_output, ensure_ascii=False)
+        else:
+            preview = (result_text or "<empty-result>").strip()
         if len(preview) > 500:
             preview = preview[:497] + "..."
         await _send_control_text(
