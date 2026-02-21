@@ -352,7 +352,7 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
     status = "ok"
     error_message: str | None = None
     try:
-        dry_run_result = await asyncio.to_thread(core.run_hf_dry_run, chat_id)
+        dry_run_result = core.run_hf_dry_run(chat_id)
         provider = str(dry_run_result.get("provider") or provider)
         model = str(dry_run_result.get("model") or model)
         prompt_json = dry_run_result.get("prompt_json") if isinstance(dry_run_result.get("prompt_json"), dict) else {}
