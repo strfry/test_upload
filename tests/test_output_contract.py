@@ -33,7 +33,7 @@ class OutputContractParserTest(unittest.TestCase):
         }
         self.assertIsNone(parse_structured_model_output(json.dumps(payload)))
 
-    def test_invalid_payload_unknown_top_level_key_is_rejected(self) -> None:
+    def test_unknown_top_level_key_is_tolerated(self) -> None:
         payload = {
             "schema": "scambait.llm.v1",
             "analysis": {},
@@ -41,7 +41,8 @@ class OutputContractParserTest(unittest.TestCase):
             "actions": [{"type": "send_message"}],
             "extra": "not-allowed",
         }
-        self.assertIsNone(parse_structured_model_output(json.dumps(payload)))
+        parsed = parse_structured_model_output(json.dumps(payload))
+        self.assertIsNotNone(parsed)
 
     def test_send_message_requires_non_empty_message_text(self) -> None:
         payload = {
@@ -51,6 +52,30 @@ class OutputContractParserTest(unittest.TestCase):
             "actions": [{"type": "send_message"}],
         }
         self.assertIsNone(parse_structured_model_output(json.dumps(payload)))
+
+    def test_action_alias_field_is_normalized(self) -> None:
+        payload = {
+            "schema": "scambait.llm.v1",
+            "analysis": {},
+            "message": {"text": "Hallo"},
+            "actions": [{"action": "send_message"}],
+        }
+        parsed = parse_structured_model_output(json.dumps(payload))
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual([{"type": "send_message"}], parsed.actions)
+
+    def test_missing_actions_falls_back_to_send_message_when_text_exists(self) -> None:
+        payload = {
+            "schema": "scambait.llm.v1",
+            "analysis": {},
+            "message": {"text": "Hallo"},
+            "actions": [],
+        }
+        parsed = parse_structured_model_output(json.dumps(payload))
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertTrue(any(item.get("type") == "send_message" for item in parsed.actions))
 
     def test_action_shorthand_is_normalized(self) -> None:
         payload = {

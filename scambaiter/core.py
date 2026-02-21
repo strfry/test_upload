@@ -90,6 +90,15 @@ def normalize_action_shape(action: object) -> dict[str, Any] | None:
     if "type" in action:
         return dict(action)
 
+    # Accept alias used by some models: {"action":"send_message", ...}
+    if "action" in action and isinstance(action.get("action"), str):
+        action_type = str(action.get("action") or "").strip()
+        if action_type in ALLOWED_ACTION_TYPES:
+            normalized = dict(action)
+            normalized.pop("action", None)
+            normalized["type"] = action_type
+            return normalized
+
     # Accept malformed shorthand for compatibility:
     # {"send_message": {}} -> {"type": "send_message"}
     if len(action) == 1:
@@ -105,8 +114,14 @@ def normalize_action_shape(action: object) -> dict[str, Any] | None:
 
 
 def _validate_actions(actions_value: object, reply: str) -> list[dict[str, Any]] | None:
-    if not isinstance(actions_value, list) or not actions_value or len(actions_value) > 10:
+    if isinstance(actions_value, dict):
+        actions_value = [actions_value]
+    if not isinstance(actions_value, list):
         return None
+    if len(actions_value) > 10:
+        return None
+    if not actions_value:
+        return [{"type": "send_message"}] if reply else [{"type": "noop"}]
 
     normalized_actions: list[dict[str, Any]] = []
     for action in actions_value:
@@ -205,6 +220,8 @@ def _validate_actions(actions_value: object, reply: str) -> list[dict[str, Any]]
     has_send_message = any(str(action.get("type")) == "send_message" for action in normalized_actions)
     if has_send_message and not reply:
         return None
+    if reply and not has_send_message:
+        normalized_actions.append({"type": "send_message"})
 
     return normalized_actions
 
@@ -219,9 +236,8 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
     if not isinstance(data, dict):
         return None
 
-    if any(str(key) not in ALLOWED_TOP_LEVEL_KEYS for key in data.keys()):
-        return None
-    if set(data.keys()) != ALLOWED_TOP_LEVEL_KEYS:
+    required_keys = {"schema", "analysis", "message", "actions"}
+    if not required_keys.issubset(set(str(key) for key in data.keys())):
         return None
 
     schema_value = data.get("schema")
@@ -233,7 +249,7 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
         return None
 
     message_value = data.get("message")
-    if not isinstance(message_value, dict) or set(message_value.keys()) != {"text"}:
+    if not isinstance(message_value, dict) or "text" not in message_value:
         return None
     text_value = message_value.get("text")
     if not isinstance(text_value, str):
