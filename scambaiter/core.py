@@ -346,17 +346,6 @@ class ScambaiterCore:
                     "meta": event.meta,
                 }
             )
-        profile_updates = self.store.list_profile_system_messages(chat_id=chat_id, limit=6)
-        for item in profile_updates:
-            prompt_events.append(
-                {
-                    "event_type": item.get("event_type", "message"),
-                    "role": item.get("role", "system"),
-                    "text": item.get("text"),
-                    "time": self._as_hhmm(item.get("ts_utc")),
-                    "meta": item.get("meta", {}),
-                }
-            )
         return self._trim_prompt_events(prompt_events, token_budget)
 
     def build_model_messages(self, chat_id: int) -> list[dict[str, str]]:

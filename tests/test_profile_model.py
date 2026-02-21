@@ -80,7 +80,7 @@ class ProfileModelTest(unittest.TestCase):
         self.assertEqual("Ex Ample", patch["identity"]["display_name"])
         self.assertIn("account", patch)
 
-    def test_prompt_events_include_profile_system_updates(self) -> None:
+    def test_prompt_events_ignore_profile_system_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
             store = AnalysisStore(str(db_path))
@@ -93,7 +93,7 @@ class ProfileModelTest(unittest.TestCase):
             )
             core = ScambaiterCore(config=SimpleNamespace(hf_max_tokens=500), store=store)
             prompt_events = core.build_prompt_events(chat_id=77)
-            self.assertTrue(any(item.get("role") == "system" and "profile_update:" in str(item.get("text")) for item in prompt_events))
+            self.assertFalse(any("profile_update:" in str(item.get("text")) for item in prompt_events))
 
     def test_generation_attempts_are_stored_and_listed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
