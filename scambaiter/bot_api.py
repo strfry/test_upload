@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -350,10 +351,11 @@ def _render_prompt_card_text(chat_id: int, prompt_events: list[dict[str, Any]], 
 
 
 PROMPT_SECTION_LABELS: dict[str, str] = {
-    "ov": "Overview",
-    "sys": "System",
-    "ev": "Events",
-    "raw": "Raw",
+    "schema": "schema",
+    "analysis": "analysis",
+    "message": "message",
+    "actions": "actions",
+    "raw": "raw",
 }
 
 
@@ -361,6 +363,22 @@ def _trim_block(text: str, max_len: int = 3800) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
+
+
+def _load_latest_reply_payload(store: Any, chat_id: int) -> tuple[dict[str, Any] | None, str, int | None, str | None]:
+    attempts = store.list_generation_attempts(chat_id=chat_id, limit=20)
+    if not attempts:
+        return None, "", None, None
+    attempt = attempts[0]
+    raw_text = str(attempt.result_text or "")
+    payload: dict[str, Any] | None = None
+    try:
+        loaded = json.loads(raw_text)
+        if isinstance(loaded, dict):
+            payload = loaded
+    except Exception:
+        payload = None
+    return payload, raw_text, int(attempt.id), str(attempt.status)
 
 
 def _prompt_keyboard(chat_id: int, active_section: str = "ov") -> InlineKeyboardMarkup:
@@ -372,8 +390,9 @@ def _prompt_keyboard(chat_id: int, active_section: str = "ov") -> InlineKeyboard
 
     return InlineKeyboardMarkup(
         [
-            [_btn("ov"), _btn("sys")],
-            [_btn("ev"), _btn("raw")],
+            [_btn("schema"), _btn("analysis")],
+            [_btn("message"), _btn("actions")],
+            [_btn("raw")],
             [
                 InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
                 InlineKeyboardButton("Delete", callback_data="sc:prompt_delete"),
@@ -387,44 +406,103 @@ def _render_prompt_section_text(
     chat_id: int,
     prompt_events: list[dict[str, Any]],
     model_messages: list[dict[str, str]],
+    latest_payload: dict[str, Any] | None,
+    latest_raw: str,
+    latest_attempt_id: int | None,
+    latest_status: str | None,
     section: str,
 ) -> str:
-    if section == "sys":
-        system_parts = [m.get("content", "") for m in model_messages if str(m.get("role")) == "system"]
-        lines = ["Prompt Section: System", f"chat_id: /{chat_id}", f"count: {len(system_parts)}", "---"]
-        for idx, chunk in enumerate(system_parts, start=1):
-            compact = " ".join(str(chunk).split())
-            if len(compact) > 900:
-                compact = compact[:897] + "..."
-            lines.append(f"[{idx}] {compact}")
-        return _trim_block("\n".join(lines))
-
-    if section == "ev":
-        lines = ["Prompt Section: Events", f"chat_id: /{chat_id}", f"count: {len(prompt_events)}", "---"]
-        tail = prompt_events[-36:]
+    if latest_payload is None:
+        lines = [
+            "Prompt Card",
+            f"chat_id: /{chat_id}",
+            f"events_in_prompt: {len(prompt_events)}",
+            "latest_reply: unavailable (run Dry Run)",
+            "---",
+        ]
+        tail = prompt_events[-12:]
         for item in tail:
             role = str(item.get("role", "unknown"))
             time = str(item.get("time") or "--:--")
             text = str(item.get("text") or "")
             compact = " ".join(text.split())
-            if len(compact) > 180:
-                compact = compact[:177] + "..."
+            if len(compact) > 160:
+                compact = compact[:157] + "..."
             lines.append(f"{time} {role}: {compact}")
         return _trim_block("\n".join(lines))
 
-    if section == "raw":
-        user_payloads = [m.get("content", "") for m in model_messages if str(m.get("role")) == "user"]
-        lines = ["Prompt Section: Raw", f"chat_id: /{chat_id}", f"payloads: {len(user_payloads)}", "---"]
-        tail = user_payloads[-10:]
-        for idx, item in enumerate(tail, start=max(1, len(user_payloads) - len(tail) + 1)):
-            compact = " ".join(str(item).split())
-            if len(compact) > 240:
-                compact = compact[:237] + "..."
-            lines.append(f"[{idx}] {compact}")
+    attempt_meta = f"attempt #{latest_attempt_id}" if isinstance(latest_attempt_id, int) else "attempt ?"
+    status_meta = latest_status or "unknown"
+
+    if section == "schema":
+        schema = latest_payload.get("schema")
+        keys = ", ".join(str(k) for k in latest_payload.keys())
+        lines = [
+            "Reply JSON Section: schema",
+            f"chat_id: /{chat_id}",
+            f"{attempt_meta}, status={status_meta}",
+            "---",
+            f"schema: {schema}",
+            f"top_level_keys: {keys}",
+        ]
         return _trim_block("\n".join(lines))
 
-    # default overview
-    return _render_prompt_card_text(chat_id=chat_id, prompt_events=prompt_events)
+    if section == "analysis":
+        analysis = latest_payload.get("analysis")
+        if isinstance(analysis, dict):
+            body = json.dumps(analysis, ensure_ascii=False, indent=2)
+        else:
+            body = str(analysis)
+        lines = [
+            "Reply JSON Section: analysis",
+            f"chat_id: /{chat_id}",
+            f"{attempt_meta}, status={status_meta}",
+            "---",
+            body,
+        ]
+        return _trim_block("\n".join(lines))
+
+    if section == "message":
+        message_obj = latest_payload.get("message")
+        text_value = ""
+        if isinstance(message_obj, dict):
+            text_value = str(message_obj.get("text") or "")
+        lines = [
+            "Reply JSON Section: message",
+            f"chat_id: /{chat_id}",
+            f"{attempt_meta}, status={status_meta}",
+            "---",
+            text_value or "(empty)",
+        ]
+        return _trim_block("\n".join(lines))
+
+    if section == "actions":
+        actions = latest_payload.get("actions")
+        lines = [
+            "Reply JSON Section: actions",
+            f"chat_id: /{chat_id}",
+            f"{attempt_meta}, status={status_meta}",
+            "---",
+        ]
+        if isinstance(actions, list) and actions:
+            for idx, action in enumerate(actions, start=1):
+                if isinstance(action, dict):
+                    lines.append(f"[{idx}] " + json.dumps(action, ensure_ascii=False))
+                else:
+                    lines.append(f"[{idx}] {action}")
+        else:
+            lines.append("(none)")
+        return _trim_block("\n".join(lines))
+
+    # raw
+    lines = [
+        "Reply JSON Section: raw",
+        f"chat_id: /{chat_id}",
+        f"{attempt_meta}, status={status_meta}",
+        "---",
+        latest_raw or "(empty)",
+    ]
+    return _trim_block("\n".join(lines))
 
 
 async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -448,20 +526,26 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
         return
     service = app.bot_data.get("service")
     core = getattr(service, "core", None)
-    if core is None:
+    store = getattr(service, "store", None)
+    if core is None or store is None:
         await query.answer("Core unavailable")
         return
     prompt_events = core.build_prompt_events(chat_id=chat_id)
     model_messages = core.build_model_messages(chat_id=chat_id)
+    latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
         model_messages=model_messages,
-        section="ov",
+        latest_payload=latest_payload,
+        latest_raw=latest_raw,
+        latest_attempt_id=latest_attempt_id,
+        latest_status=latest_status,
+        section="schema",
     )
     sent = await message.reply_text(
         prompt_text,
-        reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="ov"),
+        reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="schema"),
     )
     sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
     sent_messages.append(int(sent.message_id))
@@ -499,15 +583,21 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
         return
     service = app.bot_data.get("service")
     core = getattr(service, "core", None)
-    if core is None:
+    store = getattr(service, "store", None)
+    if core is None or store is None:
         await query.answer("Core unavailable")
         return
     prompt_events = core.build_prompt_events(chat_id=chat_id)
     model_messages = core.build_model_messages(chat_id=chat_id)
+    latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
         model_messages=model_messages,
+        latest_payload=latest_payload,
+        latest_raw=latest_raw,
+        latest_attempt_id=latest_attempt_id,
+        latest_status=latest_status,
         section=section,
     )
     try:
@@ -1272,7 +1362,7 @@ def create_bot_app(token: str, service: Any, allowed_chat_id: int | None = None)
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(MessageHandler(filters.Regex(r"^/(?:c)?[0-9]+(?:\s.*)?$"), _cmd_chat_id_shortcut))
     app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:ov|sys|ev|raw):[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:schema|analysis|message|actions|raw):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
