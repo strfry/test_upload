@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -9,6 +10,36 @@ from .model_client import call_hf_openai_chat, extract_result_text
 
 EventType = str
 RoleType = str
+
+SYSTEM_PROMPT_CONTRACT = """You are ScamBaiter assistant.
+Return exactly one valid JSON object with top-level keys: schema, analysis, message, actions.
+Rules:
+- schema must be exactly \"scambait.llm.v1\".
+- analysis must be an object.
+- message must be an object with exactly one key: text (string, <= 4000 chars).
+- actions must be a non-empty array (max 10 actions).
+- If actions contains send_message, message.text must be non-empty.
+- No markdown, no prose outside JSON, no function-call wrappers.
+Allowed action types:
+- mark_read
+- simulate_typing (duration_seconds 0..60)
+- wait (value >=0, unit in seconds|minutes; max 86400 seconds / 10080 minutes)
+- send_message (optional reply_to, optional send_at_utc)
+- edit_message (message_id, new_text)
+- noop
+- escalate_to_human (reason)
+"""
+
+ALLOWED_TOP_LEVEL_KEYS = {"schema", "analysis", "message", "actions"}
+ALLOWED_ACTION_TYPES = {
+    "mark_read",
+    "simulate_typing",
+    "wait",
+    "send_message",
+    "edit_message",
+    "noop",
+    "escalate_to_human",
+}
 
 
 @dataclass(slots=True)
@@ -34,6 +65,194 @@ class ModelOutput:
     analysis: dict[str, Any]
     metadata: dict[str, Any]
     actions: list[dict[str, Any]]
+
+
+def strip_think_segments(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    return cleaned.replace("<think>", "").replace("</think>", "").strip()
+
+
+def normalize_iso_utc(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    candidate = text.replace("Z", "+00:00")
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return text
+
+
+def normalize_action_shape(action: object) -> dict[str, Any] | None:
+    if not isinstance(action, dict):
+        return None
+    if "type" in action:
+        return dict(action)
+
+    # Accept malformed shorthand for compatibility:
+    # {"send_message": {}} -> {"type": "send_message"}
+    if len(action) == 1:
+        key = next(iter(action.keys()))
+        value = action[key]
+        if isinstance(key, str) and key in ALLOWED_ACTION_TYPES:
+            normalized: dict[str, Any] = {"type": key}
+            if isinstance(value, dict):
+                for nested_key, nested_value in value.items():
+                    normalized[str(nested_key)] = nested_value
+            return normalized
+    return dict(action)
+
+
+def _validate_actions(actions_value: object, reply: str) -> list[dict[str, Any]] | None:
+    if not isinstance(actions_value, list) or not actions_value or len(actions_value) > 10:
+        return None
+
+    normalized_actions: list[dict[str, Any]] = []
+    for action in actions_value:
+        normalized_action = normalize_action_shape(action)
+        if not isinstance(normalized_action, dict):
+            return None
+
+        action_type = normalized_action.get("type")
+        if not isinstance(action_type, str) or action_type not in ALLOWED_ACTION_TYPES:
+            return None
+
+        if action_type == "mark_read":
+            if set(normalized_action.keys()) != {"type"}:
+                return None
+            normalized_actions.append({"type": "mark_read"})
+            continue
+
+        if action_type == "simulate_typing":
+            if set(normalized_action.keys()) != {"type", "duration_seconds"}:
+                return None
+            duration = normalized_action.get("duration_seconds")
+            if not isinstance(duration, (int, float)) or duration < 0 or duration > 60:
+                return None
+            normalized_actions.append({"type": "simulate_typing", "duration_seconds": float(duration)})
+            continue
+
+        if action_type == "wait":
+            if set(normalized_action.keys()) != {"type", "value", "unit"}:
+                return None
+            value = normalized_action.get("value")
+            unit = normalized_action.get("unit")
+            if not isinstance(value, (int, float)) or not isinstance(unit, str):
+                return None
+            unit_norm = unit.strip().lower()
+            if unit_norm not in {"seconds", "minutes"}:
+                return None
+            numeric_value = float(value)
+            if numeric_value < 0:
+                return None
+            if unit_norm == "seconds" and numeric_value > 86400:
+                return None
+            if unit_norm == "minutes" and numeric_value > 10080:
+                return None
+            normalized_actions.append({"type": "wait", "value": numeric_value, "unit": unit_norm})
+            continue
+
+        if action_type == "send_message":
+            allowed = {"type", "reply_to", "send_at_utc"}
+            keys = set(normalized_action.keys())
+            if not keys.issubset(allowed) or "type" not in keys:
+                return None
+            entry: dict[str, Any] = {"type": "send_message"}
+            if "reply_to" in normalized_action:
+                reply_to = normalized_action.get("reply_to")
+                if not isinstance(reply_to, (str, int)):
+                    return None
+                entry["reply_to"] = reply_to
+            if "send_at_utc" in normalized_action:
+                send_at_utc = normalized_action.get("send_at_utc")
+                if not isinstance(send_at_utc, str):
+                    return None
+                normalized_ts = normalize_iso_utc(send_at_utc)
+                if not normalized_ts:
+                    return None
+                entry["send_at_utc"] = normalized_ts
+            normalized_actions.append(entry)
+            continue
+
+        if action_type == "edit_message":
+            if set(normalized_action.keys()) != {"type", "message_id", "new_text"}:
+                return None
+            message_id = normalized_action.get("message_id")
+            new_text = normalized_action.get("new_text")
+            if not isinstance(message_id, (str, int)) or not isinstance(new_text, str):
+                return None
+            normalized_actions.append({"type": "edit_message", "message_id": message_id, "new_text": new_text})
+            continue
+
+        if action_type == "noop":
+            if set(normalized_action.keys()) != {"type"}:
+                return None
+            normalized_actions.append({"type": "noop"})
+            continue
+
+        if action_type == "escalate_to_human":
+            if set(normalized_action.keys()) != {"type", "reason"}:
+                return None
+            reason = normalized_action.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return None
+            normalized_actions.append({"type": "escalate_to_human", "reason": reason.strip()})
+            continue
+
+        return None
+
+    has_send_message = any(str(action.get("type")) == "send_message" for action in normalized_actions)
+    if has_send_message and not reply:
+        return None
+
+    return normalized_actions
+
+
+def parse_structured_model_output(text: str) -> ModelOutput | None:
+    cleaned = strip_think_segments(text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    if any(str(key) not in ALLOWED_TOP_LEVEL_KEYS for key in data.keys()):
+        return None
+    if set(data.keys()) != ALLOWED_TOP_LEVEL_KEYS:
+        return None
+
+    schema_value = data.get("schema")
+    if not isinstance(schema_value, str) or schema_value.strip() != "scambait.llm.v1":
+        return None
+
+    analysis_value = data.get("analysis")
+    if not isinstance(analysis_value, dict):
+        return None
+
+    message_value = data.get("message")
+    if not isinstance(message_value, dict) or set(message_value.keys()) != {"text"}:
+        return None
+    text_value = message_value.get("text")
+    if not isinstance(text_value, str):
+        return None
+    reply = text_value.strip()
+    if len(reply) > 4000:
+        return None
+
+    normalized_actions = _validate_actions(data.get("actions"), reply)
+    if normalized_actions is None:
+        return None
+
+    return ModelOutput(
+        raw=text,
+        suggestion=reply,
+        analysis=analysis_value,
+        metadata={"schema": "scambait.llm.v1"},
+        actions=normalized_actions,
+    )
 
 
 class ScambaiterCore:
@@ -104,16 +323,14 @@ class ScambaiterCore:
     def build_model_messages(self, chat_id: int) -> list[dict[str, str]]:
         prompt_events = self.build_prompt_events(chat_id=chat_id)
         messages: list[dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT_CONTRACT},
             {
                 "role": "system",
                 "content": (
-                    "You are ScamBaiter assistant. Produce valid JSON with fields: "
-                    "analysis, message, actions."
+                    "Chat context for chat_id="
+                    f"{chat_id}. Events are chronological. "
+                    "Prefer the newest user/scammer intent."
                 ),
-            },
-            {
-                "role": "system",
-                "content": f"Chat context for chat_id={chat_id}. Events are chronological.",
             },
         ]
         for event in prompt_events:
@@ -141,12 +358,23 @@ class ScambaiterCore:
             # Dry run is pinned to HF router to avoid accidental provider drift via HF_BASE_URL.
             base_url=None,
         )
+        result_text = extract_result_text(response_json)
+        parsed = parse_structured_model_output(result_text)
         return {
             "provider": "huggingface_openai_compat",
             "model": model,
             "prompt_json": {"messages": messages, "max_tokens": max_tokens},
             "response_json": response_json,
-            "result_text": extract_result_text(response_json),
+            "result_text": result_text,
+            "valid_output": parsed is not None,
+            "parsed_output": {
+                "analysis": parsed.analysis,
+                "message": {"text": parsed.suggestion},
+                "actions": parsed.actions,
+                "metadata": parsed.metadata,
+            }
+            if parsed is not None
+            else None,
         }
 
     def generate_output(
@@ -169,12 +397,25 @@ class ScambaiterCore:
         suggestion = "Noted."
         if last_text:
             suggestion = f"Noted: {last_text[:120]}"
+
+        candidate_payload = {
+            "schema": "scambait.llm.v1",
+            "analysis": {},
+            "message": {"text": suggestion},
+            "actions": [{"type": "send_message"}],
+        }
+        raw = json.dumps(candidate_payload, ensure_ascii=True)
+        parsed = parse_structured_model_output(raw)
+        if parsed is not None:
+            return parsed
+
+        # Safety fallback (should be unreachable unless parser contract changes unexpectedly).
         return ModelOutput(
-            raw='{"schema":"scambait.llm.v1"}',
+            raw=raw,
             suggestion=suggestion,
             analysis={},
-            metadata={"schema": "scambait.llm.v1"},
-            actions=[{"type": "prepare_message"}],
+            metadata={"schema": "scambait.llm.v1", "fallback": True},
+            actions=[{"type": "noop"}],
         )
 
     @staticmethod
