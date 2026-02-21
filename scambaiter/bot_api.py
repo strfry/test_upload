@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import html
 from datetime import datetime, timezone
 from typing import Any
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 
@@ -72,11 +73,19 @@ def _user_card_tasks(application: Application) -> dict[int, asyncio.Task[Any]]:
     return state
 
 
+def _render_html_copy_block(text: str) -> str:
+    escaped = html.escape(text)
+    if len(escaped) > 3200:
+        escaped = escaped[:3197] + "..."
+    return "<b>Message text (copy)</b>\n<pre>" + escaped + "</pre>"
+
+
 async def _send_control_text(
     application: Application,
     message: Message,
     text: str,
     *,
+    parse_mode: str | None = None,
     replace_previous_status: bool = True,
 ) -> None:
     if len(text) > 3500:
@@ -90,7 +99,7 @@ async def _send_control_text(
                 await application.bot.delete_message(chat_id=chat_id, message_id=previous_id)
             except Exception:
                 pass
-    sent = await message.reply_text(text)
+    sent = await message.reply_text(text, parse_mode=parse_mode, disable_web_page_preview=True)
     sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
     sent_messages.append(int(sent.message_id))
     if len(sent_messages) > 500:
@@ -377,16 +386,56 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
     )
     if status == "ok":
         if isinstance(parsed_output, dict):
-            preview = json.dumps(parsed_output, ensure_ascii=False)
+            message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
+            message_text = str(message_obj.get("text") or "").strip()
+            actions = parsed_output.get("actions") if isinstance(parsed_output.get("actions"), list) else []
+            analysis = parsed_output.get("analysis") if isinstance(parsed_output.get("analysis"), dict) else {}
+
+            action_labels: list[str] = []
+            for idx, action in enumerate(actions, start=1):
+                if isinstance(action, dict):
+                    action_type = str(action.get("type") or "unknown")
+                    action_labels.append(f"{idx}. {action_type}")
+            action_block = "\n".join(action_labels) if action_labels else "(none)"
+
+            analysis_keys = sorted(str(key) for key in analysis.keys())
+            analysis_preview = ", ".join(analysis_keys[:8]) if analysis_keys else "(none)"
+            if len(analysis_keys) > 8:
+                analysis_preview += ", ..."
+
+            summary_lines = [
+                f"Dry run saved as attempt #{attempt.id} for /{chat_id}",
+                f"schema: {parsed_output.get('metadata', {}).get('schema', 'unknown')}",
+                f"actions: {len(actions)}",
+                f"analysis_keys: {analysis_preview}",
+                "",
+                "Action queue:",
+                action_block,
+            ]
+            await _send_control_text(
+                application=app,
+                message=message,
+                text="\n".join(summary_lines),
+            )
+
+            if message_text:
+                copy_block = _render_html_copy_block(message_text)
+                await _send_control_text(
+                    application=app,
+                    message=message,
+                    text=copy_block,
+                    parse_mode=ParseMode.HTML,
+                    replace_previous_status=False,
+                )
         else:
             preview = (result_text or "<empty-result>").strip()
-        if len(preview) > 500:
-            preview = preview[:497] + "..."
-        await _send_control_text(
-            application=app,
-            message=message,
-            text=f"Dry run saved as attempt #{attempt.id} for /{chat_id}\n{preview}",
-        )
+            if len(preview) > 500:
+                preview = preview[:497] + "..."
+            await _send_control_text(
+                application=app,
+                message=message,
+                text=f"Dry run saved as attempt #{attempt.id} for /{chat_id}\n{preview}",
+            )
     else:
         await _send_control_text(
             application=app,
