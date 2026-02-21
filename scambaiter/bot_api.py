@@ -1077,6 +1077,12 @@ def ingest_forwarded_message(store: Any, target_chat_id: int, message: Message) 
     return _ingest_forward_payload(store=store, target_chat_id=target_chat_id, payload=payload)
 
 
+def _sanitize_legacy_profile_text(text: str) -> str:
+    if text.startswith("profile_update:") and text.endswith("(botapi_forward)"):
+        return text[: -len("(botapi_forward)")].rstrip()
+    return text
+
+
 def _format_history_line(event: Any) -> str:
     ts = getattr(event, "ts_utc", None)
     hhmm = "--:--"
@@ -1092,7 +1098,8 @@ def _format_history_line(event: Any) -> str:
     text = getattr(event, "text", None)
     if not text:
         return f"{hhmm} {role}/{event_type}"
-    flat_text = " ".join(str(text).split())
+    normalized_text = _sanitize_legacy_profile_text(str(text))
+    flat_text = " ".join(normalized_text.split())
     if len(flat_text) > 120:
         flat_text = flat_text[:117] + "..."
     return f"{hhmm} {role}/{event_type}: {flat_text}"

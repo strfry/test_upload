@@ -183,6 +183,17 @@ class AnalysisStore:
             """
         )
         self._ensure_generation_attempt_columns()
+        # Legacy cleanup: older builds embedded source labels in profile_update text.
+        # Normalize persisted rows so views stay clean without data loss.
+        self._conn.execute(
+            """
+            UPDATE events
+            SET text = TRIM(REPLACE(text, ' (botapi_forward)', ''))
+            WHERE role = 'system'
+              AND event_type = 'message'
+              AND text LIKE 'profile_update:%(botapi_forward)%'
+            """
+        )
         self._conn.commit()
 
     def save(
