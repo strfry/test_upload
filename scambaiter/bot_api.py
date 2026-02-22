@@ -2642,6 +2642,13 @@ async def _handle_forward_insert_button(update: Update, context: ContextTypes.DE
         await query.edit_message_text(summary)
     except Exception:
         await message.reply_text(summary)
+    # Refresh the chat card for the target chat immediately after insertion completes.
+    _schedule_user_card_update(
+        application=app,
+        control_chat_id=control_chat_id,
+        store=store,
+        target_chat_id=target_chat_id,
+    )
     await query.answer("Inserted")
 
 
@@ -2795,6 +2802,20 @@ def _infer_target_chat_id_from_forward(message: Message) -> int | None:
         if isinstance(sender_user_id, int):
             return sender_user_id
     return None
+
+
+def _should_reuse_forward_target(
+    target_chat_id: int | None,
+    forward_target_hint: int | None,
+    control_user_id: int | None,
+) -> bool:
+    if not isinstance(target_chat_id, int) or target_chat_id <= 0:
+        return False
+    if not isinstance(forward_target_hint, int):
+        return True
+    if isinstance(control_user_id, int) and forward_target_hint == control_user_id:
+        return True
+    return forward_target_hint == target_chat_id
 
 
 def _infer_role_from_forward(message: Message, target_chat_id: int) -> str:
@@ -3526,10 +3547,12 @@ async def _handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     state = _active_targets(app)
     auto_targets = _auto_targets(app)
     target_chat_id = state.get(control_chat_id)
+    forward_target_hint = _infer_target_chat_id_from_forward(message)
     role: str = "manual"
     inferred_target: int | None = target_chat_id
-    if target_chat_id is not None:
-        role = _infer_role_from_forward(message, target_chat_id=target_chat_id)
+    if _should_reuse_forward_target(target_chat_id, forward_target_hint, control_user_id):
+        if isinstance(target_chat_id, int):
+            role = _infer_role_from_forward(message, target_chat_id=target_chat_id)
     else:
         auto_target_chat_id = auto_targets.get(control_chat_id)
         inferred_target, role = _resolve_target_and_role_without_active(
