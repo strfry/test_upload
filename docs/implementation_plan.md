@@ -92,6 +92,7 @@ Out of Scope:
   3. Queue-/Action-Lifecycle je `trace_id` klar im Store sichtbar machen.
   4. Prompt-Ansicht stabil auf Reply-JSON-Sektionen halten (`schema`, `analysis`, `message`, `actions`, `raw`) und nur relevante Prompt-Events verwenden.
   5. Iterative Feinhärtung der Dry-Run-Fehlerdarstellung und Attempt-Diagnostik (`phase`, `accepted`, `reject_reason`).
+  6. Forward-Ingestion als Batch-Append mit sequenzbasierter Deduplizierung stabilisieren:
+     Hybrid-Identität verwenden (`channel_message_id` nur bei Channel-Origin, sonst `origin_signature`) und Sequenzabgleich darauf aufbauen.
 
 - Übergabehinweis: Umsetzung läuft auf `branch/opencraw`; letzte Änderungen sind Prompt-Card/Attempt-Diagnostik/Cleanup für Profile-Noise.
-

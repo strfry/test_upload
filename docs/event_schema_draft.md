@@ -61,7 +61,16 @@ Storage keeps full source fields. Prompt payload is a lightweight projection.
   "role": "manual",
   "ts_utc": "2026-02-17T18:11:10Z",
   "text": "Forwarded from Telegram user...",
-  "source_message_id": "tg:6998054071:4567"
+  "source_message_id": "fwd:v2:origin_signature:ab12cd34ef56:message:112233445566",
+  "meta": {
+    "forward_identity": {
+      "strategy": "origin_signature",
+      "key": "sig:9ff3..."
+    },
+    "forward_profile": {
+      "origin_kind": "MessageOriginUser"
+    }
+  }
 }
 ```
 

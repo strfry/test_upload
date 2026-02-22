@@ -10,14 +10,17 @@ from scambaiter.bot_api import (
     _build_forward_payload,
     _chat_button_label,
     _delete_control_message,
+    _dry_run_retry_keyboard,
     _event_ts_utc_for_store,
     _extract_partial_message_preview,
     _extract_forward_profile_info,
     _infer_role_without_target,
     _infer_target_chat_id_from_forward,
     _ingest_forward_payload,
+    _plan_forward_merge,
     _profile_lines_from_events,
     _render_prompt_card_text,
+    _render_html_semantic_conflict_card,
     _render_prompt_section_text,
     _render_whoami_text,
     _prompt_keyboard,
@@ -40,7 +43,10 @@ class _FakeMessage:
         caption: str | None,
         has_photo: bool,
         with_forward_origin: bool,
-        forward_message_id: int | None = 7788,
+        origin_kind: str = "user",
+        sender_user_id: int = 99,
+        sender_chat_id: int = 77,
+        forward_message_id: int | None = None,
         forward_date_equals_message_date: bool = False,
     ) -> None:
         self.chat_id = chat_id
@@ -51,20 +57,51 @@ class _FakeMessage:
         self.date = datetime(2026, 2, 21, 14, 5, 0, tzinfo=timezone.utc)
         if with_forward_origin:
             origin_date = self.date if forward_date_equals_message_date else datetime(2026, 2, 21, 13, 59, 0, tzinfo=timezone.utc)
-            self.forward_origin = type(
-                "FakeForwardOrigin",
-                (),
-                {
-                    "date": origin_date,
-                    "message_id": forward_message_id,
-                    "sender_user": type(
-                        "User",
-                        (),
-                        {"id": 99, "username": "scammer123", "first_name": "Scam", "last_name": "Mer"},
-                    )(),
-                    "sender_chat": None,
-                },
-            )()
+            if origin_kind == "channel":
+                self.forward_origin = type(
+                    "FakeForwardOriginChannel",
+                    (),
+                    {
+                        "date": origin_date,
+                        "chat": type("Chat", (), {"id": sender_chat_id, "type": "channel", "title": "Scam Channel", "username": "scamchan"})(),
+                        "message_id": forward_message_id if isinstance(forward_message_id, int) else 7788,
+                    },
+                )()
+            elif origin_kind == "hidden":
+                self.forward_origin = type(
+                    "FakeForwardOriginHiddenUser",
+                    (),
+                    {
+                        "date": origin_date,
+                        "sender_user_name": "Hidden Sender",
+                    },
+                )()
+            elif origin_kind == "chat":
+                self.forward_origin = type(
+                    "FakeForwardOriginChat",
+                    (),
+                    {
+                        "date": origin_date,
+                        "sender_chat": type(
+                            "Chat",
+                            (),
+                            {"id": sender_chat_id, "type": "group", "title": "Scam Group", "username": "scamgroup"},
+                        )(),
+                    },
+                )()
+            else:
+                self.forward_origin = type(
+                    "FakeForwardOriginUser",
+                    (),
+                    {
+                        "date": origin_date,
+                        "sender_user": type(
+                            "User",
+                            (),
+                            {"id": sender_user_id, "username": "scammer123", "first_name": "Scam", "last_name": "Mer"},
+                        )(),
+                    },
+                )()
         else:
             self.forward_origin = None
         self.from_user = type("ControlUser", (), {"id": 555, "username": "baiter", "first_name": "Baiter", "last_name": "Tester"})()
@@ -123,6 +160,21 @@ class BotApiForwardIngestTest(unittest.TestCase):
         target = _infer_target_chat_id_from_forward(message)
         self.assertEqual(99, target)
 
+    def test_forward_origin_channel_chat_maps_to_target_chat(self) -> None:
+        message = _FakeMessage(
+            chat_id=5000,
+            message_id=141,
+            text="forwarded channel",
+            caption=None,
+            has_photo=False,
+            with_forward_origin=True,
+            origin_kind="channel",
+            sender_chat_id=7001,
+            forward_message_id=222,
+        )
+        target = _infer_target_chat_id_from_forward(message)
+        self.assertEqual(7001, target)
+
     def test_forwarded_message_from_target_is_marked_scammer(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
@@ -165,18 +217,7 @@ class BotApiForwardIngestTest(unittest.TestCase):
         ts = _event_ts_utc_for_store(message)
         self.assertEqual("2026-02-21T13:59:00Z", ts)
 
-    def test_forward_timestamp_is_optional_when_origin_is_not_reliable(self) -> None:
-        message = _FakeMessage(
-            chat_id=5000,
-            message_id=17,
-            text="coarse time",
-            caption=None,
-            has_photo=False,
-            with_forward_origin=True,
-            forward_message_id=None,
-        )
-        self.assertIsNone(_event_ts_utc_for_store(message))
-
+    def test_forward_timestamp_is_optional_when_origin_time_matches_forward_time(self) -> None:
         message_same_time = _FakeMessage(
             chat_id=5000,
             message_id=18,
@@ -212,6 +253,48 @@ class BotApiForwardIngestTest(unittest.TestCase):
         role = _infer_role_without_target(message, control_user_id=99)
         self.assertEqual("manual", role)
 
+    def test_build_forward_payload_uses_signature_identity_for_user_origin(self) -> None:
+        message = _FakeMessage(
+            chat_id=5000,
+            message_id=201,
+            text="identity",
+            caption=None,
+            has_photo=False,
+            with_forward_origin=True,
+            origin_kind="user",
+        )
+        payload = _build_forward_payload(message, role="scammer")
+        self.assertTrue(payload.get("source_message_id"))
+        meta = payload.get("meta")
+        assert isinstance(meta, dict)
+        identity = meta.get("forward_identity")
+        self.assertIsInstance(identity, dict)
+        assert isinstance(identity, dict)
+        self.assertEqual("origin_signature", identity.get("strategy"))
+        self.assertTrue(str(identity.get("key")))
+
+    def test_build_forward_payload_uses_channel_message_id_identity_when_available(self) -> None:
+        message = _FakeMessage(
+            chat_id=5000,
+            message_id=202,
+            text="channel identity",
+            caption=None,
+            has_photo=False,
+            with_forward_origin=True,
+            origin_kind="channel",
+            sender_chat_id=7123,
+            forward_message_id=333,
+        )
+        payload = _build_forward_payload(message, role="scammer")
+        meta = payload.get("meta")
+        assert isinstance(meta, dict)
+        identity = meta.get("forward_identity")
+        self.assertIsInstance(identity, dict)
+        assert isinstance(identity, dict)
+        self.assertEqual("channel_message_id", identity.get("strategy"))
+        self.assertEqual("channel:7123:333", identity.get("key"))
+        self.assertEqual(333, payload.get("origin_message_id"))
+
     def test_buffer_payload_can_be_ingested_after_chat_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
@@ -229,6 +312,63 @@ class BotApiForwardIngestTest(unittest.TestCase):
             self.assertEqual("scammer", record.role)
             events = store.list_events(chat_id=1234, limit=10)
             self.assertEqual(1, len(events))
+
+    def test_plan_forward_merge_accepts_user_origin_without_message_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            message = _FakeMessage(
+                chat_id=5000,
+                message_id=31,
+                text="missing id",
+                caption=None,
+                has_photo=False,
+                with_forward_origin=True,
+                origin_kind="user",
+                forward_message_id=None,
+            )
+            payload = _build_forward_payload(message, role="scammer")
+            merge = _plan_forward_merge(store, target_chat_id=1234, payloads=[payload])
+            self.assertEqual("append", merge.get("mode"))
+
+    def test_plan_forward_merge_appends_new_scammer_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            first = _FakeMessage(
+                chat_id=5000,
+                message_id=40,
+                text="hello",
+                caption=None,
+                has_photo=False,
+                with_forward_origin=True,
+                origin_kind="channel",
+                sender_chat_id=9911,
+                forward_message_id=100,
+            )
+            second = _FakeMessage(
+                chat_id=5000,
+                message_id=41,
+                text="next",
+                caption=None,
+                has_photo=False,
+                with_forward_origin=True,
+                origin_kind="channel",
+                sender_chat_id=9911,
+                forward_message_id=101,
+            )
+            _ingest_forward_payload(store=store, target_chat_id=1234, payload=_build_forward_payload(first, role="scammer"))
+            merge = _plan_forward_merge(
+                store,
+                target_chat_id=1234,
+                payloads=[_build_forward_payload(first, role="scammer"), _build_forward_payload(second, role="scammer")],
+            )
+            self.assertEqual("append", merge.get("mode"))
+            insert_payloads = merge.get("insert_payloads")
+            self.assertIsInstance(insert_payloads, list)
+            assert isinstance(insert_payloads, list)
+            self.assertEqual(1, len(insert_payloads))
+            self.assertEqual(101, insert_payloads[0].get("origin_message_id"))
 
     def test_forward_payload_stores_scanner_and_baiter_metadata(self) -> None:
         message = _FakeMessage(
@@ -343,6 +483,24 @@ class BotApiForwardIngestTest(unittest.TestCase):
         sender_user = info["sender_user"]
         self.assertEqual(99, sender_user.get("id"))
 
+    def test_extract_forward_profile_info_maps_channel_chat_into_sender_chat(self) -> None:
+        message = _FakeMessage(
+            chat_id=5000,
+            message_id=240,
+            text="channel profile",
+            caption=None,
+            has_photo=False,
+            with_forward_origin=True,
+            origin_kind="channel",
+            sender_chat_id=8888,
+            forward_message_id=77,
+        )
+        info = _extract_forward_profile_info(message)
+        sender_chat = info.get("sender_chat")
+        self.assertIsInstance(sender_chat, dict)
+        assert isinstance(sender_chat, dict)
+        self.assertEqual(8888, sender_chat.get("id"))
+
     def test_profile_lines_prefer_scammer_identity_over_manual(self) -> None:
         manual_event = type(
             "Evt",
@@ -432,6 +590,14 @@ class BotApiForwardIngestTest(unittest.TestCase):
         raw = (
             '{"schema":"scambait.llm.v1","message":{},'
             '"actions":[{"type":"send_message","message":{"text":"  action   text  "}}]}'
+        )
+        preview = _extract_partial_message_preview(raw)
+        self.assertEqual("action text", preview)
+
+    def test_extract_partial_message_preview_reads_dotted_action_message_text(self) -> None:
+        raw = (
+            '{"schema":"scambait.llm.v1","message":{},'
+            '"actions":[{"type":"send_message","message.text":"  action   text  "}]}'
         )
         preview = _extract_partial_message_preview(raw)
         self.assertEqual("action text", preview)
@@ -544,6 +710,35 @@ class BotApiForwardIngestTest(unittest.TestCase):
     def test_extract_partial_message_preview_empty_on_non_json(self) -> None:
         preview = _extract_partial_message_preview("not-json")
         self.assertEqual("", preview)
+
+    def test_render_semantic_conflict_card_contains_pivot_preview(self) -> None:
+        text = _render_html_semantic_conflict_card(
+            attempt_id=23,
+            chat_id=7069434543,
+            provider="huggingface_openai_compat",
+            model="openai/gpt-oss-20b",
+            conflict={
+                "type": "semantic_conflict",
+                "code": "policy_tension",
+                "reason": "Need a safer pivot to keep the conversation constructive.",
+                "requires_human": True,
+                "suggested_mode": "hold",
+            },
+            pivot={
+                "recommended_text": "Could you share the exact company registration record first?",
+            },
+            result_text="",
+        )
+        self.assertIn("Semantic conflict", text)
+        self.assertIn("recommended pivot", text)
+        self.assertIn("policy_tension", text)
+
+    def test_dry_run_retry_keyboard_contains_callback(self) -> None:
+        keyboard = _dry_run_retry_keyboard(chat_id=1234, attempt_id=77)
+        self.assertTrue(keyboard.inline_keyboard)
+        first = keyboard.inline_keyboard[0][0]
+        self.assertEqual("Retry", first.text)
+        self.assertEqual("sc:reply_retry:1234", first.callback_data)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 from datetime import datetime, timezone
@@ -45,6 +46,22 @@ def _pending_forwards(application: Application) -> dict[int, list[dict[str, Any]
     return state
 
 
+def _forward_card_messages(application: Application) -> dict[int, int]:
+    state = application.bot_data.setdefault("forward_card_message_by_control_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["forward_card_message_by_control_chat"] = state
+    return state
+
+
+def _forward_card_targets(application: Application) -> dict[int, int]:
+    state = application.bot_data.setdefault("forward_card_target_by_control_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["forward_card_target_by_control_chat"] = state
+    return state
+
+
 def _sent_control_messages(application: Application) -> dict[int, list[int]]:
     state = application.bot_data.setdefault("sent_control_messages_by_chat", {})
     if not isinstance(state, dict):
@@ -83,6 +100,55 @@ def _prompt_card_contexts(application: Application) -> dict[int, dict[str, int]]
         state = {}
         application.bot_data["prompt_card_context_by_message"] = state
     return state
+
+
+def _reply_card_states(application: Application) -> dict[int, dict[str, Any]]:
+    state = application.bot_data.setdefault("reply_card_state_by_message", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["reply_card_state_by_message"] = state
+    return state
+
+
+def _next_reply_run_id(application: Application) -> int:
+    raw = application.bot_data.get("reply_run_counter")
+    try:
+        current = int(raw)
+    except Exception:
+        current = 0
+    current += 1
+    application.bot_data["reply_run_counter"] = current
+    return current
+
+
+def _set_reply_card_state(
+    application: Application,
+    message_id: int,
+    *,
+    chat_id: int,
+    provider: str,
+    model: str,
+    parsed_output: dict[str, Any] | None,
+    result_text: str,
+    retry_context: dict[str, Any] | None,
+) -> None:
+    _reply_card_states(application)[int(message_id)] = {
+        "chat_id": int(chat_id),
+        "provider": str(provider or "unknown"),
+        "model": str(model or "unknown"),
+        "parsed_output": parsed_output if isinstance(parsed_output, dict) else None,
+        "result_text": str(result_text or ""),
+        "retry_context": retry_context if isinstance(retry_context, dict) else None,
+    }
+
+
+def _get_reply_card_state(application: Application, message_id: int) -> dict[str, Any] | None:
+    payload = _reply_card_states(application).get(int(message_id))
+    return payload if isinstance(payload, dict) else None
+
+
+def _drop_reply_card_state(application: Application, message_id: int) -> None:
+    _reply_card_states(application).pop(int(message_id), None)
 
 
 def _last_sent_by_chat(application: Application) -> dict[int, dict[str, int]]:
@@ -218,6 +284,95 @@ def _render_html_error_card(
     return "\n".join(lines)
 
 
+def _render_html_semantic_conflict_card(
+    *,
+    attempt_id: int,
+    chat_id: int,
+    provider: str,
+    model: str,
+    conflict: dict[str, Any] | None,
+    pivot: dict[str, Any] | None,
+    result_text: str | None,
+) -> str:
+    code = str((conflict or {}).get("code") or "operator_required")
+    reason = str((conflict or {}).get("reason") or "Model signaled a semantic conflict.").strip()
+    requires_human = bool((conflict or {}).get("requires_human", True))
+    mode = str((conflict or {}).get("suggested_mode") or "hold")
+    reason_escaped = html.escape(reason)
+    if len(reason_escaped) > 1400:
+        reason_escaped = reason_escaped[:1397] + "..."
+    lines = [
+        f"<b>Semantic conflict</b> (attempt #{attempt_id} for /{chat_id})",
+        f"<b>provider:</b> <code>{html.escape(provider or 'unknown')}</code>",
+        f"<b>model:</b> <code>{html.escape(model or 'unknown')}</code>",
+        "<b>class:</b> Operator decision required",
+        "",
+        "<b>conflict</b>",
+        f"- type: <code>semantic_conflict</code>",
+        f"- code: <code>{html.escape(code)}</code>",
+        f"- requires_human: <code>{'true' if requires_human else 'false'}</code>",
+        f"- suggested_mode: <code>{html.escape(mode)}</code>",
+        f"<pre>{reason_escaped}</pre>",
+    ]
+    recommended_text = ""
+    if isinstance(pivot, dict):
+        candidate = pivot.get("recommended_text")
+        if isinstance(candidate, str) and candidate.strip():
+            recommended_text = candidate.strip()
+        pivot_error = pivot.get("error")
+        if isinstance(pivot_error, str) and pivot_error.strip():
+            lines.extend(
+                [
+                    "<b>pivot generation</b>",
+                    f"<pre>{html.escape(pivot_error.strip())}</pre>",
+                ]
+            )
+    if recommended_text:
+        lines.extend(
+            [
+                "<b>recommended pivot</b>",
+                f"<pre>{html.escape(recommended_text)}</pre>",
+            ]
+        )
+    partial_preview = _extract_partial_message_preview(result_text or "")
+    if partial_preview:
+        lines.extend(
+            [
+                "<b>model message preview</b>",
+                f"<pre>{html.escape(partial_preview)}</pre>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _dry_run_retry_keyboard(chat_id: int, attempt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Retry", callback_data=f"sc:reply_retry:{chat_id}")],
+            [InlineKeyboardButton("Delete", callback_data=f"sc:reply_delete:{chat_id}")],
+        ]
+    )
+
+
+def _reply_action_keyboard(chat_id: int, telethon_enabled: bool) -> InlineKeyboardMarkup:
+    action_label = "Send" if telethon_enabled else "Mark as Sent"
+    action_code = "reply_send" if telethon_enabled else "reply_mark"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(action_label, callback_data=f"sc:{action_code}:{chat_id}")],
+            [InlineKeyboardButton("Delete", callback_data=f"sc:reply_delete:{chat_id}")],
+        ]
+    )
+
+
+def _reply_error_keyboard(chat_id: int, retry_enabled: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if retry_enabled:
+        rows.append([InlineKeyboardButton("Retry", callback_data=f"sc:reply_retry:{chat_id}")])
+    rows.append([InlineKeyboardButton("Delete", callback_data=f"sc:reply_delete:{chat_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _extract_action_message_text(payload: dict[str, Any] | None) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -231,6 +386,9 @@ def _extract_action_message_text(payload: dict[str, Any] | None) -> str:
             continue
         message_obj = action.get("message")
         if not isinstance(message_obj, dict):
+            dotted = action.get("message.text")
+            if isinstance(dotted, str) and dotted.strip():
+                return dotted.strip()
             continue
         text = message_obj.get("text")
         if isinstance(text, str) and text.strip():
@@ -645,7 +803,7 @@ def _send_result_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Cancel/Delete Last", callback_data=f"sc:undo_send:{chat_id}")],
-            [InlineKeyboardButton("Delete", callback_data="sc:prompt_delete")],
+            [InlineKeyboardButton("Delete", callback_data=f"sc:reply_delete:{chat_id}")],
         ]
     )
 
@@ -1432,27 +1590,27 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
         return
     service = app.bot_data.get("service")
     core = getattr(service, "core", None)
-    store = getattr(service, "store", None)
-    if core is None or store is None:
+    if core is None:
         await query.answer("Service unavailable")
         return
     await query.answer("Dry run started")
+    run_id = _next_reply_run_id(app)
     provider = "huggingface_openai_compat"
     model = str((getattr(core.config, "hf_model", None) or "").strip())
-    prompt_json: dict[str, Any] = {}
-    response_json: dict[str, Any] = {}
     parsed_output: dict[str, Any] | None = None
     result_text = ""
     status = "ok"
     error_message: str | None = None
-    attempt_records: list[dict[str, Any]] = []
     contract_issues: list[dict[str, Any]] = []
+    outcome_class = "ok"
+    conflict_payload: dict[str, Any] | None = None
+    pivot_payload: dict[str, Any] | None = None
+    repair_available = False
+    retry_context: dict[str, Any] | None = None
     try:
         dry_run_result = core.run_hf_dry_run(chat_id)
         provider = str(dry_run_result.get("provider") or provider)
         model = str(dry_run_result.get("model") or model)
-        prompt_json = dry_run_result.get("prompt_json") if isinstance(dry_run_result.get("prompt_json"), dict) else {}
-        response_json = dry_run_result.get("response_json") if isinstance(dry_run_result.get("response_json"), dict) else {}
         parsed_output = dry_run_result.get("parsed_output") if isinstance(dry_run_result.get("parsed_output"), dict) else None
         result_text = str(dry_run_result.get("result_text") or "")
         raw_issues = dry_run_result.get("contract_issues")
@@ -1460,10 +1618,22 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
             contract_issues = [item for item in raw_issues if isinstance(item, dict)]
         valid_output = bool(dry_run_result.get("valid_output"))
         error_message = str(dry_run_result.get("error_message") or "").strip() or None
-        records = dry_run_result.get("attempts")
-        if isinstance(records, list):
-            attempt_records = [item for item in records if isinstance(item, dict)]
-        if (not valid_output) or error_message:
+        outcome_class = str(dry_run_result.get("outcome_class") or "ok")
+        raw_conflict = dry_run_result.get("conflict")
+        if isinstance(raw_conflict, dict):
+            conflict_payload = raw_conflict
+        raw_pivot = dry_run_result.get("pivot")
+        if isinstance(raw_pivot, dict):
+            pivot_payload = raw_pivot
+        repair_available = bool(dry_run_result.get("repair_available"))
+        raw_retry_context = dry_run_result.get("repair_context")
+        if isinstance(raw_retry_context, dict):
+            retry_context = raw_retry_context
+        if outcome_class == "semantic_conflict":
+            status = "semantic_conflict"
+            if not error_message:
+                error_message = "semantic conflict detected (operator decision required)"
+        elif (not valid_output) or error_message:
             status = "error"
         if status == "ok" and not result_text.strip():
             status = "error"
@@ -1471,54 +1641,6 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         status = "error"
         error_message = str(exc)
-
-    base_attempt_no = store.next_attempt_no(chat_id)
-    saved_attempt = None
-    if attempt_records:
-        for idx, rec in enumerate(attempt_records):
-            rec_prompt = rec.get("prompt_json") if isinstance(rec.get("prompt_json"), dict) else prompt_json
-            rec_response = rec.get("response_json") if isinstance(rec.get("response_json"), dict) else response_json
-            rec_text = str(rec.get("result_text") or "")
-            rec_status = str(rec.get("status") or ("ok" if bool(rec.get("accepted")) else "invalid"))
-            rec_error = rec.get("error_message")
-            if rec_error is not None:
-                rec_error = str(rec_error)
-            rec_phase = str(rec.get("phase") or "initial")
-            rec_accepted = bool(rec.get("accepted"))
-            rec_reject_reason = rec.get("reject_reason")
-            if rec_reject_reason is not None:
-                rec_reject_reason = str(rec_reject_reason)
-            saved_attempt = store.save_generation_attempt(
-                chat_id=chat_id,
-                provider=provider,
-                model=model or "unknown",
-                prompt_json=rec_prompt,
-                response_json=rec_response,
-                result_text=rec_text,
-                status=rec_status,
-                error_message=rec_error,
-                attempt_no=base_attempt_no + idx,
-                phase=rec_phase,
-                accepted=rec_accepted,
-                reject_reason=rec_reject_reason,
-            )
-    else:
-        saved_attempt = store.save_generation_attempt(
-            chat_id=chat_id,
-            provider=provider,
-            model=model or "unknown",
-            prompt_json=prompt_json,
-            response_json=response_json,
-            result_text=result_text,
-            status=status,
-            error_message=error_message,
-            attempt_no=base_attempt_no,
-            phase="initial",
-            accepted=(status == "ok"),
-            reject_reason=None if status == "ok" else "provider_error",
-        )
-
-    attempt = saved_attempt
 
     if status == "ok":
         if isinstance(parsed_output, dict):
@@ -1542,23 +1664,11 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
                 analysis_preview += ", ..."
 
             summary_lines = [
-                f"Dry run saved as attempt #{attempt.id} for /{chat_id}",
+                f"Dry run #{run_id} for /{chat_id}",
                 f"schema: {parsed_output.get('metadata', {}).get('schema', 'unknown')}",
                 f"actions: {len(actions)}",
                 f"analysis_keys: {analysis_preview}",
             ]
-            if len(attempt_records) > 1:
-                flow_bits: list[str] = []
-                for rec in attempt_records:
-                    phase = str(rec.get("phase") or "?")
-                    phase_status = str(rec.get("status") or "?")
-                    flow_bits.append(f"{phase}:{phase_status}")
-                summary_lines.extend(
-                    [
-                        f"repair: used ({len(attempt_records)} attempts)",
-                        f"flow: {' -> '.join(flow_bits)}",
-                    ]
-                )
             summary_lines.extend(
                 [
                 "",
@@ -1574,28 +1684,23 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
 
             if message_text:
                 copy_block = _render_html_copy_block(message_text)
-                send_enabled = app.bot_data.get("telethon_executor") is not None and isinstance(getattr(attempt, "id", None), int)
-                copy_markup: InlineKeyboardMarkup | None = None
-                if send_enabled:
-                    copy_markup = InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "Send",
-                                    callback_data=f"sc:send:{chat_id}:{int(attempt.id)}",
-                                )
-                            ]
-                        ]
-                    )
                 sent_copy = await _send_control_text(
                     application=app,
                     message=message,
                     text=copy_block,
                     replace_previous_status=False,
-                    reply_markup=copy_markup,
+                    reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=app.bot_data.get("telethon_executor") is not None),
                 )
-                if send_enabled:
-                    _set_prompt_card_context(app, int(sent_copy.message_id), chat_id=chat_id, attempt_id=int(attempt.id))
+                _set_reply_card_state(
+                    app,
+                    int(sent_copy.message_id),
+                    chat_id=chat_id,
+                    provider=provider,
+                    model=model or "unknown",
+                    parsed_output=parsed_output,
+                    result_text=result_text,
+                    retry_context=None,
+                )
         else:
             preview = (result_text or "<empty-result>").strip()
             if len(preview) > 500:
@@ -1603,11 +1708,38 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
             await _send_control_text(
                 application=app,
                 message=message,
-                text=f"Dry run saved as attempt #{attempt.id} for /{chat_id}\n{preview}",
+                text=f"Dry run #{run_id} for /{chat_id}\n{preview}",
             )
+    elif status == "semantic_conflict":
+        conflict_block = _render_html_semantic_conflict_card(
+            attempt_id=run_id,
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            conflict=conflict_payload,
+            pivot=pivot_payload,
+            result_text=result_text,
+        )
+        sent = await _send_control_text(
+            application=app,
+            message=message,
+            text=conflict_block,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_reply_error_keyboard(chat_id, retry_enabled=repair_available),
+        )
+        _set_reply_card_state(
+            app,
+            int(sent.message_id),
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            parsed_output=parsed_output,
+            result_text=result_text,
+            retry_context=retry_context,
+        )
     else:
         error_block = _render_html_error_card(
-            attempt_id=attempt.id,
+            attempt_id=run_id,
             chat_id=chat_id,
             provider=provider,
             model=model or "unknown",
@@ -1615,12 +1747,331 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
             result_text=result_text,
             contract_issues=contract_issues,
         )
-        await _send_control_text(
+        sent = await _send_control_text(
             application=app,
             message=message,
             text=error_block,
             parse_mode=ParseMode.HTML,
+            reply_markup=_reply_error_keyboard(chat_id, retry_enabled=repair_available),
         )
+        _set_reply_card_state(
+            app,
+            int(sent.message_id),
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            parsed_output=parsed_output,
+            result_text=result_text,
+            retry_context=retry_context,
+        )
+
+
+async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Invalid retry action")
+        return
+    try:
+        chat_id = int(parts[2])
+    except ValueError:
+        await query.answer("Invalid retry parameters")
+        return
+    service = app.bot_data.get("service")
+    core = getattr(service, "core", None)
+    if core is None:
+        await query.answer("Service unavailable")
+        return
+    state = _get_reply_card_state(app, int(message.message_id))
+    if not isinstance(state, dict):
+        await query.answer("Card state missing")
+        return
+    if int(state.get("chat_id", -1)) != int(chat_id):
+        await query.answer("Card chat mismatch")
+        return
+    retry_context = state.get("retry_context")
+    if not isinstance(retry_context, dict):
+        await query.answer("Retry unavailable")
+        return
+    failed_generation = str(retry_context.get("failed_generation_excerpt") or state.get("result_text") or "")
+    reject_reason = str(retry_context.get("reject_reason") or "contract_validation_failed")
+    await query.answer("Retry started")
+
+    provider = "huggingface_openai_compat"
+    model = str((getattr(core.config, "hf_model", None) or "").strip())
+    parsed_output: dict[str, Any] | None = None
+    result_text = ""
+    status = "ok"
+    error_message: str | None = None
+    contract_issues: list[dict[str, Any]] = []
+    outcome_class = "ok"
+    conflict_payload: dict[str, Any] | None = None
+    pivot_payload: dict[str, Any] | None = None
+    repair_available = False
+    next_retry_context: dict[str, Any] | None = None
+    try:
+        dry_run_result = core.run_hf_dry_run_repair(
+            chat_id=chat_id,
+            failed_generation=failed_generation,
+            reject_reason=reject_reason,
+        )
+        provider = str(dry_run_result.get("provider") or provider)
+        model = str(dry_run_result.get("model") or model)
+        parsed_output = dry_run_result.get("parsed_output") if isinstance(dry_run_result.get("parsed_output"), dict) else None
+        result_text = str(dry_run_result.get("result_text") or "")
+        raw_issues = dry_run_result.get("contract_issues")
+        if isinstance(raw_issues, list):
+            contract_issues = [item for item in raw_issues if isinstance(item, dict)]
+        valid_output = bool(dry_run_result.get("valid_output"))
+        error_message = str(dry_run_result.get("error_message") or "").strip() or None
+        outcome_class = str(dry_run_result.get("outcome_class") or "ok")
+        raw_conflict = dry_run_result.get("conflict")
+        if isinstance(raw_conflict, dict):
+            conflict_payload = raw_conflict
+        raw_pivot = dry_run_result.get("pivot")
+        if isinstance(raw_pivot, dict):
+            pivot_payload = raw_pivot
+        repair_available = bool(dry_run_result.get("repair_available"))
+        raw_retry_context = dry_run_result.get("repair_context")
+        if isinstance(raw_retry_context, dict):
+            next_retry_context = raw_retry_context
+        if outcome_class == "semantic_conflict":
+            status = "semantic_conflict"
+            if not error_message:
+                error_message = "semantic conflict detected (operator decision required)"
+        elif (not valid_output) or error_message:
+            status = "error"
+        if status == "ok" and not result_text.strip():
+            status = "error"
+            error_message = "empty model result"
+    except Exception as exc:
+        status = "error"
+        error_message = str(exc)
+
+    if status == "ok" and isinstance(parsed_output, dict):
+        message_text = _extract_action_message_text(parsed_output)
+        if not message_text:
+            message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
+            message_text = str(message_obj.get("text") or "").strip()
+        text = _render_html_copy_block(message_text)
+        try:
+            await query.edit_message_text(
+                text,
+                reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=app.bot_data.get("telethon_executor") is not None),
+            )
+        except Exception:
+            await message.reply_text(
+                text,
+                reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=app.bot_data.get("telethon_executor") is not None),
+            )
+        _set_reply_card_state(
+            app,
+            int(message.message_id),
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            parsed_output=parsed_output,
+            result_text=result_text,
+            retry_context=None,
+        )
+        return
+
+    run_id = _next_reply_run_id(app)
+    if status == "semantic_conflict":
+        block = _render_html_semantic_conflict_card(
+            attempt_id=run_id,
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            conflict=conflict_payload,
+            pivot=pivot_payload,
+            result_text=result_text,
+        )
+    else:
+        block = _render_html_error_card(
+            attempt_id=run_id,
+            chat_id=chat_id,
+            provider=provider,
+            model=model or "unknown",
+            error_message=error_message,
+            result_text=result_text,
+            contract_issues=contract_issues,
+        )
+    retry_markup = _reply_error_keyboard(chat_id, retry_enabled=repair_available)
+    try:
+        await query.edit_message_text(block, parse_mode=ParseMode.HTML, reply_markup=retry_markup)
+    except Exception:
+        await message.reply_text(block, parse_mode=ParseMode.HTML, reply_markup=retry_markup)
+    _set_reply_card_state(
+        app,
+        int(message.message_id),
+        chat_id=chat_id,
+        provider=provider,
+        model=model or "unknown",
+        parsed_output=parsed_output,
+        result_text=result_text,
+        retry_context=next_retry_context,
+    )
+
+
+async def _handle_reply_send_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Invalid send action")
+        return
+    try:
+        chat_id = int(parts[2])
+    except ValueError:
+        await query.answer("Invalid chat id")
+        return
+    state = _get_reply_card_state(app, int(message.message_id))
+    if not isinstance(state, dict) or int(state.get("chat_id", -1)) != chat_id:
+        await query.answer("Card state missing")
+        return
+    parsed_output = state.get("parsed_output")
+    if not isinstance(parsed_output, dict):
+        await query.answer("No reply payload")
+        return
+    executor = app.bot_data.get("telethon_executor")
+    if executor is None:
+        await query.answer("Telethon sender unavailable")
+        return
+    actions = parsed_output.get("actions") if isinstance(parsed_output.get("actions"), list) else []
+    message_text = _extract_action_message_text(parsed_output)
+    if not actions and message_text:
+        actions = [{"type": "send_message", "message": {"text": message_text}}]
+    if not actions:
+        await query.answer("No sendable action")
+        return
+    await query.answer("Sending...")
+    report = await executor.execute_actions(
+        chat_id=chat_id,
+        parsed_output={"message": {"text": message_text}, "actions": actions},
+    )
+    if report.ok:
+        service = app.bot_data.get("service")
+        store = _resolve_store(service)
+        if message_text:
+            store.ingest_event(
+                chat_id=chat_id,
+                event_type="message",
+                role="scambaiter",
+                text=message_text,
+                source_message_id=None,
+                meta={"origin": "telethon_send", "control_message_id": int(message.message_id)},
+            )
+        lines = [
+            f"Sent via Telethon for /{chat_id}",
+            f"actions_executed: {len(report.executed_actions)}",
+        ]
+        if report.sent_message_id is not None:
+            lines.append(f"sent_message_id: {report.sent_message_id}")
+            _last_sent_by_chat(app)[chat_id] = {"message_id": int(report.sent_message_id), "attempt_id": 0}
+        if report.executed_actions:
+            lines.append("---")
+            lines.extend(report.executed_actions[:12])
+        try:
+            await query.edit_message_text(
+                "\n".join(lines),
+                reply_markup=_send_result_keyboard(chat_id=chat_id),
+            )
+        except Exception:
+            await message.reply_text("\n".join(lines), reply_markup=_send_result_keyboard(chat_id=chat_id))
+        _drop_reply_card_state(app, int(message.message_id))
+        return
+    errors = "\n".join(report.errors) if report.errors else "unknown error"
+    fail_text = (
+        "Telethon send failed.\n"
+        f"chat_id: /{chat_id}\n"
+        f"failed_action_index: {report.failed_action_index or '?'}\n"
+        "---\n"
+        f"{errors}"
+    )
+    try:
+        await query.edit_message_text(fail_text, reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=True))
+    except Exception:
+        await message.reply_text(fail_text, reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=True))
+
+
+async def _handle_reply_mark_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Invalid mark action")
+        return
+    try:
+        chat_id = int(parts[2])
+    except ValueError:
+        await query.answer("Invalid chat id")
+        return
+    state = _get_reply_card_state(app, int(message.message_id))
+    if not isinstance(state, dict) or int(state.get("chat_id", -1)) != chat_id:
+        await query.answer("Card state missing")
+        return
+    await query.answer("Marked as sent")
+    text = (
+        f"Marked as sent (manual path) for /{chat_id}\n"
+        "Forward your sent Telegram messages to ingest them into MessageStore."
+    )
+    try:
+        await query.edit_message_text(text, reply_markup=_reply_error_keyboard(chat_id, retry_enabled=False))
+    except Exception:
+        await message.reply_text(text, reply_markup=_reply_error_keyboard(chat_id, retry_enabled=False))
+
+
+async def _handle_reply_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    _drop_reply_card_state(app, int(message.message_id))
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await query.answer("Deleted")
 
 
 async def _handle_prompt_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1635,6 +2086,130 @@ async def _handle_prompt_delete_button(update: Update, context: ContextTypes.DEF
         except Exception:
             pass
     await query.answer("Deleted")
+
+
+async def _handle_forward_select_chat_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Invalid chat selection")
+        return
+    try:
+        target_chat_id = int(parts[2])
+    except ValueError:
+        await query.answer("Invalid chat id")
+        return
+    control_chat_id = int(message.chat_id)
+    _forward_card_targets(app)[control_chat_id] = target_chat_id
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    await _update_forward_card(
+        application=app,
+        message=message,
+        store=store,
+        control_chat_id=control_chat_id,
+    )
+    await query.answer(f"Target /{target_chat_id} selected")
+
+
+async def _handle_forward_discard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    control_chat_id = int(message.chat_id)
+    _clear_forward_session(app, control_chat_id)
+    card_map = _forward_card_messages(app)
+    card_map.pop(control_chat_id, None)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await query.answer("Forward batch discarded")
+
+
+async def _handle_forward_insert_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Invalid insert action")
+        return
+    try:
+        int(parts[2])
+    except ValueError:
+        await query.answer("Invalid control chat")
+        return
+    control_chat_id = int(message.chat_id)
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    pending = _pending_forwards(app).get(control_chat_id, [])
+    target_chat_id = _forward_card_targets(app).get(control_chat_id)
+    if not isinstance(target_chat_id, int) or target_chat_id <= 0:
+        await query.answer("No target chat selected")
+        return
+    merge = _plan_forward_merge(store, target_chat_id, pending)
+    mode = str(merge.get("mode") or "")
+    insert_payloads = merge.get("insert_payloads")
+    if mode not in {"append", "backfill"} or not isinstance(insert_payloads, list) or not insert_payloads:
+        await _update_forward_card(
+            application=app,
+            message=message,
+            store=store,
+            control_chat_id=control_chat_id,
+        )
+        await query.answer("Insert blocked")
+        return
+    inserted = 0
+    skipped = 0
+    for payload in insert_payloads:
+        try:
+            _ingest_forward_payload(store=store, target_chat_id=target_chat_id, payload=payload)
+            inserted += 1
+        except Exception:
+            skipped += 1
+    _clear_forward_session(app, control_chat_id)
+    _forward_card_messages(app).pop(control_chat_id, None)
+    summary = (
+        f"Forward batch inserted for /{target_chat_id}\n"
+        f"mode: {mode}\n"
+        f"inserted: {inserted}\n"
+        f"skipped: {skipped}"
+    )
+    try:
+        await query.edit_message_text(summary)
+    except Exception:
+        await message.reply_text(summary)
+    await query.answer("Inserted")
 
 
 def _is_forward_message(message: Message) -> bool:
@@ -1659,21 +2234,19 @@ def _extract_text(message: Message) -> str | None:
     return None
 
 
-def _build_source_message_id(message: Message) -> str:
+def _extract_origin_message_id(message: Message) -> int | None:
     origin = getattr(message, "forward_origin", None)
     if origin is None:
-        return f"control:{message.chat_id}:{message.message_id}"
-    date_value = getattr(origin, "date", None)
-    date_part = ""
-    if isinstance(date_value, datetime):
-        date_part = date_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    sender_user = getattr(origin, "sender_user", None)
-    sender_chat = getattr(origin, "sender_chat", None)
-    chat_id = getattr(sender_chat, "id", "") if sender_chat is not None else ""
-    user_id = getattr(sender_user, "id", "") if sender_user is not None else ""
-    message_id = getattr(origin, "message_id", "")
-    kind = type(origin).__name__
-    return f"fwd:{kind}:{chat_id}:{user_id}:{message_id}:{date_part}"
+        return None
+    value = getattr(origin, "message_id", None)
+    return value if isinstance(value, int) else None
+
+
+def _build_source_message_id(forward_identity_key: str, strategy: str, event_type: str, text: str | None) -> str:
+    key_digest = hashlib.sha1(forward_identity_key.encode("utf-8")).hexdigest()[:16]
+    raw = text or ""
+    text_digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return f"fwd:v2:{strategy}:{key_digest}:{event_type}:{text_digest}"
 
 
 def _extract_forward_profile_info(message: Message) -> dict[str, Any]:
@@ -1697,6 +2270,9 @@ def _extract_forward_profile_info(message: Message) -> dict[str, Any]:
         if user_info:
             info["sender_user"] = user_info
     sender_chat = getattr(origin, "sender_chat", None)
+    if sender_chat is None:
+        # MessageOriginChannel exposes "chat" instead of "sender_chat".
+        sender_chat = getattr(origin, "chat", None)
     if sender_chat is not None:
         chat_info: dict[str, Any] = {}
         for field in ("id", "type", "title", "username"):
@@ -1712,15 +2288,58 @@ def _extract_forward_profile_info(message: Message) -> dict[str, Any]:
     return info
 
 
+def _extract_forward_identity(
+    *,
+    origin: Any,
+    forward_profile: dict[str, Any],
+    event_type: str,
+    text: str | None,
+    message: Message,
+) -> dict[str, Any]:
+    origin_kind = str(forward_profile.get("origin_kind") or type(origin).__name__)
+    origin_message_id = getattr(origin, "message_id", None)
+    if isinstance(origin_message_id, int):
+        sender_chat = getattr(origin, "chat", None)
+        if sender_chat is None:
+            sender_chat = getattr(origin, "sender_chat", None)
+        sender_chat_id = getattr(sender_chat, "id", None) if sender_chat is not None else None
+        if isinstance(sender_chat_id, int):
+            key = f"channel:{sender_chat_id}:{origin_message_id}"
+            return {"strategy": "channel_message_id", "key": key, "origin_kind": origin_kind}
+    origin_date_utc = str(forward_profile.get("origin_date_utc") or "")
+    sender_user = forward_profile.get("sender_user")
+    sender_chat = forward_profile.get("sender_chat")
+    sender_user_name = str(forward_profile.get("sender_user_name") or "")
+    sender_user_id = sender_user.get("id") if isinstance(sender_user, dict) else None
+    sender_chat_id = sender_chat.get("id") if isinstance(sender_chat, dict) else None
+    media = getattr(message, "photo", None)
+    media_marker = ""
+    if isinstance(media, list) and media:
+        last = media[-1]
+        marker = getattr(last, "file_unique_id", None)
+        if isinstance(marker, str):
+            media_marker = marker
+    key_payload = {
+        "origin_kind": origin_kind,
+        "origin_date_utc": origin_date_utc,
+        "sender_user_id": sender_user_id if isinstance(sender_user_id, int) else None,
+        "sender_chat_id": sender_chat_id if isinstance(sender_chat_id, int) else None,
+        "sender_user_name": sender_user_name or None,
+        "event_type": event_type,
+        "text": text if isinstance(text, str) else None,
+        "media_marker": media_marker or None,
+    }
+    key_json = json.dumps(key_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    key = "sig:" + hashlib.sha1(key_json.encode("utf-8")).hexdigest()
+    return {"strategy": "origin_signature", "key": key, "origin_kind": origin_kind}
+
+
 def _event_ts_utc_for_store(message: Message) -> str | None:
     origin = getattr(message, "forward_origin", None)
     origin_date = getattr(origin, "date", None) if origin is not None else None
-    origin_message_id = getattr(origin, "message_id", None) if origin is not None else None
     if not isinstance(origin_date, datetime):
         return None
-    # Some forwards only expose forward-time or coarse time; treat those as unknown.
-    if origin_message_id in (None, ""):
-        return None
+    # Some forwards expose forward-time only; if equal, treat it as unknown.
     if origin_date == message.date:
         return None
     return origin_date.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1731,6 +2350,8 @@ def _infer_target_chat_id_from_forward(message: Message) -> int | None:
     if origin is None:
         return None
     sender_chat = getattr(origin, "sender_chat", None)
+    if sender_chat is None:
+        sender_chat = getattr(origin, "chat", None)
     if sender_chat is not None:
         sender_chat_id = getattr(sender_chat, "id", None)
         if isinstance(sender_chat_id, int):
@@ -1748,6 +2369,8 @@ def _infer_role_from_forward(message: Message, target_chat_id: int) -> str:
     if origin is None:
         return "manual"
     sender_chat = getattr(origin, "sender_chat", None)
+    if sender_chat is None:
+        sender_chat = getattr(origin, "chat", None)
     if sender_chat is not None:
         sender_chat_id = getattr(sender_chat, "id", None)
         if isinstance(sender_chat_id, int) and sender_chat_id == target_chat_id:
@@ -1772,6 +2395,8 @@ def _infer_role_without_target(message: Message, control_user_id: int | None) ->
         if isinstance(sender_user_id, int):
             return "scammer"
     sender_chat = getattr(origin, "sender_chat", None)
+    if sender_chat is None:
+        sender_chat = getattr(origin, "chat", None)
     if sender_chat is not None:
         sender_chat_id = getattr(sender_chat, "id", None)
         if isinstance(sender_chat_id, int):
@@ -1812,11 +2437,36 @@ def _control_sender_info(message: Message) -> dict[str, Any] | None:
 
 def _build_forward_payload(message: Message, role: str) -> dict[str, Any]:
     event_type = _infer_event_type(message)
-    source_message_id = _build_source_message_id(message)
+    text = _extract_text(message)
+    origin = getattr(message, "forward_origin", None)
+    origin_message_id = _extract_origin_message_id(message)
+    forward_profile = _extract_forward_profile_info(message)
+    if origin is not None:
+        forward_identity = _extract_forward_identity(
+            origin=origin,
+            forward_profile=forward_profile,
+            event_type=event_type,
+            text=text,
+            message=message,
+        )
+    else:
+        forward_identity = {
+            "strategy": "origin_signature",
+            "key": f"sig:missing:{message.chat_id}:{message.message_id}",
+            "origin_kind": "Unknown",
+        }
+    source_message_id = _build_source_message_id(
+        str(forward_identity.get("key") or ""),
+        str(forward_identity.get("strategy") or "origin_signature"),
+        event_type,
+        text,
+    )
     meta: dict[str, Any] = {
         "control_chat_id": int(message.chat_id),
         "control_message_id": int(message.message_id),
-        "forward_profile": _extract_forward_profile_info(message),
+        "forward_profile": forward_profile,
+        "forward_identity": forward_identity,
+        "origin_message_id": origin_message_id,
     }
     control_sender = _control_sender_info(message)
     if control_sender:
@@ -1824,8 +2474,9 @@ def _build_forward_payload(message: Message, role: str) -> dict[str, Any]:
     return {
         "event_type": event_type,
         "source_message_id": source_message_id,
+        "origin_message_id": origin_message_id,
         "role": role,
-        "text": _extract_text(message),
+        "text": text,
         "ts_utc": _event_ts_utc_for_store(message),
         "meta": meta,
     }
@@ -1884,11 +2535,18 @@ def _profile_patch_from_forward_profile(forward_profile: dict[str, Any]) -> dict
 
 
 def _ingest_forward_payload(store: Any, target_chat_id: int, payload: dict[str, Any]) -> Any:
+    source_message_id = str(payload.get("source_message_id") or "")
+    if not source_message_id:
+        raise ValueError("missing source_message_id for forward ingestion")
+    meta_obj = payload.get("meta")
+    forward_identity = meta_obj.get("forward_identity") if isinstance(meta_obj, dict) else None
+    if not isinstance(forward_identity, dict) or not isinstance(forward_identity.get("key"), str):
+        raise ValueError("missing forward_identity for forward ingestion")
     record = store.ingest_user_forward(
         chat_id=target_chat_id,
         event_type=str(payload["event_type"]),
         text=payload.get("text"),
-        source_message_id=str(payload["source_message_id"]),
+        source_message_id=source_message_id,
         role=str(payload["role"]),
         ts_utc=payload.get("ts_utc"),
         meta=payload.get("meta") if isinstance(payload.get("meta"), dict) else None,
@@ -1907,6 +2565,232 @@ def _ingest_forward_payload(store: Any, target_chat_id: int, payload: dict[str, 
                     changed_at=changed_at if isinstance(changed_at, str) else None,
                 )
     return record
+
+
+def _forward_item_signature(payload: dict[str, Any]) -> tuple[str, str]:
+    event_type = str(payload.get("event_type") or "")
+    text = payload.get("text")
+    return event_type, str(text) if isinstance(text, str) else ""
+
+
+def _extract_forward_identity_key_from_event(event: Any) -> str | None:
+    meta = getattr(event, "meta", None)
+    if isinstance(meta, dict):
+        forward_identity = meta.get("forward_identity")
+        if isinstance(forward_identity, dict):
+            key = forward_identity.get("key")
+            if isinstance(key, str) and key:
+                return key
+        origin_id = meta.get("origin_message_id")
+        if isinstance(origin_id, int):
+            return f"legacy_origin:{origin_id}"
+    source_message_id = getattr(event, "source_message_id", None)
+    if isinstance(source_message_id, str) and source_message_id:
+        return f"legacy_source:{source_message_id}"
+    return None
+
+
+def _extract_forward_identity_key_from_payload(payload: dict[str, Any]) -> str | None:
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        forward_identity = meta.get("forward_identity")
+        if isinstance(forward_identity, dict):
+            key = forward_identity.get("key")
+            if isinstance(key, str) and key:
+                return key
+    origin_id = payload.get("origin_message_id")
+    if isinstance(origin_id, int):
+        return f"legacy_origin:{origin_id}"
+    source_message_id = payload.get("source_message_id")
+    if isinstance(source_message_id, str) and source_message_id:
+        return f"legacy_source:{source_message_id}"
+    return None
+
+
+def _build_existing_identity_index(events: list[Any]) -> dict[str, list[Any]]:
+    out: dict[str, list[Any]] = {}
+    for event in events:
+        key = _extract_forward_identity_key_from_event(event)
+        if key is None:
+            continue
+        out.setdefault(key, []).append(event)
+    return out
+
+
+def _plan_forward_merge(store: Any, target_chat_id: int, payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    if target_chat_id <= 0:
+        return {"mode": "unresolved", "insert_payloads": [], "reason": "target chat unresolved"}
+    if not payloads:
+        return {"mode": "blocked", "insert_payloads": [], "reason": "batch empty"}
+    missing_identity = [p for p in payloads if not isinstance(_extract_forward_identity_key_from_payload(p), str)]
+    if missing_identity:
+        return {
+            "mode": "blocked",
+            "insert_payloads": [],
+            "reason": f"{len(missing_identity)} item(s) missing forward_identity",
+        }
+
+    events = store.list_events(chat_id=target_chat_id, limit=5000)
+    existing_by_identity = _build_existing_identity_index(events)
+    existing_scammer_keys: list[str] = []
+    seen_scammer_keys: set[str] = set()
+    for event in events:
+        if str(getattr(event, "role", "")) != "scammer":
+            continue
+        key = _extract_forward_identity_key_from_event(event)
+        if not isinstance(key, str):
+            continue
+        if key in seen_scammer_keys:
+            continue
+        seen_scammer_keys.add(key)
+        existing_scammer_keys.append(key)
+
+    insert_payloads: list[dict[str, Any]] = []
+    batch_scammer_keys: list[str] = []
+    batch_new_scammer_keys: list[str] = []
+    for payload in payloads:
+        identity_key = _extract_forward_identity_key_from_payload(payload)
+        if not isinstance(identity_key, str):
+            continue
+        existing_rows = existing_by_identity.get(identity_key, [])
+        role = str(payload.get("role") or "")
+        if role == "scammer":
+            batch_scammer_keys.append(identity_key)
+            if not existing_rows:
+                batch_new_scammer_keys.append(identity_key)
+        sig = _forward_item_signature(payload)
+        has_same = False
+        has_changed = False
+        for row in existing_rows:
+            row_sig = (str(getattr(row, "event_type", "") or ""), str(getattr(row, "text", "") or ""))
+            if row_sig == sig:
+                has_same = True
+                break
+            has_changed = True
+        if has_same:
+            continue
+        candidate = dict(payload)
+        meta = candidate.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        if has_changed:
+            meta["revision_of_forward_identity_key"] = identity_key
+            meta["revision_reason"] = "content_changed"
+        candidate["meta"] = meta
+        insert_payloads.append(candidate)
+
+    if not insert_payloads:
+        return {"mode": "blocked", "insert_payloads": [], "reason": "batch already present"}
+
+    if batch_new_scammer_keys:
+        if not existing_scammer_keys:
+            return {"mode": "append", "insert_payloads": insert_payloads, "reason": f"append {len(insert_payloads)} item(s)"}
+        existing_pos = {key: idx for idx, key in enumerate(existing_scammer_keys)}
+        first_new_idx = next((idx for idx, key in enumerate(batch_scammer_keys) if key not in existing_pos), len(batch_scammer_keys))
+        has_known_after_new = any(key in existing_pos for key in batch_scammer_keys[first_new_idx:])
+        prefix_known = batch_scammer_keys[:first_new_idx]
+        is_suffix_match = bool(prefix_known) and prefix_known == existing_scammer_keys[-len(prefix_known) :]
+        if (not has_known_after_new) and is_suffix_match:
+            return {"mode": "append", "insert_payloads": insert_payloads, "reason": f"append {len(insert_payloads)} item(s)"}
+        return {"mode": "backfill", "insert_payloads": insert_payloads, "reason": f"backfill {len(insert_payloads)} item(s)"}
+
+    return {"mode": "backfill", "insert_payloads": insert_payloads, "reason": f"backfill {len(insert_payloads)} item(s)"}
+
+
+def _forward_card_keyboard(
+    *,
+    control_chat_id: int,
+    target_chat_id: int | None,
+    mode: str,
+    known_chat_ids: list[int],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if isinstance(target_chat_id, int) and target_chat_id > 0:
+        if mode == "append":
+            rows.append([InlineKeyboardButton(f"Append to /{target_chat_id}", callback_data=f"sc:fwd_insert:{control_chat_id}")])
+        elif mode == "backfill":
+            rows.append([InlineKeyboardButton(f"Backfill to /{target_chat_id}", callback_data=f"sc:fwd_insert:{control_chat_id}")])
+        else:
+            rows.append([InlineKeyboardButton("Insert blocked", callback_data="sc:nop")])
+    else:
+        for chat_id in known_chat_ids[:8]:
+            rows.append([InlineKeyboardButton(f"/{chat_id}", callback_data=f"sc:fwd_selchat:{chat_id}")])
+    rows.append([InlineKeyboardButton("Discard", callback_data=f"sc:fwd_discard:{control_chat_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _render_forward_card_text(
+    *,
+    control_chat_id: int,
+    target_chat_id: int | None,
+    payloads: list[dict[str, Any]],
+    merge: dict[str, Any],
+) -> str:
+    total = len(payloads)
+    scammer = sum(1 for p in payloads if str(p.get("role") or "") == "scammer")
+    manual = sum(1 for p in payloads if str(p.get("role") or "") != "scammer")
+    missing_identity = sum(1 for p in payloads if not isinstance(_extract_forward_identity_key_from_payload(p), str))
+    mode = str(merge.get("mode") or "unresolved")
+    reason = str(merge.get("reason") or "-")
+    target_text = f"/{target_chat_id}" if isinstance(target_chat_id, int) and target_chat_id > 0 else "(unresolved)"
+    return (
+        "Forward/Insert Card\n"
+        f"control_chat: {control_chat_id}\n"
+        f"target_chat: {target_text}\n"
+        f"batch_items: {total}\n"
+        f"scammer_items: {scammer}\n"
+        f"manual_items: {manual}\n"
+        f"missing_forward_identity: {missing_identity}\n"
+        f"merge_mode: {mode}\n"
+        f"merge_reason: {reason}"
+    )
+
+
+async def _update_forward_card(
+    *,
+    application: Application,
+    message: Message,
+    store: Any,
+    control_chat_id: int,
+) -> None:
+    pending = _pending_forwards(application)
+    payloads = pending.get(control_chat_id, [])
+    target_map = _forward_card_targets(application)
+    target_chat_id = target_map.get(control_chat_id)
+    merge = _plan_forward_merge(store, target_chat_id if isinstance(target_chat_id, int) else -1, payloads)
+    known_chat_ids = store.list_chat_ids(limit=30)
+    text = _render_forward_card_text(
+        control_chat_id=control_chat_id,
+        target_chat_id=target_chat_id,
+        payloads=payloads,
+        merge=merge,
+    )
+    keyboard = _forward_card_keyboard(
+        control_chat_id=control_chat_id,
+        target_chat_id=target_chat_id,
+        mode=str(merge.get("mode") or "unresolved"),
+        known_chat_ids=known_chat_ids,
+    )
+    message_ids = _forward_card_messages(application)
+    current_id = message_ids.get(control_chat_id)
+    if isinstance(current_id, int):
+        try:
+            await application.bot.edit_message_text(
+                chat_id=control_chat_id,
+                message_id=current_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            pass
+    sent = await message.reply_text(text, reply_markup=keyboard)
+    message_ids[control_chat_id] = int(sent.message_id)
+
+
+def _clear_forward_session(application: Application, control_chat_id: int) -> None:
+    _pending_forwards(application)[control_chat_id] = []
+    _forward_card_targets(application).pop(control_chat_id, None)
 
 
 def _flush_pending_forwards(
@@ -2065,20 +2949,8 @@ async def _set_active_chat_from_id(update: Update, context: ContextTypes.DEFAULT
     state[int(message.chat_id)] = target_chat_id
     _auto_targets(app)[int(message.chat_id)] = target_chat_id
     store = _resolve_store(app.bot_data["service"])
-    ingested = _flush_pending_forwards(
-        application=app,
-        store=store,
-        control_chat_id=int(message.chat_id),
-        target_chat_id=target_chat_id,
-    )
-    if ingested:
-        await _send_control_text(
-            application=app,
-            message=message,
-            text=f"Active target chat set to {target_chat_id}. Imported {ingested} buffered forwards.",
-        )
-    else:
-        await _send_control_text(application=app, message=message, text=f"Active target chat set to {target_chat_id}.")
+    _forward_card_targets(app)[int(message.chat_id)] = target_chat_id
+    await _send_control_text(application=app, message=message, text=f"Active target chat set to {target_chat_id}.")
 
     if not store.list_events(chat_id=target_chat_id, limit=1):
         await _send_control_text(
@@ -2221,57 +3093,32 @@ async def _handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     state = _active_targets(app)
     auto_targets = _auto_targets(app)
     target_chat_id = state.get(control_chat_id)
-    role: str
+    role: str = "manual"
+    inferred_target: int | None = target_chat_id
     if target_chat_id is not None:
         role = _infer_role_from_forward(message, target_chat_id=target_chat_id)
     else:
         auto_target_chat_id = auto_targets.get(control_chat_id)
-        target_chat_id, role = _resolve_target_and_role_without_active(
+        inferred_target, role = _resolve_target_and_role_without_active(
             message=message,
             control_user_id=control_user_id,
             auto_target_chat_id=auto_target_chat_id,
         )
-        if target_chat_id is None:
-            pending = _pending_forwards(app)
-            queue = pending.setdefault(control_chat_id, [])
-            queue.append(_build_forward_payload(message, role="manual"))
-            await _send_control_text(
-                application=app,
-                message=message,
-                text=f"Buffered {len(queue)} manual forward(s). Forward a scammer message from same chat or set /chat <chat_id>.",
-            )
-            await _delete_control_message(message)
-            return
-        if role == "scammer":
-            auto_targets[control_chat_id] = target_chat_id
-    state[control_chat_id] = target_chat_id
+        if role == "scammer" and isinstance(inferred_target, int):
+            auto_targets[control_chat_id] = inferred_target
+    if isinstance(inferred_target, int):
+        state[control_chat_id] = inferred_target
+        _forward_card_targets(app)[control_chat_id] = inferred_target
     store = _resolve_store(app.bot_data["service"])
-    imported = _flush_pending_forwards(
-        application=app,
-        store=store,
-        control_chat_id=control_chat_id,
-        target_chat_id=target_chat_id,
-    )
     payload = _build_forward_payload(message, role=role)
-    record = _ingest_forward_payload(store=store, target_chat_id=target_chat_id, payload=payload)
-    if imported:
-        await _send_control_text(
-            application=app,
-            message=message,
-            text=f"Imported {imported} buffered forward(s). Ingested #{record.id} as {record.event_type}/{record.role} for chat {target_chat_id}.",
-        )
-    else:
-        await _send_control_text(
-            application=app,
-            message=message,
-            text=f"Ingested #{record.id} as {record.event_type}/{record.role} for chat {target_chat_id}.",
-        )
-    _schedule_user_card_update(
+    pending = _pending_forwards(app)
+    queue = pending.setdefault(control_chat_id, [])
+    queue.append(payload)
+    await _update_forward_card(
         application=app,
-        control_chat_id=control_chat_id,
+        message=message,
         store=store,
-        target_chat_id=target_chat_id,
-        delay_seconds=1.0,
+        control_chat_id=control_chat_id,
     )
     await _delete_control_message(message)
 
@@ -2318,11 +3165,15 @@ def create_bot_app(
     )
     app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:messages|memory|system):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_close_button, pattern=r"^sc:prompt_close:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_send_button, pattern=r"^sc:send:[0-9]+:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_send_confirm_button, pattern=r"^sc:send_confirm:[0-9]+:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_send_cancel_button, pattern=r"^sc:send_cancel:[0-9]+:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_reply_send_button, pattern=r"^sc:reply_send:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_reply_mark_button, pattern=r"^sc:reply_mark:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_undo_send_button, pattern=r"^sc:undo_send:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dry_run_retry_button, pattern=r"^sc:reply_retry:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_insert_button, pattern=r"^sc:fwd_insert:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_discard_button, pattern=r"^sc:fwd_discard:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_select_chat_button, pattern=r"^sc:fwd_selchat:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_reply_delete_button, pattern=r"^sc:reply_delete:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
     app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:nop$"))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
