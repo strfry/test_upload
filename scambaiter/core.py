@@ -26,8 +26,10 @@ Rules:
 - schema must be exactly \"scambait.llm.v1\".
 - analysis must be an object.
 - message must be an object (reserved for metadata/compat).
+- conflict is optional; if present it must describe a semantic_conflict object.
 - actions must be a non-empty array (max 10 actions).
 - send_message action must include message.text (string, <= 4000 chars).
+- If there is a semantic conflict, do not break schema; set conflict and keep actions valid.
 - No markdown, no prose outside JSON, no function-call wrappers.
 Allowed action types:
 - mark_read
@@ -77,6 +79,39 @@ DISALLOWED_STYLE_PHRASES = (
     "independent legal advice",
     "risk-free high yields is a red flag",
 )
+ALLOWED_CONFLICT_CODES = {
+    "policy_tension",
+    "insufficient_context",
+    "conversation_stall",
+    "operator_required",
+    "uncertain_target",
+}
+ALLOWED_CONFLICT_MODES = {"pivot", "escalate", "hold"}
+SEMANTIC_CONFLICT_REASON_HINTS = (
+    "cannot",
+    "can't",
+    "unable",
+    "insufficient",
+    "unclear",
+    "uncertain",
+    "policy",
+    "not enough context",
+)
+META_TURN_PROMPT_CONTRACT = """You are ScamBaiter Meta Core.
+Return exactly one valid JSON object with this schema:
+{
+  "schema": "scambait.meta.turn.v1",
+  "turn_options": [
+    {"text": string, "strategy": string, "risk": "low|med|high"}
+  ],
+  "recommended_text": string
+}
+Rules:
+- JSON only, no markdown.
+- Focus on conversation redirection for scambaiting.
+- Do not include real commitments, credentials, or money transfer promises.
+- Provide 1-3 options.
+"""
 
 
 @dataclass(slots=True)
@@ -102,6 +137,7 @@ class ModelOutput:
     analysis: dict[str, Any]
     metadata: dict[str, Any]
     actions: list[dict[str, Any]]
+    conflict: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -147,7 +183,19 @@ def normalize_action_shape(action: object) -> dict[str, Any] | None:
     if not isinstance(action, dict):
         return None
     if "type" in action:
-        return dict(action)
+        normalized = dict(action)
+        action_type = str(normalized.get("type") or "").strip()
+        # Some models emit dotted key aliases like "message.text" for send_message.
+        # Normalize to the contract shape: {"message": {"text": ...}}.
+        if action_type == "send_message" and "message.text" in normalized:
+            dotted_text = normalized.pop("message.text")
+            message_obj = normalized.get("message")
+            if not isinstance(message_obj, dict):
+                message_obj = {}
+            if "text" not in message_obj:
+                message_obj["text"] = dotted_text
+            normalized["message"] = message_obj
+        return normalized
 
     # Accept alias used by some models: {"action":"send_message", ...}
     if "action" in action and isinstance(action.get("action"), str):
@@ -426,6 +474,66 @@ def _build_repair_messages(
     ]
 
 
+def _validate_conflict(conflict_value: object) -> tuple[dict[str, Any] | None, list[ValidationIssue]]:
+    issues: list[ValidationIssue] = []
+
+    def _fail(path: str, reason: str, expected: str | None = None, actual: str | None = None) -> None:
+        issues.append(ValidationIssue(path=path, reason=reason, expected=expected, actual=actual))
+
+    if conflict_value is None:
+        return None, issues
+    if not isinstance(conflict_value, dict):
+        _fail("conflict", "conflict must be object", expected="object", actual=type(conflict_value).__name__)
+        return None, issues
+    conflict_type = str(conflict_value.get("type") or "").strip()
+    if conflict_type != "semantic_conflict":
+        _fail("conflict.type", "invalid conflict type", expected="semantic_conflict", actual=conflict_type or "missing")
+        return None, issues
+    code_value = str(conflict_value.get("code") or "").strip().lower() or "operator_required"
+    if code_value not in ALLOWED_CONFLICT_CODES:
+        _fail(
+            "conflict.code",
+            "invalid conflict code",
+            expected="|".join(sorted(ALLOWED_CONFLICT_CODES)),
+            actual=code_value,
+        )
+        return None, issues
+    reason_value = str(conflict_value.get("reason") or "").strip()
+    if not reason_value:
+        _fail("conflict.reason", "conflict reason must be non-empty string", expected="string")
+        return None, issues
+    if len(reason_value) > 2000:
+        _fail("conflict.reason", "reason too long", expected="<=2000 chars", actual=str(len(reason_value)))
+        return None, issues
+    requires_human = conflict_value.get("requires_human")
+    if requires_human is None:
+        requires_human = True
+    if not isinstance(requires_human, bool):
+        _fail(
+            "conflict.requires_human",
+            "requires_human must be boolean",
+            expected="bool",
+            actual=type(requires_human).__name__,
+        )
+        return None, issues
+    suggested_mode = str(conflict_value.get("suggested_mode") or "hold").strip().lower()
+    if suggested_mode not in ALLOWED_CONFLICT_MODES:
+        _fail(
+            "conflict.suggested_mode",
+            "invalid suggested_mode",
+            expected="pivot|escalate|hold",
+            actual=suggested_mode,
+        )
+        return None, issues
+    return {
+        "type": "semantic_conflict",
+        "code": code_value,
+        "reason": reason_value,
+        "requires_human": requires_human,
+        "suggested_mode": suggested_mode,
+    }, issues
+
+
 def parse_structured_model_output_detailed(text: str) -> ParseResult:
     issues: list[ValidationIssue] = []
 
@@ -459,6 +567,10 @@ def parse_structured_model_output_detailed(text: str) -> ParseResult:
     if not isinstance(message_value, dict):
         return _fail("message", "message must be object", expected="object", actual=type(message_value).__name__)
 
+    normalized_conflict, conflict_issues = _validate_conflict(data.get("conflict"))
+    if conflict_issues:
+        return ParseResult(output=None, issues=conflict_issues)
+
     normalized_actions, action_issues = _validate_actions(data.get("actions"))
     if normalized_actions is None:
         return ParseResult(output=None, issues=action_issues)
@@ -473,7 +585,7 @@ def parse_structured_model_output_detailed(text: str) -> ParseResult:
                     suggestion = candidate.strip()
                     break
 
-    if not suggestion:
+    if not suggestion and normalized_conflict is None:
         text_value = message_value.get("text")
         if isinstance(text_value, str) and text_value.strip():
             suggestion = text_value.strip()
@@ -490,6 +602,7 @@ def parse_structured_model_output_detailed(text: str) -> ParseResult:
         analysis=analysis_value,
         metadata={"schema": "scambait.llm.v1"},
         actions=normalized_actions,
+        conflict=normalized_conflict,
     ), issues=[])
 
 
@@ -765,6 +878,152 @@ class ScambaiterCore:
             messages.append({"role": "user", "content": json.dumps(payload, ensure_ascii=True)})
         return messages
 
+    @staticmethod
+    def _extract_analysis_reason_from_result_text(result_text: str) -> str:
+        cleaned = strip_think_segments(result_text or "")
+        if not cleaned:
+            return ""
+        try:
+            loaded = json.loads(cleaned)
+        except Exception:
+            return ""
+        if not isinstance(loaded, dict):
+            return ""
+        analysis = loaded.get("analysis")
+        if not isinstance(analysis, dict):
+            return ""
+        reason = analysis.get("reason")
+        if not isinstance(reason, str):
+            return ""
+        return reason.strip()
+
+    @staticmethod
+    def _classify_conflict_code(reason: str) -> str:
+        text = (reason or "").strip().lower()
+        if not text:
+            return "operator_required"
+        if "insufficient" in text or "not enough context" in text or "unclear" in text or "uncertain" in text:
+            return "insufficient_context"
+        if "policy" in text or "cannot" in text or "can't" in text or "unable" in text:
+            return "policy_tension"
+        if "stall" in text:
+            return "conversation_stall"
+        if "target" in text:
+            return "uncertain_target"
+        return "operator_required"
+
+    def _detect_semantic_conflict(self, parsed: ModelOutput | None, result_text: str) -> tuple[bool, dict[str, Any] | None]:
+        if parsed is not None and isinstance(parsed.conflict, dict):
+            return True, parsed.conflict
+        analysis_reason = ""
+        if parsed is not None and isinstance(parsed.analysis, dict):
+            candidate = parsed.analysis.get("reason")
+            if isinstance(candidate, str):
+                analysis_reason = candidate.strip()
+        if not analysis_reason:
+            analysis_reason = self._extract_analysis_reason_from_result_text(result_text)
+        reason_lower = analysis_reason.lower()
+        has_reason_hint = bool(reason_lower) and any(hint in reason_lower for hint in SEMANTIC_CONFLICT_REASON_HINTS)
+        has_escalate = False
+        if parsed is not None:
+            for action in parsed.actions:
+                if isinstance(action, dict) and str(action.get("type") or "") == "escalate_to_human":
+                    has_escalate = True
+                    break
+        if has_escalate or has_reason_hint:
+            reason = analysis_reason or "Semantic conflict signaled by model output."
+            return True, {
+                "type": "semantic_conflict",
+                "code": self._classify_conflict_code(reason),
+                "reason": reason,
+                "requires_human": True,
+                "suggested_mode": "hold",
+            }
+        return False, None
+
+    @staticmethod
+    def _parse_meta_turn_output(result_text: str) -> dict[str, Any] | None:
+        cleaned = strip_think_segments(result_text or "")
+        if not cleaned:
+            return None
+        try:
+            loaded = json.loads(cleaned)
+        except Exception:
+            return None
+        if not isinstance(loaded, dict):
+            return None
+        if str(loaded.get("schema") or "").strip() != "scambait.meta.turn.v1":
+            return None
+        recommended_text = loaded.get("recommended_text")
+        turn_options = loaded.get("turn_options")
+        if not isinstance(recommended_text, str) or not recommended_text.strip():
+            return None
+        if not isinstance(turn_options, list):
+            return None
+        normalized_options: list[dict[str, str]] = []
+        for item in turn_options[:3]:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            strategy = item.get("strategy")
+            risk = item.get("risk")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if not isinstance(strategy, str):
+                strategy = ""
+            risk_value = str(risk or "").strip().lower()
+            if risk_value not in {"low", "med", "high"}:
+                risk_value = "med"
+            normalized_options.append(
+                {
+                    "text": text.strip(),
+                    "strategy": strategy.strip(),
+                    "risk": risk_value,
+                }
+            )
+        if not normalized_options:
+            normalized_options.append({"text": recommended_text.strip(), "strategy": "", "risk": "med"})
+        return {
+            "schema": "scambait.meta.turn.v1",
+            "recommended_text": recommended_text.strip(),
+            "turn_options": normalized_options,
+        }
+
+    def _build_semantic_pivot(self, chat_id: int, conflict: dict[str, Any] | None) -> dict[str, Any] | None:
+        token = (getattr(self.config, "hf_token", None) or "").strip()
+        if not token:
+            return None
+        model = (getattr(self.config, "hf_memory_model", None) or "").strip() or (getattr(self.config, "hf_model", None) or "").strip()
+        if not model:
+            return None
+        max_tokens = int(getattr(self.config, "hf_memory_max_tokens", 150000))
+        prompt_events = self.build_prompt_events(chat_id=chat_id, token_limit=int(getattr(self.config, "hf_max_tokens", 1500)))
+        memory_state = self.store.get_memory_context(chat_id=chat_id)
+        payload = {
+            "schema": "scambait.meta.turn.input.v1",
+            "chat_id": chat_id,
+            "conflict": conflict or {},
+            "recent_messages": prompt_events[-20:],
+            "memory_summary": memory_state.summary if memory_state is not None else {},
+        }
+        messages = [
+            {"role": "system", "content": META_TURN_PROMPT_CONTRACT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+        ]
+        response = call_hf_openai_chat(
+            token=token,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            base_url=None,
+        )
+        result_text = extract_result_text(response)
+        parsed = self._parse_meta_turn_output(result_text)
+        if parsed is None:
+            raise RuntimeError("invalid meta turn contract (expected scambait.meta.turn.v1)")
+        parsed["model"] = model
+        return parsed
+
     def run_hf_dry_run(self, chat_id: int) -> dict[str, Any]:
         token = (getattr(self.config, "hf_token", None) or "").strip()
         model = (getattr(self.config, "hf_model", None) or "").strip()
@@ -808,6 +1067,12 @@ class ScambaiterCore:
                 "valid_output": False,
                 "parsed_output": None,
                 "error_message": str(exc),
+                "outcome_class": "provider_error",
+                "semantic_conflict": False,
+                "conflict": None,
+                "pivot": None,
+                "repair_available": False,
+                "repair_context": None,
                 "attempts": attempts,
             }
 
@@ -837,76 +1102,6 @@ class ScambaiterCore:
         final_response = initial_response
         final_text = initial_text
 
-        if parsed is None:
-            repair_messages = _build_repair_messages(
-                initial_text,
-                reject_reason=initial_reject_reason or "contract_validation_failed",
-            )
-            repair_prompt = {"messages": repair_messages, "max_tokens": max_tokens}
-            try:
-                repair_response = call_hf_openai_chat(
-                    token=token,
-                    model=model,
-                    messages=repair_messages,
-                    max_tokens=max_tokens,
-                    base_url=None,
-                )
-                repair_text = extract_result_text(repair_response)
-                repaired_result = parse_structured_model_output_detailed(repair_text)
-                repaired = repaired_result.output
-                repair_reject_reason: str | None = None
-                if repaired is None:
-                    repair_reject_reason = "contract_validation_failed"
-                elif violates_scambait_style_policy(repaired.suggestion):
-                    repair_reject_reason = "style_policy_violation"
-                    repaired = None
-                attempts.append(
-                    {
-                        "phase": "repair",
-                        "status": "ok" if repaired is not None else "invalid",
-                        "accepted": repaired is not None,
-                        "reject_reason": repair_reject_reason,
-                        "error_message": None,
-                        "contract_issues": [item.as_dict() for item in repaired_result.issues] if repaired is None else [],
-                        "prompt_json": repair_prompt,
-                        "response_json": repair_response,
-                        "result_text": repair_text,
-                    }
-                )
-                if repaired is not None:
-                    parsed = repaired
-                    final_prompt = repair_prompt
-                    final_response = repair_response
-                    final_text = repair_text
-                else:
-                    final_prompt = repair_prompt
-                    final_response = repair_response
-                    final_text = repair_text
-            except Exception as exc:
-                attempts.append(
-                    {
-                        "phase": "repair",
-                        "status": "error",
-                        "accepted": False,
-                        "reject_reason": "provider_error",
-                        "error_message": str(exc),
-                        "prompt_json": repair_prompt,
-                        "response_json": {},
-                        "result_text": "",
-                    }
-                )
-                return {
-                    "provider": "huggingface_openai_compat",
-                    "model": model,
-                    "prompt_json": repair_prompt,
-                    "response_json": {},
-                    "result_text": "",
-                    "valid_output": False,
-                    "parsed_output": None,
-                    "error_message": str(exc),
-                    "attempts": attempts,
-                }
-
         contract_issues: list[dict[str, Any]] = []
         if parsed is None:
             for attempt in reversed(attempts):
@@ -922,6 +1117,28 @@ class ScambaiterCore:
             if issue_path or issue_reason:
                 first_issue_str = f" ({issue_path}: {issue_reason})"
 
+        semantic_conflict, conflict_payload = self._detect_semantic_conflict(parsed=parsed, result_text=final_text)
+        pivot_payload: dict[str, Any] | None = None
+        if semantic_conflict:
+            try:
+                pivot_payload = self._build_semantic_pivot(chat_id=chat_id, conflict=conflict_payload)
+            except Exception as exc:
+                pivot_payload = {"error": str(exc)}
+            # Keep a deterministic trail in attempts: conflict means operator decision is still required.
+            if attempts:
+                attempts[-1]["accepted"] = False
+                attempts[-1]["reject_reason"] = "semantic_conflict"
+                attempts[-1]["status"] = "invalid"
+
+        if semantic_conflict:
+            outcome_class = "semantic_conflict"
+        elif parsed is None and any(str(item.get("reject_reason") or "") == "style_policy_violation" for item in attempts):
+            outcome_class = "style_violation"
+        elif parsed is None:
+            outcome_class = "contract_invalid"
+        else:
+            outcome_class = "ok"
+
         return {
             "provider": "huggingface_openai_compat",
             "model": model,
@@ -934,18 +1151,195 @@ class ScambaiterCore:
                 "message": {"text": parsed.suggestion},
                 "actions": parsed.actions,
                 "metadata": parsed.metadata,
+                "conflict": parsed.conflict,
             }
             if parsed is not None
             else None,
             "contract_issues": contract_issues,
+            "outcome_class": outcome_class,
+            "semantic_conflict": semantic_conflict,
+            "conflict": conflict_payload,
+            "pivot": pivot_payload,
+            "repair_available": parsed is None,
+            "repair_context": (
+                {
+                    "chat_id": chat_id,
+                    "reject_reason": initial_reject_reason or "contract_validation_failed",
+                    "failed_generation_excerpt": final_text[:2000],
+                }
+                if parsed is None
+                else None
+            ),
             "error_message": (
                 None
-                if parsed is not None
+                if parsed is not None and not semantic_conflict
                 else (
+                    "semantic conflict detected (operator decision required)"
+                    if semantic_conflict
+                    else (
                     "model output violates scambait style policy"
                     if any(str(item.get("reject_reason") or "") == "style_policy_violation" for item in attempts)
                     else "invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)"
                     + first_issue_str
+                    )
+                )
+            ),
+            "attempts": attempts,
+        }
+
+    def run_hf_dry_run_repair(
+        self,
+        chat_id: int,
+        failed_generation: str,
+        reject_reason: str = "contract_validation_failed",
+    ) -> dict[str, Any]:
+        token = (getattr(self.config, "hf_token", None) or "").strip()
+        model = (getattr(self.config, "hf_model", None) or "").strip()
+        if not token or not model:
+            raise RuntimeError("HF_TOKEN/HF_MODEL missing")
+        max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))
+        repair_messages = _build_repair_messages(
+            failed_generation,
+            reject_reason=reject_reason or "contract_validation_failed",
+        )
+        repair_prompt = {"messages": repair_messages, "max_tokens": max_tokens}
+        attempts: list[dict[str, Any]] = []
+        try:
+            repair_response = call_hf_openai_chat(
+                token=token,
+                model=model,
+                messages=repair_messages,
+                max_tokens=max_tokens,
+                base_url=None,
+            )
+            repair_text = extract_result_text(repair_response)
+        except Exception as exc:
+            attempts.append(
+                {
+                    "phase": "repair",
+                    "status": "error",
+                    "accepted": False,
+                    "reject_reason": "provider_error",
+                    "error_message": str(exc),
+                    "prompt_json": repair_prompt,
+                    "response_json": {},
+                    "result_text": "",
+                }
+            )
+            return {
+                "provider": "huggingface_openai_compat",
+                "model": model,
+                "prompt_json": repair_prompt,
+                "response_json": {},
+                "result_text": "",
+                "valid_output": False,
+                "parsed_output": None,
+                "error_message": str(exc),
+                "outcome_class": "provider_error",
+                "semantic_conflict": False,
+                "conflict": None,
+                "pivot": None,
+                "repair_available": False,
+                "repair_context": None,
+                "attempts": attempts,
+            }
+
+        repaired_result = parse_structured_model_output_detailed(repair_text)
+        repaired = repaired_result.output
+        repair_reject_reason: str | None = None
+        if repaired is None:
+            repair_reject_reason = "contract_validation_failed"
+        elif violates_scambait_style_policy(repaired.suggestion):
+            repair_reject_reason = "style_policy_violation"
+            repaired = None
+        attempts.append(
+            {
+                "phase": "repair",
+                "status": "ok" if repaired is not None else "invalid",
+                "accepted": repaired is not None,
+                "reject_reason": repair_reject_reason,
+                "error_message": None,
+                "contract_issues": [item.as_dict() for item in repaired_result.issues] if repaired is None else [],
+                "prompt_json": repair_prompt,
+                "response_json": repair_response,
+                "result_text": repair_text,
+            }
+        )
+
+        contract_issues: list[dict[str, Any]] = []
+        if repaired is None:
+            contract_issues = [item.as_dict() for item in repaired_result.issues]
+        first_issue = contract_issues[0] if contract_issues else None
+        first_issue_str = ""
+        if isinstance(first_issue, dict):
+            issue_path = str(first_issue.get("path") or "").strip()
+            issue_reason = str(first_issue.get("reason") or "").strip()
+            if issue_path or issue_reason:
+                first_issue_str = f" ({issue_path}: {issue_reason})"
+
+        semantic_conflict, conflict_payload = self._detect_semantic_conflict(parsed=repaired, result_text=repair_text)
+        pivot_payload: dict[str, Any] | None = None
+        if semantic_conflict:
+            try:
+                pivot_payload = self._build_semantic_pivot(chat_id=chat_id, conflict=conflict_payload)
+            except Exception as exc:
+                pivot_payload = {"error": str(exc)}
+            attempts[-1]["accepted"] = False
+            attempts[-1]["reject_reason"] = "semantic_conflict"
+            attempts[-1]["status"] = "invalid"
+
+        if semantic_conflict:
+            outcome_class = "semantic_conflict"
+        elif repaired is None and repair_reject_reason == "style_policy_violation":
+            outcome_class = "style_violation"
+        elif repaired is None:
+            outcome_class = "contract_invalid"
+        else:
+            outcome_class = "ok"
+
+        return {
+            "provider": "huggingface_openai_compat",
+            "model": model,
+            "prompt_json": repair_prompt,
+            "response_json": repair_response,
+            "result_text": repair_text,
+            "valid_output": repaired is not None,
+            "parsed_output": {
+                "analysis": repaired.analysis,
+                "message": {"text": repaired.suggestion},
+                "actions": repaired.actions,
+                "metadata": repaired.metadata,
+                "conflict": repaired.conflict,
+            }
+            if repaired is not None
+            else None,
+            "contract_issues": contract_issues,
+            "outcome_class": outcome_class,
+            "semantic_conflict": semantic_conflict,
+            "conflict": conflict_payload,
+            "pivot": pivot_payload,
+            "repair_available": repaired is None,
+            "repair_context": (
+                {
+                    "chat_id": chat_id,
+                    "reject_reason": repair_reject_reason or "contract_validation_failed",
+                    "failed_generation_excerpt": repair_text[:2000],
+                }
+                if repaired is None
+                else None
+            ),
+            "error_message": (
+                None
+                if repaired is not None and not semantic_conflict
+                else (
+                    "semantic conflict detected (operator decision required)"
+                    if semantic_conflict
+                    else (
+                        "model output violates scambait style policy"
+                        if repair_reject_reason == "style_policy_violation"
+                        else "invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)"
+                        + first_issue_str
+                    )
                 )
             ),
             "attempts": attempts,

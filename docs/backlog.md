@@ -50,6 +50,19 @@ Die wichtigsten offenen Guardrail-/Promptverbesserungen und ihre aktuellen Zust�
 2. Post-Response-Check in `model_client` hinzufügen, der Pronomen/Kontext auf die letzten Erwähnungen abgleicht.
 3. Bei Verletzungen das Guard-Flag setzen und ggf. ein Rewrite initiieren.
 
+## Forward-Ingestion: Batch-Merge & Sequenz-Dedupe *(Actionable)*
+
+- Für Nutzer ohne Telethon sollen weitergeleitete Nachrichten als Batch betrachtet werden.
+- Ein Batch darf nur hinten angehängt werden, wenn die enthaltenen Scam-Nachrichten nicht bereits in derselben Reihenfolge in der DB stehen.
+- Deduplizierung soll nicht nur auf einzelner Message-ID basieren, sondern auf geordneter Sequenz-Erkennung über den Batch.
+
+### Nächste Schritte
+
+1. Batch-Identifikation definieren (zusammenhängende Forward-Importe pro ingest-Lauf).
+2. Sequenzvergleich gegen vorhandene Scam-Nachrichten implementieren (ordered subsequence / suffix match).
+3. Append nur bei neuer Sequenz; ansonsten Import überspringen und im Control-Text transparent melden.
+4. Tests ergänzen: identischer Batch doppelt forwarded -> kein zweites Append; Reihenfolgeabweichung -> neues Append erlaubt.
+
 ## Archivierte/deferrierte Ideen
 
 - Escalation-Regel feiner kalibrieren: nur bei echten Faktenlücken eskalieren, sonst kreativ weiterführen.

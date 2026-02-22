@@ -122,6 +122,57 @@ class OutputContractParserTest(unittest.TestCase):
         self.assertTrue(parsed.issues)
         self.assertEqual("actions[0]", parsed.issues[0].path)
 
+    def test_send_message_accepts_dotted_message_text_alias(self) -> None:
+        payload = {
+            "schema": "scambait.llm.v1",
+            "analysis": {},
+            "message": {},
+            "actions": [{"type": "send_message", "message.text": "Hallo"}],
+        }
+        parsed = parse_structured_model_output(json.dumps(payload))
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual([{"type": "send_message", "message": {"text": "Hallo"}}], parsed.actions)
+
+    def test_conflict_allows_missing_send_message(self) -> None:
+        payload = {
+            "schema": "scambait.llm.v1",
+            "analysis": {"reason": "Insufficient context to continue safely."},
+            "message": {},
+            "conflict": {
+                "type": "semantic_conflict",
+                "code": "insufficient_context",
+                "reason": "Need operator decision before continuing.",
+                "requires_human": True,
+                "suggested_mode": "hold",
+            },
+            "actions": [{"type": "noop"}],
+        }
+        parsed = parse_structured_model_output(json.dumps(payload))
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual("", parsed.suggestion)
+        self.assertIsInstance(parsed.conflict, dict)
+        assert isinstance(parsed.conflict, dict)
+        self.assertEqual("semantic_conflict", parsed.conflict.get("type"))
+
+    def test_conflict_without_reason_is_rejected(self) -> None:
+        payload = {
+            "schema": "scambait.llm.v1",
+            "analysis": {},
+            "message": {},
+            "conflict": {
+                "type": "semantic_conflict",
+                "code": "operator_required",
+                "suggested_mode": "hold",
+            },
+            "actions": [{"type": "noop"}],
+        }
+        parsed = parse_structured_model_output_detailed(json.dumps(payload))
+        self.assertIsNone(parsed.output)
+        self.assertTrue(parsed.issues)
+        self.assertEqual("conflict.reason", parsed.issues[0].path)
+
     def test_parser_returns_structured_issue_path_and_reason(self) -> None:
         payload = {
             "schema": "scambait.llm.v1",

@@ -23,7 +23,7 @@ def _response_with_content(content: str) -> dict:
 
 
 class IterationBDryRunRepairTest(unittest.TestCase):
-    def test_dry_run_uses_repair_phase_after_invalid_initial_output(self) -> None:
+    def test_dry_run_returns_initial_only_without_auto_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
             store = AnalysisStore(str(db_path))
@@ -42,25 +42,99 @@ class IterationBDryRunRepairTest(unittest.TestCase):
                     '{"schema":"wrong","analysis":{},"message":{"text":"x"},'
                     '"actions":[{"type":"send_message","message":{"text":"x"}}]}'
                 ),
-                _response_with_content(
-                    '{"schema":"scambait.llm.v1","analysis":{},"message":{"text":"ok"},'
-                    '"actions":[{"type":"send_message","message":{"text":"ok"}}]}'
-                ),
             ]
 
             with patch("scambaiter.core.call_hf_openai_chat", side_effect=responses):
                 result = core.run_hf_dry_run(chat_id=123)
 
+            self.assertFalse(result.get("valid_output"))
+            self.assertEqual("contract_invalid", result.get("outcome_class"))
+            self.assertTrue(result.get("repair_available"))
+            attempts = result.get("attempts")
+            self.assertIsInstance(attempts, list)
+            assert isinstance(attempts, list)
+            self.assertEqual(1, len(attempts))
+            self.assertEqual("initial", attempts[0].get("phase"))
+            self.assertEqual("invalid", attempts[0].get("status"))
+            self.assertIsInstance(attempts[0].get("contract_issues"), list)
+            self.assertEqual("contract_validation_failed", attempts[0].get("reject_reason"))
+
+    def test_manual_repair_call_returns_repair_phase_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            config = SimpleNamespace(hf_token="token", hf_model="model", hf_max_tokens=200)
+            core = ScambaiterCore(config=config, store=store)
+
+            responses = [
+                _response_with_content(
+                    '{"schema":"scambait.llm.v1","analysis":{},"message":{"text":"ok"},'
+                    '"actions":[{"type":"send_message","message":{"text":"ok"}}]}'
+                ),
+            ]
+            with patch("scambaiter.core.call_hf_openai_chat", side_effect=responses):
+                result = core.run_hf_dry_run_repair(
+                    chat_id=123,
+                    failed_generation='{"schema":"wrong"}',
+                    reject_reason="contract_validation_failed",
+                )
             self.assertTrue(result.get("valid_output"))
             attempts = result.get("attempts")
             self.assertIsInstance(attempts, list)
             assert isinstance(attempts, list)
-            self.assertEqual(2, len(attempts))
-            self.assertEqual("initial", attempts[0].get("phase"))
-            self.assertEqual("invalid", attempts[0].get("status"))
-            self.assertIsInstance(attempts[0].get("contract_issues"), list)
-            self.assertEqual("repair", attempts[1].get("phase"))
-            self.assertEqual("ok", attempts[1].get("status"))
+            self.assertEqual(1, len(attempts))
+            self.assertEqual("repair", attempts[0].get("phase"))
+            self.assertEqual("ok", attempts[0].get("status"))
+
+    def test_dry_run_marks_semantic_conflict_and_generates_pivot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.ingest_event(
+                chat_id=124,
+                event_type="message",
+                role="scammer",
+                text="Can you share ownership and returns details?",
+            )
+            config = SimpleNamespace(
+                hf_token="token",
+                hf_model="model",
+                hf_memory_model="memory-model",
+                hf_max_tokens=200,
+                hf_memory_max_tokens=300,
+            )
+            core = ScambaiterCore(config=config, store=store)
+
+            responses = [
+                _response_with_content(
+                    '{"schema":"scambait.llm.v1","analysis":{"reason":"I cannot provide exact investment terms safely."},'
+                    '"message":{},"actions":[{"type":"send_message","message":{"text":"Could you share the legal entity name behind the platform first?"}}]}'
+                ),
+                _response_with_content(
+                    '{"schema":"scambait.meta.turn.v1","turn_options":[{"text":"Before terms, can you send the company registration number?","strategy":"verification pivot","risk":"low"}],'
+                    '"recommended_text":"Before terms, can you send the company registration number?"}'
+                ),
+            ]
+
+            with patch("scambaiter.core.call_hf_openai_chat", side_effect=responses):
+                result = core.run_hf_dry_run(chat_id=124)
+
+            self.assertTrue(result.get("valid_output"))
+            self.assertEqual("semantic_conflict", result.get("outcome_class"))
+            self.assertTrue(result.get("semantic_conflict"))
+            conflict = result.get("conflict")
+            self.assertIsInstance(conflict, dict)
+            assert isinstance(conflict, dict)
+            self.assertEqual("semantic_conflict", conflict.get("type"))
+            pivot = result.get("pivot")
+            self.assertIsInstance(pivot, dict)
+            assert isinstance(pivot, dict)
+            self.assertIn("recommended_text", pivot)
+            attempts = result.get("attempts")
+            self.assertIsInstance(attempts, list)
+            assert isinstance(attempts, list)
+            self.assertEqual("semantic_conflict", attempts[-1].get("reject_reason"))
+            self.assertFalse(bool(attempts[-1].get("accepted")))
 
 
 class GenerationAttemptStoreFieldsTest(unittest.TestCase):
