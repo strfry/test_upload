@@ -540,13 +540,14 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("chat_id: /123", text)
         self.assertIn("12:01 scammer: hi back", text)
 
-    def test_render_prompt_section_text_includes_prompt_json(self) -> None:
+    def test_render_prompt_section_text_renders_chat_window(self) -> None:
         prompt_events = [
             {"time": "01:00", "role": "manual", "text": "user"},
         ]
         model_messages = [
             {"role": "system", "content": "system msg"},
-            {"role": "user", "content": "user msg"},
+            {"role": "user", "content": "user msg", "time": "01:01"},
+            {"role": "assistant", "content": "assistant msg", "time": "01:02"},
         ]
         text = _render_prompt_section_text(
             chat_id=321,
@@ -560,9 +561,35 @@ class BotApiForwardIngestTest(unittest.TestCase):
             memory={"current_intent": {"latest_topic": "topic"}, "key_facts": {"fact": "value"}},
         )
         self.assertIn("Model Input Section: messages", text)
-        self.assertIn('"recent_messages"', text)
-        self.assertNotIn('"memory_summary"', text)
+        self.assertIn("recent_messages_count: 2", text)
+        self.assertIn("showing_recent_messages: 2", text)
+        self.assertIn("[...] earlier context summarized in memory", text)
+        self.assertIn("01:01 🔹 user: user msg", text)
+        self.assertIn("01:02 🔸 assistant: assistant msg", text)
+        self.assertNotIn('"recent_messages"', text)
         self.assertNotIn("system msg", text)
+
+    def test_render_prompt_section_text_messages_limits_to_twenty_items(self) -> None:
+        model_messages: list[dict[str, str]] = []
+        for idx in range(30):
+            role = "user" if idx % 2 == 0 else "assistant"
+            model_messages.append({"role": role, "content": f"msg-{idx:02d}"})
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=[],
+            model_messages=model_messages,
+            latest_payload=None,
+            latest_raw="",
+            latest_attempt_id=None,
+            latest_status=None,
+            section="messages",
+            memory=None,
+        )
+        self.assertIn("recent_messages_count: 30", text)
+        self.assertIn("showing_recent_messages: 20", text)
+        self.assertNotIn("msg-00", text)
+        self.assertIn("msg-10", text)
+        self.assertIn("msg-29", text)
 
     def test_prompt_keyboard_includes_prompt_button(self) -> None:
         keyboard = _prompt_keyboard(chat_id=999, active_section="messages")

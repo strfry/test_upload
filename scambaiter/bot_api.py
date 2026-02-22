@@ -941,7 +941,7 @@ def _render_memory_compact(summary: dict[str, Any], meta: dict[str, Any], *, cha
     return _trim_block("\n".join(lines))
 
 
-def _extract_recent_messages(model_messages: list[dict[str, str]]) -> list[dict[str, str]]:
+def _extract_recent_messages(model_messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for item in model_messages:
         if not isinstance(item, dict):
@@ -951,11 +951,15 @@ def _extract_recent_messages(model_messages: list[dict[str, str]]) -> list[dict[
             continue
         content = item.get("content")
         if isinstance(content, str):
-            out.append({"role": role or "user", "content": content})
+            row: dict[str, str] = {"role": role or "user", "content": content}
+            raw_time = item.get("time")
+            if isinstance(raw_time, str) and raw_time.strip():
+                row["time"] = raw_time.strip()
+            out.append(row)
     return out
 
 
-def _extract_system_prompt(model_messages: list[dict[str, str]]) -> str:
+def _extract_system_prompt(model_messages: list[dict[str, Any]]) -> str:
     for item in model_messages:
         if not isinstance(item, dict):
             continue
@@ -968,11 +972,48 @@ def _extract_system_prompt(model_messages: list[dict[str, str]]) -> str:
     return ""
 
 
+def _render_messages_chat_window(
+    recent_messages: list[dict[str, str]],
+    *,
+    max_items: int = 20,
+    max_chars: int = 160,
+) -> list[str]:
+    def _role_name(raw_role: str) -> str:
+        role = raw_role.strip().lower()
+        if role in ("assistant", "scammer", "scambaiter"):
+            return "assistant"
+        return "user"
+
+    def _role_marker(role: str) -> str:
+        if role == "assistant":
+            return "🔸"
+        return "🔹"
+
+    def _clean_and_truncate(text: str) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= max_chars:
+            return compact
+        return compact[: max_chars - 3].rstrip() + "..."
+
+    visible = recent_messages[-max_items:] if len(recent_messages) > max_items else list(recent_messages)
+    lines: list[str] = []
+    for row in visible:
+        role = _role_name(str(row.get("role") or "user"))
+        text = _clean_and_truncate(str(row.get("content") or ""))
+        raw_time = str(row.get("time") or "").strip()
+        marker = _role_marker(role)
+        if raw_time:
+            lines.append(f"{raw_time} {marker} {role}: {text}")
+        else:
+            lines.append(f"{marker} {role}: {text}")
+    return lines
+
+
 def _render_prompt_section_text(
     *,
     chat_id: int,
     prompt_events: list[dict[str, Any]],
-    model_messages: list[dict[str, str]],
+    model_messages: list[dict[str, Any]],
     latest_payload: dict[str, Any] | None,
     latest_raw: str,
     latest_attempt_id: int | None,
@@ -982,16 +1023,24 @@ def _render_prompt_section_text(
 ) -> str:
     if section == "messages":
         recent_messages = _extract_recent_messages(model_messages)
-        payload = {
-            "recent_messages": recent_messages,
-        }
+        message_lines = _render_messages_chat_window(recent_messages, max_items=20, max_chars=160)
+        memory_summary, memory_meta = _normalize_memory_payload(memory)
+        has_memory = bool(memory_summary) and str(memory_meta.get("state") or "") == "ok"
         lines = [
             "Model Input Section: messages",
             f"chat_id: /{chat_id}",
             f"events_in_prompt: {len(prompt_events)}",
-            "---",
-            json.dumps(payload, ensure_ascii=False, indent=2),
+            f"recent_messages_count: {len(recent_messages)}",
+            f"showing_recent_messages: {len(message_lines)}",
         ]
+        if has_memory:
+            lines.append("[...] earlier context summarized in memory")
+        lines.extend(
+            [
+            "---",
+            ]
+        )
+        lines.extend(message_lines if message_lines else ["(no recent messages)"])
         return _trim_block("\n".join(lines))
 
     if section == "system":
