@@ -17,10 +17,8 @@ from scambaiter.storage import AnalysisStore
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe dry-run prompt and HF request.")
+    parser = argparse.ArgumentParser(description="Run a read-only HF dry-run for one chat.")
     parser.add_argument("--chat-id", type=int, required=True)
-    parser.add_argument("--preview-only", action="store_true")
-    parser.add_argument("--save-attempt", action="store_true")
     parser.add_argument("--db", default=os.getenv("SCAMBAITER_ANALYSIS_DB_PATH", "scambaiter.sqlite3"))
     args = parser.parse_args()
 
@@ -30,46 +28,27 @@ def main() -> None:
     store = AnalysisStore(config.analysis_db_path)
     core = ScambaiterCore(config=config, store=store)
 
-    if args.preview_only:
-        messages = core.build_model_messages(chat_id=args.chat_id)
-        print(json.dumps({"chat_id": args.chat_id, "messages": messages}, ensure_ascii=False, indent=2))
-        return
-
     status = "ok"
-    result_text = ""
-    response_json: dict[str, object] = {}
-    prompt_json: dict[str, object] = {}
-    provider = "huggingface_openai_compat"
-    model = (config.hf_model or "").strip()
-    error_message: str | None = None
+    payload: dict[str, object] = {"chat_id": int(args.chat_id)}
     try:
         result = core.run_hf_dry_run(chat_id=args.chat_id)
-        result_text = str(result.get("result_text") or "")
-        response_json = result.get("response_json") if isinstance(result.get("response_json"), dict) else {}
-        prompt_json = result.get("prompt_json") if isinstance(result.get("prompt_json"), dict) else {}
-        provider = str(result.get("provider") or provider)
-        model = str(result.get("model") or model)
+        payload.update(result)
+        valid_output = bool(result.get("valid_output"))
+        error_message = str(result.get("error_message") or "").strip()
+        status = "ok" if valid_output and not error_message else "error"
     except Exception as exc:
         status = "error"
-        error_message = str(exc)
-
-    if args.save_attempt:
-        attempt = store.save_generation_attempt(
-            chat_id=args.chat_id,
-            provider=provider,
-            model=model,
-            prompt_json=prompt_json,
-            response_json=response_json,
-            result_text=result_text,
-            status=status,
-            error_message=error_message,
-        )
-        print(f"saved attempt id={attempt.id} status={attempt.status}")
+        payload = {
+            "chat_id": int(args.chat_id),
+            "status": "error",
+            "error_message": str(exc),
+        }
 
     if status == "ok":
-        print(result_text or "<empty-result>")
+        payload["status"] = "ok"
+        print(json.dumps(payload, ensure_ascii=False))
     else:
-        print(f"dry-run failed: {error_message}")
+        print(json.dumps(payload, ensure_ascii=False))
 
 
 if __name__ == "__main__":

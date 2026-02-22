@@ -9,6 +9,7 @@ from scambaiter.bot_api import (
     _build_forward_payload,
     _delete_control_message,
     _event_ts_utc_for_store,
+    _extract_partial_message_preview,
     _extract_forward_profile_info,
     _infer_role_without_target,
     _infer_target_chat_id_from_forward,
@@ -357,19 +358,19 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_raw="",
             latest_attempt_id=None,
             latest_status=None,
-            section="prompt",
+            section="messages",
             memory={"current_intent": {"latest_topic": "topic"}, "key_facts": {"fact": "value"}},
         )
-        self.assertIn("Prompt JSON", text)
+        self.assertIn("Model Input Section: messages", text)
         self.assertIn('"messages"', text)
-        self.assertIn('"memory_summary"', text)
+        self.assertNotIn('"memory_summary"', text)
 
     def test_prompt_keyboard_includes_prompt_button(self) -> None:
-        keyboard = _prompt_keyboard(chat_id=999, active_section="prompt")
+        keyboard = _prompt_keyboard(chat_id=999, active_section="messages")
         self.assertTrue(keyboard.inline_keyboard)
         prompt_row = keyboard.inline_keyboard[0]
-        self.assertEqual("• prompt", prompt_row[0].text)
-        self.assertEqual("sc:psec:prompt:999", prompt_row[0].callback_data)
+        self.assertEqual("• messages", prompt_row[0].text)
+        self.assertEqual("sc:psec:messages:999", prompt_row[0].callback_data)
 
     def test_render_whoami_text_reports_authorization_state(self) -> None:
         message = type("Msg", (), {"chat_id": 1234})()
@@ -378,6 +379,45 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("user_id: 777", text)
         self.assertIn("allowed_chat_id: 8450305774", text)
         self.assertIn("authorized_here: no", text)
+
+    def test_extract_partial_message_preview_reads_message_text(self) -> None:
+        raw = '{"schema":"scambait.llm.v1","message":{"text":"  hello   world  "},"actions":[]}'
+        preview = _extract_partial_message_preview(raw)
+        self.assertEqual("hello world", preview)
+
+    def test_extract_partial_message_preview_reads_action_send_message_text(self) -> None:
+        raw = (
+            '{"schema":"scambait.llm.v1","message":{},'
+            '"actions":[{"type":"send_message","message":{"text":"  action   text  "}}]}'
+        )
+        preview = _extract_partial_message_preview(raw)
+        self.assertEqual("action text", preview)
+
+    def test_render_prompt_section_memory_includes_memory_summary(self) -> None:
+        prompt_events = [{"time": "01:00", "role": "manual", "text": "user"}]
+        model_messages = [{"role": "system", "content": "system msg"}]
+        latest_payload = {
+            "schema": "scambait.llm.v1",
+            "message": {},
+            "actions": [{"type": "send_message", "message": {"text": "from action"}}],
+        }
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=prompt_events,
+            model_messages=model_messages,
+            latest_payload=latest_payload,
+            latest_raw="",
+            latest_attempt_id=23,
+            latest_status="ok",
+            section="memory",
+            memory={"current_intent": {"latest_topic": "topic"}},
+        )
+        self.assertIn("Model Input Section: memory", text)
+        self.assertIn('"memory_summary"', text)
+
+    def test_extract_partial_message_preview_empty_on_non_json(self) -> None:
+        preview = _extract_partial_message_preview("not-json")
+        self.assertEqual("", preview)
 
 
 if __name__ == "__main__":

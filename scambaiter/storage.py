@@ -779,6 +779,36 @@ class AnalysisStore:
             for row in rows
         ]
 
+    def get_generation_attempt(self, attempt_id: int) -> GenerationAttempt | None:
+        row = self._conn.execute(
+            """
+            SELECT id, chat_id, provider, model, prompt_json, response_json, result_text, status,
+                   error_message, attempt_no, phase, accepted, reject_reason, created_at
+            FROM generation_attempts
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return GenerationAttempt(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            provider=str(row["provider"]),
+            model=str(row["model"]),
+            prompt_json=self._loads_dict(row["prompt_json"]),
+            response_json=self._loads_dict(row["response_json"]),
+            result_text=str(row["result_text"]),
+            status=str(row["status"]),
+            error_message=row["error_message"],
+            attempt_no=int(row["attempt_no"]),
+            phase=str(row["phase"]),
+            accepted=bool(int(row["accepted"])),
+            reject_reason=row["reject_reason"],
+            created_at=str(row["created_at"]),
+        )
+
     @staticmethod
     def _loads_dict(raw: str) -> dict[str, Any]:
         value = json.loads(raw)

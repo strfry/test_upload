@@ -4,12 +4,33 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from scambaiter.core import ScambaiterCore
 from scambaiter.storage import AnalysisStore
 
 
 class EventAndPromptFlowTest(unittest.TestCase):
+    @staticmethod
+    def _memory_response(content: str) -> dict:
+        return {"choices": [{"message": {"content": content}}]}
+
+    @staticmethod
+    def _valid_memory_summary_json(tag: str) -> str:
+        payload = {
+            "schema": "scambait.memory.v1",
+            "claimed_identity": {"name": tag, "role_claim": "investor", "confidence": "medium"},
+            "narrative": {"phase": "pitch", "short_story": "story", "timeline_points": ["t1"]},
+            "current_intent": {"scammer_intent": "extract funds", "baiter_intent": "delay", "latest_topic": tag},
+            "key_facts": {"k": "v"},
+            "risk_flags": ["rf"],
+            "open_questions": ["q1"],
+            "next_focus": ["n1"],
+        }
+        import json
+
+        return json.dumps(payload, ensure_ascii=True)
+
     def test_user_forward_keeps_event_type_and_sets_manual_role(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
@@ -95,6 +116,69 @@ class EventAndPromptFlowTest(unittest.TestCase):
             self.assertEqual(17, loaded.cursor_event_id)
             self.assertEqual("openai/gpt-oss-120b", loaded.model)
             self.assertEqual("scambait.memory.v1", loaded.summary.get("schema"))
+
+    def test_ensure_memory_context_skips_model_when_cursor_is_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.ingest_event(chat_id=2050, event_type="message", role="scammer", text="hello")
+            store.upsert_memory_context(
+                chat_id=2050,
+                summary={"schema": "scambait.memory.v1", "current_intent": {}},
+                cursor_event_id=1,
+                model="openai/gpt-oss-120b",
+            )
+            config = SimpleNamespace(hf_token="token", hf_memory_model="openai/gpt-oss-120b", hf_memory_max_tokens=150000)
+            core = ScambaiterCore(config=config, store=store)
+
+            with patch("scambaiter.core.call_hf_openai_chat") as mocked_call:
+                state = core.ensure_memory_context(chat_id=2050, force_refresh=False)
+
+            mocked_call.assert_not_called()
+            self.assertFalse(bool(state.get("updated")))
+            self.assertEqual(1, int(state.get("cursor_event_id") or 0))
+
+    def test_ensure_memory_context_uses_existing_cursor_for_incremental_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.ingest_event(chat_id=2060, event_type="message", role="scammer", text="first")
+            store.upsert_memory_context(
+                chat_id=2060,
+                summary={"schema": "scambait.memory.v1", "current_intent": {"latest_topic": "first"}},
+                cursor_event_id=1,
+                model="openai/gpt-oss-120b",
+            )
+            store.ingest_event(chat_id=2060, event_type="message", role="manual", text="second")
+            config = SimpleNamespace(hf_token="token", hf_memory_model="openai/gpt-oss-120b", hf_memory_max_tokens=150000)
+            core = ScambaiterCore(config=config, store=store)
+
+            captured: dict[str, object] = {}
+
+            def _fake_call(**kwargs: object) -> dict:
+                messages = kwargs.get("messages")
+                assert isinstance(messages, list)
+                user_payload_raw = messages[1]["content"]
+                import json
+
+                payload = json.loads(user_payload_raw)
+                captured["payload"] = payload
+                return self._memory_response(self._valid_memory_summary_json("second"))
+
+            with patch("scambaiter.core.call_hf_openai_chat", side_effect=_fake_call):
+                state = core.ensure_memory_context(chat_id=2060, force_refresh=False)
+
+            payload = captured.get("payload")
+            self.assertIsInstance(payload, dict)
+            assert isinstance(payload, dict)
+            self.assertEqual(1, int(payload.get("memory_cursor_event_id") or 0))
+            events = payload.get("events")
+            self.assertIsInstance(events, list)
+            assert isinstance(events, list)
+            self.assertEqual(1, len(events))
+            self.assertEqual("second", events[0].get("text"))
+            self.assertEqual(2, int(state.get("cursor_event_id") or 0))
+            self.assertTrue(bool(state.get("updated")))
 
     def test_clear_chat_history_deletes_events_for_target_chat_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

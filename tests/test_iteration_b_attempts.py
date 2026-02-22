@@ -38,8 +38,14 @@ class IterationBDryRunRepairTest(unittest.TestCase):
             core = ScambaiterCore(config=config, store=store)
 
             responses = [
-                _response_with_content('{"schema":"wrong","analysis":{},"message":{"text":"x"},"actions":[{"type":"send_message"}]}'),
-                _response_with_content('{"schema":"scambait.llm.v1","analysis":{},"message":{"text":"ok"},"actions":[{"type":"send_message"}]}'),
+                _response_with_content(
+                    '{"schema":"wrong","analysis":{},"message":{"text":"x"},'
+                    '"actions":[{"type":"send_message","message":{"text":"x"}}]}'
+                ),
+                _response_with_content(
+                    '{"schema":"scambait.llm.v1","analysis":{},"message":{"text":"ok"},'
+                    '"actions":[{"type":"send_message","message":{"text":"ok"}}]}'
+                ),
             ]
 
             with patch("scambaiter.core.call_hf_openai_chat", side_effect=responses):
@@ -52,6 +58,7 @@ class IterationBDryRunRepairTest(unittest.TestCase):
             self.assertEqual(2, len(attempts))
             self.assertEqual("initial", attempts[0].get("phase"))
             self.assertEqual("invalid", attempts[0].get("status"))
+            self.assertIsInstance(attempts[0].get("contract_issues"), list)
             self.assertEqual("repair", attempts[1].get("phase"))
             self.assertEqual("ok", attempts[1].get("status"))
 

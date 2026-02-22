@@ -55,4 +55,5 @@ Die wichtigsten offenen Guardrail-/Promptverbesserungen und ihre aktuellen Zust�
 - Escalation-Regel feiner kalibrieren: nur bei echten Faktenlücken eskalieren, sonst kreativ weiterführen.
 - Mini-Testset für Prompt-Qualität: 5-10 reale JSON-Fixtures mit klaren Erwartungskriterien (siehe `docs/prompt_cases`).
 - Optionaler Guardrail/Post-Check (später): Nur bei Bedarf automatische Repair-Iteration bei Duplikatfragen/Halluzinationen.
+- Prompt-Modi als konfigurierbare Chat-Card-Option (`lead_extract`, `play_light`, `hard_challenge`) einführen; aktuell bleibt `play_light` Default.
 - Diese Ideen bleiben dokumentiert, werden aber aktuell nicht aktiv angegangen; sie können bei Bedarf reaktiviert werden.

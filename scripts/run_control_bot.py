@@ -9,6 +9,7 @@ from scambaiter.config import load_config
 from scambaiter.core import ScambaiterCore
 from scambaiter.service import BackgroundService
 from scambaiter.storage import AnalysisStore
+from scambaiter.telethon_executor import TelethonExecutor
 
 
 async def _run() -> None:
@@ -18,12 +19,27 @@ async def _run() -> None:
         raise RuntimeError("SCAMBAITER_BOT_TOKEN is required")
     allowed = os.getenv("SCAMBAITER_CONTROL_CHAT_ID")
     allowed_chat_id = int(allowed) if allowed else None
+    telethon_executor = None
+    api_id = os.getenv("TELETHON_API_ID")
+    api_hash = os.getenv("TELETHON_API_HASH")
+    session_name = os.getenv("TELETHON_SESSION", "scambaiter.session")
+    if api_id and api_hash:
+        try:
+            telethon_executor = TelethonExecutor(api_id=int(api_id), api_hash=api_hash, session=session_name)
+            await telethon_executor.start()
+        except Exception:
+            telethon_executor = None
 
     store = AnalysisStore(config.analysis_db_path)
     core = ScambaiterCore(config=config, store=store)
     service = BackgroundService(core=core, interval_seconds=config.auto_interval_seconds, store=store)
 
-    app = create_bot_app(token=token, service=service, allowed_chat_id=allowed_chat_id)
+    app = create_bot_app(
+        token=token,
+        service=service,
+        allowed_chat_id=allowed_chat_id,
+        telethon_executor=telethon_executor,
+    )
     await app.initialize()
     await app.start()
     register_command_menu = app.bot_data.get("register_command_menu")
@@ -37,6 +53,8 @@ async def _run() -> None:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        if telethon_executor is not None:
+            await telethon_executor.close()
 
 
 def main() -> None:

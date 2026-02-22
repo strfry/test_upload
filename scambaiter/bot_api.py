@@ -94,10 +94,10 @@ def _last_sent_by_chat(application: Application) -> dict[int, dict[str, int]]:
 
 
 def _render_html_copy_block(text: str) -> str:
-    escaped = html.escape(text)
-    if len(escaped) > 3200:
-        escaped = escaped[:3197] + "..."
-    return "<b>Message text (copy)</b>\n<pre>" + escaped + "</pre>"
+    raw = text or ""
+    if len(raw) > 3200:
+        raw = raw[:3197] + "..."
+    return "Message text (copy)\n" + raw
 
 
 def _classify_dry_run_error(error_message: str) -> tuple[str, str]:
@@ -175,6 +175,69 @@ def _render_html_error_block(
     return "\n".join(lines)
 
 
+def _render_html_error_card(
+    *,
+    attempt_id: int,
+    chat_id: int,
+    provider: str,
+    model: str,
+    error_message: str | None,
+    result_text: str | None,
+    contract_issues: list[dict[str, Any]] | None = None,
+) -> str:
+    base = _render_html_error_block(
+        attempt_id=attempt_id,
+        chat_id=chat_id,
+        provider=provider,
+        model=model,
+        error_message=error_message,
+        result_text=result_text,
+    )
+    if not contract_issues:
+        return base
+    lines = [base, "<b>contract issues</b>"]
+    shown = 0
+    for item in contract_issues:
+        if not isinstance(item, dict):
+            continue
+        path = html.escape(str(item.get("path") or "").strip() or "unknown")
+        reason = html.escape(str(item.get("reason") or "").strip() or "unknown")
+        expected = str(item.get("expected") or "").strip()
+        actual = str(item.get("actual") or "").strip()
+        row = f"- <code>{path}</code>: {reason}"
+        if expected:
+            row += f" (expected: <code>{html.escape(expected)}</code>)"
+        if actual:
+            row += f" (actual: <code>{html.escape(actual)}</code>)"
+        lines.append(row)
+        shown += 1
+        if shown >= 5:
+            break
+    if len(contract_issues) > shown:
+        lines.append(f"... and {len(contract_issues) - shown} more")
+    return "\n".join(lines)
+
+
+def _extract_action_message_text(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return ""
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        if str(action.get("type") or "").strip() != "send_message":
+            continue
+        message_obj = action.get("message")
+        if not isinstance(message_obj, dict):
+            continue
+        text = message_obj.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
+
+
 def _extract_partial_message_preview(result_text: str) -> str:
     raw = (result_text or "").strip()
     if not raw:
@@ -185,12 +248,16 @@ def _extract_partial_message_preview(result_text: str) -> str:
         return ""
     if not isinstance(loaded, dict):
         return ""
-    message = loaded.get("message")
-    if isinstance(message, dict):
-        text = message.get("text")
-        if isinstance(text, str) and text.strip():
-            compact = " ".join(text.split())
-            return compact[:800] + ("..." if len(compact) > 800 else "")
+    text_value = _extract_action_message_text(loaded)
+    if not text_value:
+        message = loaded.get("message")
+        if isinstance(message, dict):
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                text_value = text.strip()
+    if text_value:
+        compact = " ".join(text_value.split())
+        return compact[:800] + ("..." if len(compact) > 800 else "")
     return ""
 
 
@@ -202,7 +269,7 @@ async def _send_control_text(
     parse_mode: str | None = None,
     replace_previous_status: bool = True,
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+) -> Message:
     if len(text) > 3500:
         text = text[:3497] + "..."
     chat_id = int(message.chat_id)
@@ -226,6 +293,7 @@ async def _send_control_text(
         del sent_messages[: len(sent_messages) - 500]
     if replace_previous_status:
         last_status[chat_id] = int(sent.message_id)
+    return sent
 
 
 def _render_user_card(
@@ -439,12 +507,8 @@ def _render_prompt_card_text(chat_id: int, prompt_events: list[dict[str, Any]], 
 
 
 PROMPT_SECTION_LABELS: dict[str, str] = {
-    "prompt": "prompt",
-    "schema": "schema",
-    "analysis": "analysis",
-    "message": "message",
-    "actions": "actions",
-    "raw": "raw",
+    "messages": "messages",
+    "memory": "memory",
 }
 
 
@@ -493,9 +557,7 @@ def _matches_prompt_card_context(application: Application, message_id: int, chat
 
 def _prompt_keyboard(
     chat_id: int,
-    active_section: str = "prompt",
-    attempt_id: int | None = None,
-    send_enabled: bool = False,
+    active_section: str = "messages",
 ) -> InlineKeyboardMarkup:
     def _btn(code: str) -> InlineKeyboardButton:
         label = PROMPT_SECTION_LABELS.get(code, code)
@@ -503,20 +565,12 @@ def _prompt_keyboard(
             label = f"• {label}"
         return InlineKeyboardButton(label, callback_data=f"sc:psec:{code}:{chat_id}")
 
-    if send_enabled and isinstance(attempt_id, int):
-        send_button = InlineKeyboardButton("Send", callback_data=f"sc:send:{chat_id}:{attempt_id}")
-    else:
-        send_button = InlineKeyboardButton("Send unavailable", callback_data="sc:nop")
-
     return InlineKeyboardMarkup(
         [
-            [_btn("prompt"), _btn("schema")],
-            [_btn("analysis"), _btn("message")],
-            [_btn("actions"), _btn("raw")],
-            [send_button],
+            [_btn("messages"), _btn("memory")],
             [
                 InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
-                InlineKeyboardButton("Delete", callback_data="sc:prompt_delete"),
+                InlineKeyboardButton("Close", callback_data=f"sc:prompt_close:{chat_id}"),
             ],
         ]
     )
@@ -574,110 +628,29 @@ def _render_prompt_section_text(
     section: str,
     memory: dict[str, Any] | None = None,
 ) -> str:
-    attempt_meta = f"attempt #{latest_attempt_id}" if isinstance(latest_attempt_id, int) else "attempt ?"
-    status_meta = latest_status or "unknown"
-    if section == "prompt":
+    if section == "messages":
         payload = {
-            "memory_summary": memory or {},
             "messages": model_messages,
         }
         lines = [
-            "Prompt JSON",
+            "Model Input Section: messages",
             f"chat_id: /{chat_id}",
-            f"{attempt_meta}, status={status_meta}",
             f"events_in_prompt: {len(prompt_events)}",
             "---",
             json.dumps(payload, ensure_ascii=False, indent=2),
         ]
         return _trim_block("\n".join(lines))
 
-    if latest_payload is None:
-        lines = [
-            "Prompt Card",
-            f"chat_id: /{chat_id}",
-            f"events_in_prompt: {len(prompt_events)}",
-            "latest_reply: unavailable (run Dry Run)",
-            "---",
-        ]
-        lines.extend(_memory_summary_prompt_lines(memory))
-        tail = prompt_events[-12:]
-        for item in tail:
-            role = str(item.get("role", "unknown"))
-            time = str(item.get("time") or "--:--")
-            text = str(item.get("text") or "")
-            compact = " ".join(text.split())
-            if len(compact) > 160:
-                compact = compact[:157] + "..."
-            lines.append(f"{time} {role}: {compact}")
-        return _trim_block("\n".join(lines))
-
-    if section == "schema":
-        schema = latest_payload.get("schema")
-        keys = ", ".join(str(k) for k in latest_payload.keys())
-        lines = [
-            "Reply JSON Section: schema",
-            f"chat_id: /{chat_id}",
-            f"{attempt_meta}, status={status_meta}",
-            "---",
-            f"schema: {schema}",
-            f"top_level_keys: {keys}",
-        ]
-        return _trim_block("\n".join(lines))
-
-    if section == "analysis":
-        analysis = latest_payload.get("analysis")
-        if isinstance(analysis, dict):
-            body = json.dumps(analysis, ensure_ascii=False, indent=2)
-        else:
-            body = str(analysis)
-        lines = [
-            "Reply JSON Section: analysis",
-            f"chat_id: /{chat_id}",
-            f"{attempt_meta}, status={status_meta}",
-            "---",
-            body,
-        ]
-        return _trim_block("\n".join(lines))
-
-    if section == "message":
-        message_obj = latest_payload.get("message")
-        text_value = ""
-        if isinstance(message_obj, dict):
-            text_value = str(message_obj.get("text") or "")
-        lines = [
-            "Reply JSON Section: message",
-            f"chat_id: /{chat_id}",
-            f"{attempt_meta}, status={status_meta}",
-            "---",
-            text_value or "(empty)",
-        ]
-        return _trim_block("\n".join(lines))
-
-    if section == "actions":
-        actions = latest_payload.get("actions")
-        lines = [
-            "Reply JSON Section: actions",
-            f"chat_id: /{chat_id}",
-            f"{attempt_meta}, status={status_meta}",
-            "---",
-        ]
-        if isinstance(actions, list) and actions:
-            for idx, action in enumerate(actions, start=1):
-                if isinstance(action, dict):
-                    lines.append(f"[{idx}] " + json.dumps(action, ensure_ascii=False))
-                else:
-                    lines.append(f"[{idx}] {action}")
-        else:
-            lines.append("(none)")
-        return _trim_block("\n".join(lines))
-
-    # raw
+    # memory
+    payload = {
+        "memory_summary": memory or {},
+    }
     lines = [
-        "Reply JSON Section: raw",
+        "Model Input Section: memory",
         f"chat_id: /{chat_id}",
-        f"{attempt_meta}, status={status_meta}",
+        f"events_in_prompt: {len(prompt_events)}",
         "---",
-        latest_raw or "(empty)",
+        json.dumps(payload, ensure_ascii=False, indent=2),
     ]
     return _trim_block("\n".join(lines))
 
@@ -711,7 +684,6 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     memory = store.get_memory_context(chat_id=chat_id)
-    send_enabled = app.bot_data.get("telethon_executor") is not None and isinstance(latest_attempt_id, int)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -720,17 +692,12 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
         latest_raw=latest_raw,
         latest_attempt_id=latest_attempt_id,
         latest_status=latest_status,
-        section="schema",
+        section="messages",
         memory=memory,
     )
     sent = await message.reply_text(
         prompt_text,
-        reply_markup=_prompt_keyboard(
-            chat_id=chat_id,
-            active_section="schema",
-            attempt_id=latest_attempt_id,
-            send_enabled=send_enabled,
-        ),
+        reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="messages"),
     )
     _set_prompt_card_context(app, int(sent.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
     sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
@@ -929,7 +896,6 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     memory = store.get_memory_context(chat_id=chat_id)
-    send_enabled = app.bot_data.get("telethon_executor") is not None and isinstance(latest_attempt_id, int)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -944,26 +910,47 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
     try:
         await query.edit_message_text(
             prompt_text,
-            reply_markup=_prompt_keyboard(
-                chat_id=chat_id,
-                active_section=section,
-                attempt_id=latest_attempt_id,
-                send_enabled=send_enabled,
-            ),
+            reply_markup=_prompt_keyboard(chat_id=chat_id, active_section=section),
         )
         _set_prompt_card_context(app, int(message.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
     except Exception:
         sent = await message.reply_text(
             prompt_text,
-            reply_markup=_prompt_keyboard(
-                chat_id=chat_id,
-                active_section=section,
-                attempt_id=latest_attempt_id,
-                send_enabled=send_enabled,
-            ),
+            reply_markup=_prompt_keyboard(chat_id=chat_id, active_section=section),
         )
         _set_prompt_card_context(app, int(sent.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
     await query.answer(f"Section: {PROMPT_SECTION_LABELS.get(section, section)}")
+
+
+async def _handle_prompt_close_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    try:
+        chat_id = int(data.split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    await query.answer("Closed")
+    await _show_user_card(
+        application=app,
+        control_chat_id=int(message.chat_id),
+        store=store,
+        target_chat_id=chat_id,
+    )
+    await _delete_control_message(message)
 
 
 def _load_attempt_for_send(store: Any, chat_id: int, attempt_id: int) -> tuple[Any | None, Any | None, str | None]:
@@ -1218,6 +1205,7 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
     status = "ok"
     error_message: str | None = None
     attempt_records: list[dict[str, Any]] = []
+    contract_issues: list[dict[str, Any]] = []
     try:
         dry_run_result = core.run_hf_dry_run(chat_id)
         provider = str(dry_run_result.get("provider") or provider)
@@ -1226,6 +1214,9 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
         response_json = dry_run_result.get("response_json") if isinstance(dry_run_result.get("response_json"), dict) else {}
         parsed_output = dry_run_result.get("parsed_output") if isinstance(dry_run_result.get("parsed_output"), dict) else None
         result_text = str(dry_run_result.get("result_text") or "")
+        raw_issues = dry_run_result.get("contract_issues")
+        if isinstance(raw_issues, list):
+            contract_issues = [item for item in raw_issues if isinstance(item, dict)]
         valid_output = bool(dry_run_result.get("valid_output"))
         error_message = str(dry_run_result.get("error_message") or "").strip() or None
         records = dry_run_result.get("attempts")
@@ -1290,8 +1281,10 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
 
     if status == "ok":
         if isinstance(parsed_output, dict):
-            message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
-            message_text = str(message_obj.get("text") or "").strip()
+            message_text = _extract_action_message_text(parsed_output)
+            if not message_text:
+                message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
+                message_text = str(message_obj.get("text") or "").strip()
             actions = parsed_output.get("actions") if isinstance(parsed_output.get("actions"), list) else []
             analysis = parsed_output.get("analysis") if isinstance(parsed_output.get("analysis"), dict) else {}
 
@@ -1312,10 +1305,26 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
                 f"schema: {parsed_output.get('metadata', {}).get('schema', 'unknown')}",
                 f"actions: {len(actions)}",
                 f"analysis_keys: {analysis_preview}",
+            ]
+            if len(attempt_records) > 1:
+                flow_bits: list[str] = []
+                for rec in attempt_records:
+                    phase = str(rec.get("phase") or "?")
+                    phase_status = str(rec.get("status") or "?")
+                    flow_bits.append(f"{phase}:{phase_status}")
+                summary_lines.extend(
+                    [
+                        f"repair: used ({len(attempt_records)} attempts)",
+                        f"flow: {' -> '.join(flow_bits)}",
+                    ]
+                )
+            summary_lines.extend(
+                [
                 "",
                 "Action queue:",
                 action_block,
-            ]
+                ]
+            )
             await _send_control_text(
                 application=app,
                 message=message,
@@ -1324,13 +1333,28 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
 
             if message_text:
                 copy_block = _render_html_copy_block(message_text)
-                await _send_control_text(
+                send_enabled = app.bot_data.get("telethon_executor") is not None and isinstance(getattr(attempt, "id", None), int)
+                copy_markup: InlineKeyboardMarkup | None = None
+                if send_enabled:
+                    copy_markup = InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "Send",
+                                    callback_data=f"sc:send:{chat_id}:{int(attempt.id)}",
+                                )
+                            ]
+                        ]
+                    )
+                sent_copy = await _send_control_text(
                     application=app,
                     message=message,
                     text=copy_block,
-                    parse_mode=ParseMode.HTML,
                     replace_previous_status=False,
+                    reply_markup=copy_markup,
                 )
+                if send_enabled:
+                    _set_prompt_card_context(app, int(sent_copy.message_id), chat_id=chat_id, attempt_id=int(attempt.id))
         else:
             preview = (result_text or "<empty-result>").strip()
             if len(preview) > 500:
@@ -1341,13 +1365,14 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
                 text=f"Dry run saved as attempt #{attempt.id} for /{chat_id}\n{preview}",
             )
     else:
-        error_block = _render_html_error_block(
+        error_block = _render_html_error_card(
             attempt_id=attempt.id,
             chat_id=chat_id,
             provider=provider,
             model=model or "unknown",
             error_message=error_message,
             result_text=result_text,
+            contract_issues=contract_issues,
         )
         await _send_control_text(
             application=app,
@@ -2053,7 +2078,8 @@ def create_bot_app(
     app.add_handler(
         CallbackQueryHandler(_handle_clear_history_cancel_button, pattern=r"^sc:clear_history_cancel:[0-9]+$")
     )
-    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:schema|analysis|message|actions|raw):[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:messages|memory):[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_close_button, pattern=r"^sc:prompt_close:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_send_button, pattern=r"^sc:send:[0-9]+:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_send_confirm_button, pattern=r"^sc:send_confirm:[0-9]+:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_send_cancel_button, pattern=r"^sc:send_cancel:[0-9]+:[0-9]+$"))
