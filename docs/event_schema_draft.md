@@ -1,7 +1,7 @@
 # Event Schema Draft (Conversation Context)
 
-This draft models Telegram interaction as explicit events instead of mixed text markers.
-It is intended as prompt/input context (not necessarily persisted 1:1).
+This draft models Telegram interaction as explicit events.
+Storage keeps full source fields. Prompt payload is a lightweight projection.
 
 ## Envelope
 
@@ -16,25 +16,25 @@ It is intended as prompt/input context (not necessarily persisted 1:1).
 
 ## Event Types
 
-### `text_message`
+### `message`
 
 ```json
 {
-  "type": "text_message",
+  "event_type": "message",
   "event_id": "msg_12345",
-  "role": "counterparty",
+  "role": "scammer",
   "ts_utc": "2026-02-17T18:10:00Z",
   "text": "Hi, install Coinbase first."
 }
 ```
 
-### `image_message`
+### `photo`
 
 ```json
 {
-  "type": "image_message",
+  "event_type": "photo",
   "event_id": "msg_12346",
-  "role": "counterparty",
+  "role": "scammer",
   "ts_utc": "2026-02-17T18:11:00Z",
   "caption_original": "",
   "caption_generated": "A screenshot shows a login form with email and password fields.",
@@ -42,32 +42,37 @@ It is intended as prompt/input context (not necessarily persisted 1:1).
 }
 ```
 
-### `typing`
+### `typing_interval`
 
 ```json
 {
-  "type": "typing",
-  "role": "counterparty",
+  "event_type": "typing_interval",
+  "role": "system",
   "ts_utc": "2026-02-17T18:11:05Z",
-  "action": "SendMessageTypingAction",
-  "ephemeral": true
+  "duration_ms": 4000
 }
 ```
 
-### `read_receipt`
+### `forward`
 
 ```json
 {
-  "type": "read_receipt",
-  "role": "assistant",
-  "ts_utc": "2026-02-17T18:11:10Z"
+  "event_type": "forward",
+  "role": "manual",
+  "ts_utc": "2026-02-17T18:11:10Z",
+  "text": "Forwarded from Telegram user...",
+  "source_message_id": "tg:6998054071:4567"
 }
 ```
 
 ## Prompt Integration
 
-- Pass `events[]` in chronological order.
-- Typing/read events should be optional and short-lived.
-- Typing events should not trigger model generation by themselves.
-- Image events should use `caption_generated` in the conversation context.
-
+- Persisted enum set:
+  - `event_type in {message, photo, forward, typing_interval}`
+  - `role in {manual, scammer, scambaiter, system}`
+- User forwards keep their original content type (`message`/`photo`/`forward`) and become `role=manual` when not yet known in store.
+- Pass `events[]` to the model in chronological order.
+- Prompt builder starts with full history; when token limit is reached, remove oldest events first.
+- Prompt timestamps are normalized to `HH:MM`; storage keeps full `ts_utc`.
+- `typing_interval` stays optional in prompt and should not trigger generation by itself.
+- Escalations are control actions, logged in event `meta` (not as separate top-level event type).

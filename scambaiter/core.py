@@ -1,459 +1,95 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-import asyncio
-import base64
-import hashlib
 import json
 import re
-import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Literal
+from typing import Any
 
+from .forward_meta import baiter_name_from_meta, scammer_name_from_meta
+from .model_client import call_hf_openai_chat, extract_result_text
 
-MAX_GENERATION_ATTEMPTS = 2
-MAX_REPAIR_SOURCE_CHARS = 12000
+EventType = str
+RoleType = str
 
-from huggingface_hub import InferenceClient
-from telethon import TelegramClient, events
-from telethon.tl.functions.messages import GetDialogFiltersRequest
-from telethon.tl.types import DialogFilter, UpdateChannelUserTyping, UpdateChatUserTyping, UpdateUserTyping
-from telethon.utils import get_peer_id
-
-from scambaiter.config import AppConfig
-from scambaiter.storage import AnalysisStore
-
-
-IMAGE_MARKER_PREFIX = "[Bild gesendet"
-
-SYSTEM_PROMPT = """Du bist eine Scambaiting-AI. Deine Rolle: Eine naive, aber freundliche potenzielle Zielperson.
-Du bist ein autonomer Generator für Scambaiting-Antworten.
-
-AUSGABEVERTRAG:
-- Gib ausschließlich ein einzelnes gültiges JSON-Objekt aus.
-- Kein Markdown. Kein Fließtext außerhalb des JSON.
-- Keine zusätzlichen Kommentare oder Erklärungen.
-- Keine Tool-Calls, keine Funktionsaufrufe, kein Code-Ausführen.
-- Verboten sind Strukturen wie {"name":"...","arguments":{...}}.
-- Erlaubte Top-Level-Keys:
-  - schema
-  - analysis
-  - message
-  - actions
-- schema MUSS exakt "scambait.llm.v1" sein.
-
-PFLICHTFELDER:
-- schema (String, exakt "scambait.llm.v1")
-- analysis (Objekt, kein String)
-- message.text (String, max. 4000 Zeichen)
-- actions (Array, max. 10 Elemente)
-- message.text darf leer sein, wenn keine send_message-Action enthalten ist.
-
-STRUKTURREGELN:
-- message.text enthält die tatsächlich zu sendende Nachricht.
-- send_message bedeutet: sende message.text.
-- Keine zusätzlichen Keys erzeugen.
-- Keine nicht spezifizierten Felder erfinden.
-- `message.text` muss wie eine natürliche Chat-Nachricht an die Gegenpartei klingen,
-  nicht wie interne Analyse oder Moderationsnotiz.
-- `analysis` ist ein Update-Objekt (Delta): gib nur neue/aktualisierte Fakten zurück.
-- Spiegele `previous_analysis` NICHT als Ganzes in `analysis`.
-- Wenn Lesen sinnvoll ist, setze mark_read explizit vor Sende-Aktionen.
-- Jede Action im actions-Array ist ein Objekt mit Pflichtfeld "type".
-- Verboten: Kurzformen wie {"send_message":{}} oder {"simulate_typing":{...}}.
-
-ERLAUBTE ACTION-TYPEN:
+SYSTEM_PROMPT_CONTRACT = """You are ScamBaiter assistant.
+Return exactly one valid JSON object with top-level keys: schema, analysis, message, actions.
+Rules:
+- schema must be exactly \"scambait.llm.v1\".
+- analysis must be an object.
+- message must be an object with exactly one key: text (string, <= 4000 chars).
+- actions must be a non-empty array (max 10 actions).
+- If actions contains send_message, message.text must be non-empty.
+- No markdown, no prose outside JSON, no function-call wrappers.
+Allowed action types:
 - mark_read
-- simulate_typing (benötigt duration_seconds)
-- wait (benötigt value und unit=seconds|minutes)
+- simulate_typing (duration_seconds 0..60)
+- wait (value >=0, unit in seconds|minutes; max 86400 seconds / 10080 minutes)
 - send_message (optional reply_to, optional send_at_utc)
-- edit_message (benötigt message_id und new_text)
+- edit_message (message_id, new_text)
+- delete_message (message_id)
 - noop
-- escalate_to_human (benötigt reason)
+- escalate_to_human (reason)
+"""
 
-ACTION-GRENZEN:
-- duration_seconds: 0–60
-- wait.value mit unit=seconds: 0–86400
-- wait.value mit unit=minutes: 0–10080
-- Plane realistische menschliche Antwortzeiten:
-  - vermeide Mikro-Timing (z.B. 1-4 Sekunden bei längeren Nachrichten)
-  - bei längeren Antworten eher spürbare Tippzeit nutzen
-  - wait für längere Pausen (Minuten/Stunden) nutzen
-- Timing-Heuristik (Richtwert):
-  - kurze Nachricht (<120 Zeichen): simulate_typing ca. 8–22s
-  - mittlere Nachricht (120–280 Zeichen): simulate_typing ca. 16–42s
-  - lange Nachricht (>280 Zeichen): simulate_typing ca. 28–60s
-  - wait mit unit=seconds typischerweise 0–15s, nur wenn es natürlich wirkt
-  - wait mit unit=minutes für längere Pausen, z.B. 5, 30, 120, 1440
+MEMORY_SUMMARY_PROMPT_CONTRACT = """You are ScamBaiter memory summarizer.
+Return exactly one valid JSON object with this schema:
+{
+  "schema": "scambait.memory.v1",
+  "claimed_identity": {"name": string, "role_claim": string, "confidence": "low|medium|high"},
+  "narrative": {"phase": string, "short_story": string, "timeline_points": [string]},
+  "current_intent": {"scammer_intent": string, "baiter_intent": string, "latest_topic": string},
+  "key_facts": object,
+  "risk_flags": [string],
+  "open_questions": [string],
+  "next_focus": [string]
+}
+Rules:
+- JSON only, no markdown or prose outside JSON.
+- Keep key_facts concise and evidence-based.
+- Use empty arrays/objects if information is missing.
+"""
 
-REFERENZREGELN:
-- Nachrichten können über "message_id" referenziert werden.
-- reply_to muss auf eine existierende message_id aus der Konversation verweisen.
-- Erfinde keine neuen message_id-Werte.
-
-ZEITINFORMATION:
-- Nachrichten können ein Feld "ts_utc" (ISO-8601) enthalten.
-- Der Kontext kann ein Feld "now_utc" (ISO-8601, UTC) enthalten.
-- Nutze Zeitabstände optional zur Einschätzung von Dringlichkeit oder natürlichem Antwortverhalten.
-- Führe keine komplexe Datumsberechnung durch.
-- Für geplantes Senden kann send_message ein Feld "send_at_utc" (ISO-8601, UTC) enthalten.
-
-QUEUE-KONTEXT:
-- Der Input kann bereits geplante Actions aus einer früheren Planung enthalten (`planned_queue`).
-- Wenn die alte Planung weiterhin passt, gib die geplanten Actions konsistent erneut aus (Bestätigung).
-- Wenn sie nicht mehr passt (z.B. neue eingehende Nachricht), verwerfe/ersetze sie durch eine aktualisierte Actions-Liste.
-- Antworte immer mit der vollständigen, aktuell gültigen Actions-Liste.
-- Wenn die letzte echte Chat-Nachricht bereits vom Assistenten stammt und seitdem keine neue User-Nachricht kam:
-  - Erzeuge KEINE neue inhaltlich ähnliche Folge-Nachricht.
-  - Nutze stattdessen `noop` (oder bestätige nur weiterhin gültige geplante Actions ohne neue Duplikat-Nachricht).
-  - Ausnahme: Wenn aktive `operator.directives` explizit ein proaktives Follow-up ohne neue User-Nachricht verlangen,
-    darfst du eine neue, klar unterscheidbare Nachricht planen (kein Duplikat der letzten Assistant-Nachricht).
-  - In diesem Ausnahmefall trage die verwendete Direktiven-ID in `analysis.operator_applied` ein.
-
-KONTEXT-KONSISTENZ:
-- `previous_analysis` ist nur Arbeitsspeicher und kann unvollständig oder veraltet sein.
-- Behandle `previous_analysis` als interne Faktenbasis für den aktuellen Stand.
-- Der aktuelle Chatverlauf hat Vorrang vor `previous_analysis`.
-- Frage keine Information erneut, wenn `previous_analysis` ODER der Verlauf sie bereits als bekannt markieren.
-- Wenn der Verlauf bereits eine Antwort auf eine zuvor offene Frage enthält, stelle diese Frage NICHT erneut.
-- Aktualisiere stattdessen `analysis` konsistent zum Verlauf (z.B. offene Punkte als geklärt markieren).
-- Bei Widerspruch zwischen `previous_analysis` und Verlauf: folge dem Verlauf und korrigiere `analysis`.
-- Vermeide Wiederholungsfragen in leicht umformulierter Form; das zählt ebenfalls als Duplikat.
-
-ANTWORT-PRIORITÄT:
-- Richte die nächste Nachricht primär auf die JÜNGSTE User-Nachricht aus.
-- Beantworte deren aktuelle Intention zuerst, statt auf ältere offene Punkte zurückzufallen.
-- Wenn mehrere Themen offen sind, priorisiere das zuletzt vom User angesprochene Thema.
-- Bevorzuge eine konkrete, kreative Anschlussfrage oder einen konkreten nächsten Schritt,
-  statt eine bereits diskutierte Basisfrage erneut zu stellen.
-
-PROGRESS-REGEL:
-- Stelle nicht wiederholt dieselbe Kernfrage.
-- Wenn ein Intent-Thema in den letzten 2 Assistant-Nachrichten bereits als Hauptfrage vorkam,
-  darf es in der nächsten Nachricht nicht erneut die Hauptfrage sein.
-- Liefere stattdessen Fortschritt: nächster konkreter Schritt, neues Subthema oder gezielte Nachfrage
-  zu einem bisher nicht geklärten Detail.
-
-LOOP-GUARD:
-- Wenn `analysis.loop_guard_active=true`, vermeide semantische Wiederholung der letzten Assistant-Hauptfrage.
-- Wenn `analysis.ask_again_guard.topic_from_last_turn=true`, stelle keine inhaltlich ähnliche Rückfrage
-  zum zuletzt bereits gefragten Kern-Intent.
-- Eine erneut formulierte Frage zum gleichen Intent gilt als Duplikat und ist unzulässig.
-- In diesem Fall liefere stattdessen einen neuen, konkreten Fortschrittsschritt oder eine neue Detailfrage.
-
-LAST-USER-PRIORITY:
-- Wenn `analysis.last_user_topic_priority=true`, muss `message.text` primär auf die JÜNGSTE User-Nachricht reagieren.
-- Weiche davon nur ab, wenn Sicherheitsregeln es erzwingen.
-
-OPERATOR-DIREKTIVEN:
-- Der Input kann ein Feld `operator.directives` enthalten.
-- Jede Direktive ist bindend, solange sie aktiv ist.
-- Befolge aktive Direktiven priorisiert, sofern keine Sicherheitsregel verletzt wird.
-- Priorität: Sicherheitsregeln > operator.directives > übrige Heuristiken
-  (z.B. "kein Follow-up ohne neue User-Nachricht").
-- Trage in `analysis` ein:
-  - `operator_applied`: Liste der angewendeten Direktiven-IDs.
-  - `operator_ignored`: Liste von Objekten mit `id` und `reason` für ignorierte Direktiven.
-
-NOOP-REGEL:
-- Bei `noop` darf `message.text` leer sein.
-- Wenn `actions` eine `send_message`-Action enthält, muss `message.text` nicht-leer sein.
-
-SPRACHE:
-- Verwende ausschließlich die Sprache aus dem Eingabefeld "language".
-- Die JSON-Struktur und Feldnamen bleiben unverändert.
-
-SICHERHEITSREGELN:
-- Niemals echtes Geld senden oder zusagen.
-- Keine echten persönlichen Daten preisgeben.
-- Keine illegalen Anleitungen geben.
-- Keine Schadsoftware oder Credential-Erfassung unterstützen.
-- Erfinde keine konkreten Zahlungsdetails (Wallet-Adressen, Bankdaten, Zahlungslinks,
-  Beträge/Mindest-Einlagen oder Transferanweisungen), wenn sie nicht eindeutig
-  im Chatverlauf genannt wurden.
-- Gib keine Platzhalter-Wallets oder Beispieladressen aus.
-
-FALLBACK:
-- Wenn keine sichere oder regelkonforme Antwort möglich ist:
-  Verwende escalate_to_human.
-- Verwende ebenfalls `escalate_to_human`, wenn für eine plausible nächste Nachricht
-  entscheidende Fakten fehlen und du sonst raten oder halluzinieren müsstest.
-- Pflicht-Escalation: Wenn (a) entscheidende Fakten fehlen ODER (b) die verlangte Aktion
-  gegen Sicherheitsregeln verstößt, nutze `escalate_to_human` statt `send_message`.
-- Bei Sicherheitskonflikt ist eine reine Ablehnungs-Nachricht per `send_message` kein gültiger Ersatz.
-- In diesem Fall MUSS `actions` genau eine `escalate_to_human`-Action enthalten
-  (optional mit vorbereitenden Nicht-Sende-Actions wie `mark_read`/`simulate_typing`).
-- Eskaliere nicht vorschnell: Wenn eine sichere, nicht-spekulative Klärungsfrage möglich ist,
-  bevorzuge diese und führe den Dialog weiter.
-- Nutze `escalate_to_human` primär dann, wenn ohne menschliche Entscheidung kein regelkonformer
-  nächster Schritt möglich ist.
-- In diesem Fall:
-  - setze `actions` auf `[{\"type\":\"escalate_to_human\",\"reason\":\"...\"}]`
-  - lass `message.text` leer
-  - dokumentiere in `analysis`, welche Informationen fehlen und welche Keys hilfreich wären
-    (z.B. `missing_facts`, `suggested_analysis_keys`).
-
-Gib ausschließlich gültiges JSON zurück."""
+ALLOWED_TOP_LEVEL_KEYS = {"schema", "analysis", "message", "actions"}
+ALLOWED_ACTION_TYPES = {
+    "mark_read",
+    "simulate_typing",
+    "wait",
+    "send_message",
+    "edit_message",
+    "noop",
+    "escalate_to_human",
+}
 
 
-@dataclass
+@dataclass(slots=True)
+class ChatEvent:
+    event_type: EventType
+    role: RoleType
+    text: str | None = None
+    ts_utc: str | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ChatContext:
     chat_id: int
     title: str
-    messages: list["ChatMessage"]
+    messages: list[ChatEvent | dict[str, Any]]
 
 
-@dataclass
-class ChatMessage:
-    timestamp: datetime
-    sender: str
-    role: Literal["assistant", "user"]
-    text: str
-    message_id: int | None = None
-    reply_to: int | None = None
-
-
-@dataclass
-class SuggestionResult:
-    context: ChatContext
-    suggestion: str
-    analysis: dict[str, object] | None = None
-    metadata: dict[str, str] | None = None
-    actions: list[dict[str, object]] | None = None
-
-
-@dataclass
+@dataclass(slots=True)
 class ModelOutput:
     raw: str
     suggestion: str
-    analysis: dict[str, object] | None
-    metadata: dict[str, str]
-    actions: list[dict[str, object]]
+    analysis: dict[str, Any]
+    metadata: dict[str, Any]
+    actions: list[dict[str, Any]]
 
 
-@dataclass
-class ModelExceptionEvent:
-    chat_id: int
-    title: str
-    attempt_no: int
-    phase: str
-    prompt_json: str
-    failed_generation: str | None
-    error_details: str
-
-GenerationAttemptCallback = Callable[[dict[str, object]], None]
-
-
-def parse_structured_model_output(text: str) -> ModelOutput | None:
-    cleaned = strip_think_segments(text)
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(data, dict):
-        return None
-
-    allowed_top_level_keys = {"schema", "analysis", "message", "actions"}
-    if any(str(key) not in allowed_top_level_keys for key in data.keys()):
-        return None
-
-    schema_value = data.get("schema")
-    if not isinstance(schema_value, str) or schema_value.strip() != "scambait.llm.v1":
-        return None
-
-    message_value = data.get("message")
-    if not isinstance(message_value, dict):
-        return None
-    if any(str(key) != "text" for key in message_value.keys()):
-        return None
-    text_value = message_value.get("text")
-    if not isinstance(text_value, str):
-        return None
-    reply = text_value.strip()
-    if len(reply) > 4000:
-        return None
-
-    actions_value = data.get("actions")
-    if not isinstance(actions_value, list) or not actions_value or len(actions_value) > 10:
-        return None
-
-    normalized_actions: list[dict[str, object]] = []
-    for action in actions_value:
-        normalized_action = normalize_action_shape(action)
-        if not isinstance(normalized_action, dict):
-            return None
-        if (
-            isinstance(action, dict)
-            and "type" not in action
-            and normalized_action.get("type") is not None
-        ):
-            print(
-                "[WARN] Parser normalisiert Action-Kurzform: "
-                + truncate_for_log(json.dumps(action, ensure_ascii=False), max_len=500)
-            )
-        action_type = normalized_action.get("type")
-        if not isinstance(action_type, str):
-            return None
-
-        if action_type == "mark_read":
-            if set(normalized_action.keys()) != {"type"}:
-                return None
-            normalized_actions.append({"type": "mark_read"})
-        elif action_type == "simulate_typing":
-            expected = {"type", "duration_seconds"}
-            if set(normalized_action.keys()) != expected:
-                return None
-            duration = normalized_action.get("duration_seconds")
-            if not isinstance(duration, (int, float)) or duration < 0 or duration > 60:
-                return None
-            normalized_actions.append({"type": "simulate_typing", "duration_seconds": float(duration)})
-        elif action_type == "wait":
-            expected = {"type", "value", "unit"}
-            if set(normalized_action.keys()) != expected:
-                return None
-            value = normalized_action.get("value")
-            unit = normalized_action.get("unit")
-            if not isinstance(value, (int, float)) or not isinstance(unit, str):
-                return None
-            normalized_unit = unit.strip().lower()
-            if normalized_unit not in {"seconds", "minutes"}:
-                return None
-            numeric_value = float(value)
-            if numeric_value < 0:
-                return None
-            if normalized_unit == "seconds" and numeric_value > 86400:
-                return None
-            if normalized_unit == "minutes" and numeric_value > 10080:
-                return None
-            normalized_actions.append({"type": "wait", "value": numeric_value, "unit": normalized_unit})
-        elif action_type == "send_message":
-            allowed = {"type", "reply_to", "send_at_utc"}
-            keys = set(normalized_action.keys())
-            if not keys.issubset(allowed) or "type" not in keys:
-                return None
-            entry: dict[str, object] = {"type": "send_message"}
-            if "reply_to" in normalized_action:
-                reply_to = normalized_action.get("reply_to")
-                if not isinstance(reply_to, (str, int)):
-                    return None
-                entry["reply_to"] = reply_to
-            if "send_at_utc" in normalized_action:
-                send_at_utc = normalized_action.get("send_at_utc")
-                if not isinstance(send_at_utc, str):
-                    return None
-                normalized_ts = normalize_iso_utc(send_at_utc)
-                if not normalized_ts:
-                    return None
-                entry["send_at_utc"] = normalized_ts
-            normalized_actions.append(entry)
-        elif action_type == "edit_message":
-            expected = {"type", "message_id", "new_text"}
-            if set(normalized_action.keys()) != expected:
-                return None
-            if not isinstance(normalized_action.get("new_text"), str):
-                return None
-            message_id = normalized_action.get("message_id")
-            if not isinstance(message_id, (str, int)):
-                return None
-            normalized_actions.append(
-                {
-                    "type": "edit_message",
-                    "message_id": message_id,
-                    "new_text": normalized_action.get("new_text", ""),
-                }
-            )
-        elif action_type == "noop":
-            if set(normalized_action.keys()) != {"type"}:
-                return None
-            normalized_actions.append({"type": "noop"})
-        elif action_type == "escalate_to_human":
-            expected = {"type", "reason"}
-            if set(normalized_action.keys()) != expected:
-                return None
-            if not isinstance(normalized_action.get("reason"), str) or not normalized_action.get("reason").strip():
-                return None
-            normalized_actions.append({"type": "escalate_to_human", "reason": normalized_action.get("reason", "").strip()})
-        else:
-            return None
-
-    analysis_value = data.get("analysis")
-    if not isinstance(analysis_value, dict):
-        return None
-    analysis = normalize_analysis_value_types(analysis_value)
-
-    metadata: dict[str, str] = {}
-    for top_level_key in ("schema",):
-        top_level_value = data.get(top_level_key)
-        if isinstance(top_level_value, str) and top_level_value.strip():
-            metadata[top_level_key] = top_level_value.strip()
-
-    normalized_actions = normalize_action_timings(normalized_actions, reply)
-    has_send_message = any(str(action.get("type")) == "send_message" for action in normalized_actions)
-    if has_send_message and not reply:
-        return None
-
-    return ModelOutput(
-        raw=text,
-        suggestion=reply,
-        analysis=analysis or None,
-        metadata=metadata,
-        actions=normalized_actions,
-    )
-
-
-def normalize_action_shape(action: object) -> dict[str, object] | None:
-    if not isinstance(action, dict):
-        return None
-    if "type" in action:
-        return dict(action)
-
-    # Accept and normalize malformed shorthand:
-    # {"send_message": {}} -> {"type": "send_message"}
-    if len(action) == 1:
-        key = next(iter(action.keys()))
-        value = action[key]
-        if isinstance(key, str) and key in {
-            "mark_read",
-            "simulate_typing",
-            "wait",
-            "send_message",
-            "edit_message",
-            "noop",
-            "escalate_to_human",
-        }:
-            normalized: dict[str, object] = {"type": key}
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    normalized[str(k)] = v
-            return normalized
-    return dict(action)
-
-
-def normalize_analysis_value_types(value: object) -> dict[str, object]:
-    normalized = _normalize_analysis_scalar_or_container(value)
-    if isinstance(normalized, dict):
-        return normalized
-    return {}
-
-
-def _normalize_analysis_scalar_or_container(value: object) -> object:
-    if isinstance(value, dict):
-        normalized_dict: dict[str, object] = {}
-        for key, item in value.items():
-            normalized_dict[str(key)] = _normalize_analysis_scalar_or_container(item)
-        return normalized_dict
-    if isinstance(value, list):
-        return [_normalize_analysis_scalar_or_container(item) for item in value]
-    if isinstance(value, str):
-        stripped = value.strip()
-        lowered = stripped.lower()
-        if lowered == "true":
-            return True
-        if lowered == "false":
-            return False
-        return value
-    return value
+def strip_think_segments(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    return cleaned.replace("<think>", "").replace("</think>", "").strip()
 
 
 def normalize_iso_utc(value: str) -> str | None:
@@ -468,1198 +104,676 @@ def normalize_iso_utc(value: str) -> str | None:
     return text
 
 
-def normalize_action_timings(actions: list[dict[str, object]], message_text: str) -> list[dict[str, object]]:
-    normalized = [dict(action) for action in actions]
-    text_len = len((message_text or "").strip())
-    has_send = any(str(action.get("type")) == "send_message" for action in normalized)
-    if not has_send:
-        return normalized
+def normalize_action_shape(action: object) -> dict[str, Any] | None:
+    if not isinstance(action, dict):
+        return None
+    if "type" in action:
+        return dict(action)
 
-    # Heuristic tuned for human-like typing speed in chat.
-    if text_len <= 0:
-        suggested_typing = 6.0
-    elif text_len < 120:
-        suggested_typing = max(8.0, min(22.0, round(text_len / 7.5, 1)))
-    elif text_len <= 280:
-        suggested_typing = max(16.0, min(42.0, round(text_len / 6.5, 1)))
-    else:
-        suggested_typing = max(28.0, min(60.0, round(text_len / 5.8, 1)))
-    suggested_typing = min(60.0, suggested_typing)
+    # Accept alias used by some models: {"action":"send_message", ...}
+    if "action" in action and isinstance(action.get("action"), str):
+        action_type = str(action.get("action") or "").strip()
+        if action_type in ALLOWED_ACTION_TYPES:
+            normalized = dict(action)
+            normalized.pop("action", None)
+            normalized["type"] = action_type
+            return normalized
 
-    for action in normalized:
-        action_type = str(action.get("type", ""))
+    # Accept malformed shorthand for compatibility:
+    # {"send_message": {}} -> {"type": "send_message"}
+    if len(action) == 1:
+        key = next(iter(action.keys()))
+        value = action[key]
+        if isinstance(key, str) and key in ALLOWED_ACTION_TYPES:
+            normalized: dict[str, Any] = {"type": key}
+            if isinstance(value, dict):
+                for nested_key, nested_value in value.items():
+                    normalized[str(nested_key)] = nested_value
+            return normalized
+    return dict(action)
+
+
+def _validate_actions(actions_value: object, reply: str) -> list[dict[str, Any]] | None:
+    if isinstance(actions_value, dict):
+        actions_value = [actions_value]
+    if not isinstance(actions_value, list):
+        return None
+    if len(actions_value) > 10:
+        return None
+    if not actions_value:
+        return [{"type": "send_message"}] if reply else [{"type": "noop"}]
+
+    normalized_actions: list[dict[str, Any]] = []
+    for action in actions_value:
+        normalized_action = normalize_action_shape(action)
+        if not isinstance(normalized_action, dict):
+            return None
+
+        action_type = normalized_action.get("type")
+        if not isinstance(action_type, str) or action_type not in ALLOWED_ACTION_TYPES:
+            return None
+
+        if action_type == "mark_read":
+            if set(normalized_action.keys()) != {"type"}:
+                return None
+            normalized_actions.append({"type": "mark_read"})
+            continue
+
         if action_type == "simulate_typing":
-            duration = action.get("duration_seconds")
-            if isinstance(duration, (int, float)) and duration < suggested_typing:
-                print(
-                    "[WARN] Timing normalisiert: simulate_typing von "
-                    f"{duration} auf {suggested_typing} Sekunden erhöht."
-                )
-                action["duration_seconds"] = suggested_typing
+            if set(normalized_action.keys()) != {"type", "duration_seconds"}:
+                return None
+            duration = normalized_action.get("duration_seconds")
+            if not isinstance(duration, (int, float)) or duration < 0 or duration > 60:
+                return None
+            normalized_actions.append({"type": "simulate_typing", "duration_seconds": float(duration)})
+            continue
+
         if action_type == "wait":
-            value = action.get("value")
-            unit = str(action.get("unit", "")).strip().lower()
-            if unit == "seconds" and isinstance(value, (int, float)) and value < 1:
-                print("[WARN] Timing normalisiert: wait(seconds) von " f"{value} auf 1 erhöht.")
-                action["value"] = 1.0
-            if unit == "minutes" and isinstance(value, (int, float)) and value < 0.1:
-                print("[WARN] Timing normalisiert: wait(minutes) von " f"{value} auf 0.1 erhöht.")
-                action["value"] = 0.1
+            if set(normalized_action.keys()) != {"type", "value", "unit"}:
+                return None
+            value = normalized_action.get("value")
+            unit = normalized_action.get("unit")
+            if not isinstance(value, (int, float)) or not isinstance(unit, str):
+                return None
+            unit_norm = unit.strip().lower()
+            if unit_norm not in {"seconds", "minutes"}:
+                return None
+            numeric_value = float(value)
+            if numeric_value < 0:
+                return None
+            if unit_norm == "seconds" and numeric_value > 86400:
+                return None
+            if unit_norm == "minutes" and numeric_value > 10080:
+                return None
+            normalized_actions.append({"type": "wait", "value": numeric_value, "unit": unit_norm})
+            continue
 
-    return normalized
+        if action_type == "send_message":
+            allowed = {"type", "reply_to", "send_at_utc"}
+            keys = set(normalized_action.keys())
+            if not keys.issubset(allowed) or "type" not in keys:
+                return None
+            entry: dict[str, Any] = {"type": "send_message"}
+            if "reply_to" in normalized_action:
+                reply_to = normalized_action.get("reply_to")
+                if not isinstance(reply_to, (str, int)):
+                    return None
+                entry["reply_to"] = reply_to
+            if "send_at_utc" in normalized_action:
+                send_at_utc = normalized_action.get("send_at_utc")
+                if not isinstance(send_at_utc, str):
+                    return None
+                normalized_ts = normalize_iso_utc(send_at_utc)
+                if not normalized_ts:
+                    return None
+                entry["send_at_utc"] = normalized_ts
+            normalized_actions.append(entry)
+            continue
 
+        if action_type == "edit_message":
+            if set(normalized_action.keys()) != {"type", "message_id", "new_text"}:
+                return None
+            message_id = normalized_action.get("message_id")
+            new_text = normalized_action.get("new_text")
+            if not isinstance(message_id, (str, int)) or not isinstance(new_text, str):
+                return None
+            normalized_actions.append({"type": "edit_message", "message_id": message_id, "new_text": new_text})
+            continue
 
-def _normalize_text_content(content: object) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text_value = item.get("text")
-                if isinstance(text_value, str) and text_value.strip():
-                    parts.append(text_value.strip())
-            elif isinstance(item, str) and item.strip():
-                parts.append(item.strip())
-        return "\n".join(parts)
-    return ""
+        if action_type == "noop":
+            if set(normalized_action.keys()) != {"type"}:
+                return None
+            normalized_actions.append({"type": "noop"})
+            continue
 
+        if action_type == "escalate_to_human":
+            if set(normalized_action.keys()) != {"type", "reason"}:
+                return None
+            reason = normalized_action.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return None
+            normalized_actions.append({"type": "escalate_to_human", "reason": reason.strip()})
+            continue
 
-def _extract_usage_fields(usage: object) -> dict[str, int | None]:
-    def _read(obj: object, key: str) -> object | None:
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
-
-    def _to_int(value: object | None) -> int | None:
-        if isinstance(value, bool):
-            return int(value)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
         return None
 
-    prompt_tokens = _to_int(_read(usage, "prompt_tokens"))
-    completion_tokens = _to_int(_read(usage, "completion_tokens"))
-    total_tokens = _to_int(_read(usage, "total_tokens"))
-    details = _read(usage, "completion_tokens_details")
-    reasoning_tokens = _to_int(_read(details, "reasoning_tokens"))
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "reasoning_tokens": reasoning_tokens,
-    }
+    has_send_message = any(str(action.get("type")) == "send_message" for action in normalized_actions)
+    if has_send_message and not reply:
+        return None
+    if reply and not has_send_message:
+        normalized_actions.append({"type": "send_message"})
+
+    return normalized_actions
+
+
+def _build_repair_messages(failed_generation: str) -> list[dict[str, str]]:
+    clipped = failed_generation.strip()
+    if len(clipped) > 12000:
+        clipped = clipped[:12000]
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_CONTRACT},
+        {
+            "role": "system",
+            "content": (
+                "Repair task: previous output violated the JSON contract. "
+                "Return only a corrected scambait.llm.v1 JSON object."
+            ),
+        },
+        {"role": "user", "content": json.dumps({"failed_generation": clipped}, ensure_ascii=True)},
+    ]
+
+
+def parse_structured_model_output(text: str) -> ModelOutput | None:
+    cleaned = strip_think_segments(text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    required_keys = {"schema", "analysis", "message", "actions"}
+    if not required_keys.issubset(set(str(key) for key in data.keys())):
+        return None
+
+    schema_value = data.get("schema")
+    if not isinstance(schema_value, str) or schema_value.strip() != "scambait.llm.v1":
+        return None
+
+    analysis_value = data.get("analysis")
+    if not isinstance(analysis_value, dict):
+        return None
+
+    message_value = data.get("message")
+    if not isinstance(message_value, dict) or "text" not in message_value:
+        return None
+    text_value = message_value.get("text")
+    if not isinstance(text_value, str):
+        return None
+    reply = text_value.strip()
+    if len(reply) > 4000:
+        return None
+
+    normalized_actions = _validate_actions(data.get("actions"), reply)
+    if normalized_actions is None:
+        return None
+
+    return ModelOutput(
+        raw=text,
+        suggestion=reply,
+        analysis=analysis_value,
+        metadata={"schema": "scambait.llm.v1"},
+        actions=normalized_actions,
+    )
 
 
 class ScambaiterCore:
-    def __init__(self, config: AppConfig, store: AnalysisStore | None = None) -> None:
+    """Core analysis/prompt component.
+
+    This class intentionally does not send any messages. It only prepares
+    context and generates structured model outputs.
+    """
+
+    def __init__(self, config: Any, store: Any) -> None:
         self.config = config
         self.store = store
-        self.client = TelegramClient(config.telegram_session, config.telegram_api_id, config.telegram_api_hash)
-        self.hf_client = InferenceClient(api_key=config.hf_token, base_url=config.hf_base_url)
-        self._recent_typing_by_chat: dict[int, tuple[datetime, str]] = {}
-        self.client.add_event_handler(self._on_raw_event, events.Raw())
 
-    async def start(self) -> None:
-        await self.client.start()
+    async def start(self) -> None:  # pragma: no cover - lifecycle hook
+        return
 
-    async def close(self) -> None:
-        await self.client.disconnect()
-
-    async def _on_raw_event(self, event) -> None:
-        update = getattr(event, "update", None)
-        if isinstance(update, UpdateUserTyping):
-            chat_id = int(update.user_id)
-            action_name = type(update.action).__name__
-            self._recent_typing_by_chat[chat_id] = (datetime.now(), action_name)
-            return
-        if isinstance(update, UpdateChatUserTyping):
-            chat_id = int(update.chat_id)
-            action_name = type(update.action).__name__
-            self._recent_typing_by_chat[chat_id] = (datetime.now(), action_name)
-            return
-        if isinstance(update, UpdateChannelUserTyping):
-            chat_id = int(update.channel_id)
-            action_name = type(update.action).__name__
-            self._recent_typing_by_chat[chat_id] = (datetime.now(), action_name)
-            return
-
-    def get_recent_typing_hint(self, chat_id: int, max_age_seconds: int = 120) -> dict[str, object] | None:
-        entry = self._recent_typing_by_chat.get(int(chat_id))
-        if not entry:
-            return None
-        ts, action_name = entry
-        age_seconds = int((datetime.now() - ts).total_seconds())
-        if age_seconds < 0 or age_seconds > max_age_seconds:
-            return None
-        return {
-            "kind": "typing_event",
-            "action": action_name,
-            "age_seconds": age_seconds,
-        }
-
-    def _debug(self, message: str) -> None:
-        if self.config.debug_enabled:
-            print(f"[DEBUG] {message}")
-
-    async def resolve_control_chat_id(self, bot_username: str) -> int:
-        me = await self.client.get_me()
-        my_id = me.id
-        wanted = bot_username.strip().lstrip("@").lower()
-
-        async for dialog in self.client.iter_dialogs():
-            entity = dialog.entity
-            username = (getattr(entity, "username", None) or "").strip().lstrip("@").lower()
-            if username == wanted:
-                return my_id
-
-        raise ValueError(
-            f"Bot-Dialog mit @{wanted} nicht gefunden. Bitte den Bot zuerst anschreiben und neu starten."
-        )
-
-    async def get_folder_chat_ids(self) -> set[int]:
-        result = await self.client(GetDialogFiltersRequest())
-        wanted = self.config.folder_name.strip().lower()
-
-        for item in result.filters:
-            if not isinstance(item, DialogFilter):
-                continue
-            title = getattr(item.title, "text", str(item.title))
-            if title.strip().lower() != wanted:
-                continue
-
-            chat_ids: set[int] = set()
-            for peer in item.include_peers:
-                chat_ids.add(get_peer_id(peer))
-            return chat_ids
-
-        raise ValueError(f'Telegram-Ordner "{self.config.folder_name}" wurde nicht gefunden.')
-
-    async def collect_folder_chats(self, folder_chat_ids: set[int]) -> list[ChatContext]:
-        me = await self.client.get_me()
-        my_id = me.id
-        contexts: list[ChatContext] = []
-
-        async for dialog in self.client.iter_dialogs():
-            if dialog.id not in folder_chat_ids or dialog.message is None:
-                continue
-
-            messages = await self.client.get_messages(dialog.entity, limit=self.config.history_limit)
-            chat_messages: list[ChatMessage] = []
-            for message in reversed(messages):
-                chat_message = await self._format_message_line(
-                    message,
-                    my_id=my_id,
-                    dialog_title=dialog.title,
-                    chat_id=int(dialog.id),
-                )
-                if chat_message:
-                    chat_messages.append(chat_message)
-
-            if chat_messages:
-                contexts.append(ChatContext(chat_id=dialog.id, title=dialog.title, messages=chat_messages))
-
-        self._debug(f"Chats im Ordner gefunden: {len(contexts)}")
-        return contexts
+    async def close(self) -> None:  # pragma: no cover - lifecycle hook
+        return
 
     async def build_chat_context(self, chat_id: int) -> ChatContext | None:
-        me = await self.client.get_me()
-        my_id = me.id
-        entity = await self.client.get_entity(chat_id)
-        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(chat_id)
-        messages = await self.client.get_messages(entity, limit=self.config.history_limit)
-
-        chat_messages: list[ChatMessage] = []
-        for message in reversed(messages):
-            chat_message = await self._format_message_line(
-                message,
-                my_id=my_id,
-                dialog_title=title,
-                chat_id=int(chat_id),
+        events = self.store.list_events(chat_id=chat_id, limit=500)
+        if not events:
+            return None
+        messages: list[dict[str, Any]] = []
+        for event in events:
+            messages.append(
+                {
+                    "event_type": event.event_type,
+                    "role": event.role,
+                    "text": event.text,
+                    "ts_utc": event.ts_utc,
+                    "meta": event.meta,
+                }
             )
-            if chat_message:
-                chat_messages.append(chat_message)
+        return ChatContext(chat_id=chat_id, title=f"chat-{chat_id}", messages=messages)
 
-        if not chat_messages:
-            return None
-
-        return ChatContext(chat_id=chat_id, title=title, messages=chat_messages)
-
-    async def get_chat_profile_photo(self, chat_id: int) -> bytes | None:
-        try:
-            entity = await self.client.get_entity(chat_id)
-        except Exception as exc:
-            self._debug(f"Profilbild: Entity fuer {chat_id} konnte nicht geladen werden: {exc}")
-            return None
-
-        try:
-            photo_bytes = await self.client.download_profile_photo(entity, file=bytes)
-        except Exception as exc:
-            self._debug(f"Profilbild: Download fuer {chat_id} fehlgeschlagen: {exc}")
-            return None
-
-        if isinstance(photo_bytes, (bytes, bytearray)) and photo_bytes:
-            return bytes(photo_bytes)
+    def get_recent_typing_hint(self, chat_id: int, max_age_seconds: int = 120) -> dict[str, Any] | None:
+        _ = (chat_id, max_age_seconds)
         return None
 
-    def build_conversation_messages(
+    def build_prompt_events(self, chat_id: int, token_limit: int | None = None) -> list[dict[str, Any]]:
+        token_budget = token_limit if token_limit is not None else int(getattr(self.config, "hf_max_tokens", 1500))
+        events = self.store.list_events(chat_id=chat_id, limit=5000)
+        prompt_events: list[dict[str, Any]] = []
+        for event in events:
+            # Legacy rows may contain synthetic profile_update system messages from older builds.
+            # Skip these in prompt context to avoid profile noise amplification.
+            if str(getattr(event, "role", "")) == "system":
+                text_value = getattr(event, "text", None)
+                if isinstance(text_value, str) and text_value.strip().startswith("profile_update:"):
+                    continue
+            prompt_events.append(
+                {
+                    "event_type": event.event_type,
+                    "role": event.role,
+                    "text": event.text,
+                    "time": self._as_hhmm(event.ts_utc),
+                    "meta": event.meta,
+                }
+            )
+        return self._trim_prompt_events(prompt_events, token_budget)
+
+    def build_memory_events(self, chat_id: int, after_event_id: int = 0) -> list[dict[str, Any]]:
+        events = self.store.list_events(chat_id=chat_id, limit=5000)
+        out: list[dict[str, Any]] = []
+        for event in events:
+            event_id = int(getattr(event, "id", 0))
+            if event_id <= int(after_event_id):
+                continue
+            meta = getattr(event, "meta", None)
+            if not isinstance(meta, dict):
+                meta = {}
+            media_type = str(getattr(event, "event_type", "") or "")
+            caption = None
+            if media_type == "photo":
+                text_value = getattr(event, "text", None)
+                if isinstance(text_value, str) and text_value.strip():
+                    caption = text_value.strip()
+            out.append(
+                {
+                    "event_id": event_id,
+                    "ts_utc": getattr(event, "ts_utc", None),
+                    "role": getattr(event, "role", None),
+                    "scammer_username": scammer_name_from_meta(meta),
+                    "baiter_username": baiter_name_from_meta(meta),
+                    "text": getattr(event, "text", None),
+                    "caption": caption,
+                    "citation": meta.get("citation"),
+                    "media_type": media_type,
+                }
+            )
+        return out
+
+    def _build_memory_messages(
         self,
-        context: ChatContext,
-        prompt_context: dict[str, object] | None = None,
+        *,
+        chat_id: int,
+        cursor_event_id: int,
+        existing_memory: dict[str, Any] | None,
+        events: list[dict[str, Any]],
     ) -> list[dict[str, str]]:
+        payload = {
+            "schema": "scambait.memory.input.v1",
+            "chat_id": chat_id,
+            "memory_cursor_event_id": int(cursor_event_id),
+            "existing_memory": existing_memory,
+            "events": events,
+        }
+        return [
+            {"role": "system", "content": MEMORY_SUMMARY_PROMPT_CONTRACT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+        ]
+
+    @staticmethod
+    def _parse_memory_summary_output(text: str) -> dict[str, Any] | None:
+        cleaned = strip_think_segments(text)
+        try:
+            value = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        if str(value.get("schema") or "").strip() != "scambait.memory.v1":
+            return None
+        required = {
+            "claimed_identity",
+            "narrative",
+            "current_intent",
+            "key_facts",
+            "risk_flags",
+            "open_questions",
+            "next_focus",
+        }
+        if not required.issubset(value.keys()):
+            return None
+        return value
+
+    def ensure_memory_context(self, chat_id: int, force_refresh: bool = False) -> dict[str, Any]:
+        current = self.store.get_memory_context(chat_id=chat_id)
+        if current is not None and not force_refresh:
+            return {"summary": current.summary, "cursor_event_id": current.cursor_event_id, "updated": False}
+        cursor = 0
+        existing_summary = None
+        if current is not None and force_refresh:
+            existing_summary = current.summary
+        token = (getattr(self.config, "hf_token", None) or "").strip()
+        model = (getattr(self.config, "hf_memory_model", None) or "").strip() or "openai/gpt-oss-120b"
+        max_tokens = int(getattr(self.config, "hf_memory_max_tokens", 150000))
+        if not token:
+            # Offline-safe fallback when HF token is unavailable.
+            fallback_summary = {
+                "schema": "scambait.memory.v1",
+                "claimed_identity": {"name": "", "role_claim": "", "confidence": "low"},
+                "narrative": {"phase": "unknown", "short_story": "", "timeline_points": []},
+                "current_intent": {"scammer_intent": "", "baiter_intent": "", "latest_topic": ""},
+                "key_facts": {},
+                "risk_flags": [],
+                "open_questions": [],
+                "next_focus": [],
+            }
+            if current is None or force_refresh:
+                latest = self.store.list_events(chat_id=chat_id, limit=1)
+                latest_id = int(latest[-1].id) if latest else 0
+                saved = self.store.upsert_memory_context(
+                    chat_id=chat_id,
+                    summary=fallback_summary,
+                    cursor_event_id=latest_id,
+                    model=model,
+                )
+                return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
+            return {"summary": fallback_summary, "cursor_event_id": 0, "updated": False}
+
+        events = self.build_memory_events(chat_id=chat_id, after_event_id=cursor)
+        if not events:
+            if current is not None:
+                return {"summary": current.summary, "cursor_event_id": current.cursor_event_id, "updated": False}
+            empty_summary = {
+                "schema": "scambait.memory.v1",
+                "claimed_identity": {"name": "", "role_claim": "", "confidence": "low"},
+                "narrative": {"phase": "empty", "short_story": "", "timeline_points": []},
+                "current_intent": {"scammer_intent": "", "baiter_intent": "", "latest_topic": ""},
+                "key_facts": {},
+                "risk_flags": [],
+                "open_questions": [],
+                "next_focus": [],
+            }
+            saved = self.store.upsert_memory_context(
+                chat_id=chat_id,
+                summary=empty_summary,
+                cursor_event_id=0,
+                model=model,
+            )
+            return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
+
+        messages = self._build_memory_messages(
+            chat_id=chat_id,
+            cursor_event_id=cursor,
+            existing_memory=existing_summary,
+            events=events,
+        )
+        response = call_hf_openai_chat(
+            token=token,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            base_url=(getattr(self.config, "hf_base_url", None) or None),
+        )
+        result_text = extract_result_text(response)
+        parsed = self._parse_memory_summary_output(result_text)
+        if parsed is None:
+            raise RuntimeError("invalid memory summary contract (expected scambait.memory.v1)")
+        latest_cursor = int(events[-1]["event_id"])
+        saved = self.store.upsert_memory_context(
+            chat_id=chat_id,
+            summary=parsed,
+            cursor_event_id=latest_cursor,
+            model=model,
+        )
+        return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
+
+    def build_model_messages(
+        self,
+        chat_id: int,
+        token_limit: int | None = None,
+        force_refresh_memory: bool = False,
+        include_memory: bool = True,
+    ) -> list[dict[str, str]]:
+        prompt_events = self.build_prompt_events(chat_id=chat_id, token_limit=token_limit)
+        memory_state: dict[str, Any] = {"summary": {}, "cursor_event_id": 0, "updated": False}
+        if include_memory:
+            memory_state = self.ensure_memory_context(chat_id=chat_id, force_refresh=force_refresh_memory)
         messages: list[dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT_CONTRACT},
             {
                 "role": "system",
                 "content": (
-                    f"Konversation mit {context.title} (Telegram Chat-ID: {context.chat_id}). "
-                    "Die folgenden Nachrichten sind chronologisch sortiert."
+                    "Memory summary for chat_id="
+                    f"{chat_id}: {json.dumps(memory_state.get('summary') or {}, ensure_ascii=True)}"
                 ),
-            }
+            },
         ]
-
-        if prompt_context:
-            context_json = json.dumps(prompt_context, ensure_ascii=False, indent=2)
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Strukturierter System-Kontext (nur intern, nicht wortwörtlich zitieren):\n"
-                        f"{context_json}"
-                    ),
-                }
-            )
-
-        convo_events: list[dict[str, str]] = []
-        for item in context.messages:
-            ts_utc = item.timestamp.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            event_payload = {
-                "ts_utc": ts_utc,
-                "role": item.role,
-                "sender": ("self" if item.role == "assistant" else item.sender),
-                "text": item.text,
+        for event in prompt_events:
+            payload = {
+                "time": event.get("time"),
+                "role": event.get("role"),
+                "event_type": event.get("event_type"),
+                "text": event.get("text"),
             }
-            if item.message_id is not None:
-                event_payload["message_id"] = item.message_id
-            if item.reply_to is not None:
-                event_payload["reply_to"] = item.reply_to
-            convo_events.append({"role": item.role, "content": json.dumps(event_payload, ensure_ascii=False)})
-
-        if self.config.prompt_middle_trim_enabled:
-            keep_head = max(1, int(self.config.prompt_middle_trim_keep_head))
-            keep_tail = max(1, int(self.config.prompt_middle_trim_keep_tail))
-            max_chars = max(1500, int(self.config.prompt_middle_trim_max_chars))
-            total_chars = sum(len(item.get("content", "")) for item in convo_events)
-            min_events_for_trim = keep_head + keep_tail + 2
-            if total_chars > max_chars and len(convo_events) >= min_events_for_trim:
-                head_slice = convo_events[:keep_head]
-                tail_slice = convo_events[-keep_tail:]
-                omitted_count = max(0, len(convo_events) - len(head_slice) - len(tail_slice))
-                marker = {
-                    "role": "system",
-                    "content": (
-                        f"Kontext gekürzt: {omitted_count} mittlere Nachrichten ausgelassen "
-                        "um Tokenverbrauch zu begrenzen."
-                    ),
-                }
-                convo_events = head_slice + [marker] + tail_slice
-
-        messages.extend(convo_events)
-
+            messages.append({"role": "user", "content": json.dumps(payload, ensure_ascii=True)})
         return messages
 
-    def build_prompt_debug_summary(self, context: ChatContext, max_lines: int = 5) -> str:
-        rendered_messages = [self.render_chat_message(item) for item in context.messages]
-        image_lines = [line for line in rendered_messages if IMAGE_MARKER_PREFIX in line]
-        head_lines = rendered_messages[:max_lines]
-        tail_lines = rendered_messages[-max_lines:] if len(rendered_messages) > max_lines else []
+    def run_hf_dry_run(self, chat_id: int) -> dict[str, Any]:
+        token = (getattr(self.config, "hf_token", None) or "").strip()
+        model = (getattr(self.config, "hf_model", None) or "").strip()
+        if not token or not model:
+            raise RuntimeError("HF_TOKEN/HF_MODEL missing")
+        max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))
 
-        parts = [
-            f"Chat: {context.title} ({context.chat_id})",
-            f"Zeilen gesamt: {len(rendered_messages)}",
-            f"Bildzeilen: {len(image_lines)}",
-        ]
+        attempts: list[dict[str, Any]] = []
+        initial_messages = self.build_model_messages(chat_id=chat_id, include_memory=False)
+        initial_prompt = {"messages": initial_messages, "max_tokens": max_tokens}
 
-        if image_lines:
-            parts.append("Bildzeilen (gekürzt):")
-            for line in image_lines[:max_lines]:
-                parts.append("- " + truncate_for_log(line, max_len=220))
-
-        if head_lines:
-            parts.append("Anfang des Verlaufs:")
-            for line in head_lines:
-                parts.append("- " + truncate_for_log(line, max_len=220))
-
-        if tail_lines:
-            parts.append("Ende des Verlaufs:")
-            for line in tail_lines:
-                parts.append("- " + truncate_for_log(line, max_len=220))
-
-        return "\n".join(parts)
-
-    @staticmethod
-    def render_chat_message(message: ChatMessage) -> str:
-        ts = ScambaiterCore._fmt_dt(message.timestamp)
-        return f"[{ts}] {message.sender}: {message.text}"
-
-    async def _collect_recent_chat_images(
-        self,
-        chat_id: int,
-        limit: int = 3,
-    ) -> list[tuple[int, str, bytes, str]]:
-        messages = await self.client.get_messages(chat_id, limit=max(20, limit * 10))
-        images: list[tuple[int, str, bytes, str]] = []
-        language_hint = self._chat_language_hint(chat_id)
-
-        for message in messages:
-            is_photo = bool(getattr(message, "photo", None))
-            document = getattr(message, "document", None)
-            mime_type = getattr(document, "mime_type", "") if document else ""
-            is_image_document = bool(mime_type and mime_type.startswith("image/"))
-            if not is_photo and not is_image_document:
-                continue
-
-            image_bytes = await self.client.download_media(message, file=bytes)
-            if not image_bytes:
-                continue
-
-            description = await self.describe_image(image_bytes, language_hint=language_hint)
-            if not description:
-                continue
-
-            marker = "photo" if is_photo else f"document:{mime_type}"
-            images.append((int(message.id), marker, image_bytes, description))
-            if len(images) >= limit:
-                break
-
-        return images
-
-    async def describe_recent_images_for_chat(self, chat_id: int, limit: int = 3) -> list[str]:
-        images = await self._collect_recent_chat_images(chat_id, limit=limit)
-        return [
-            f"msg_id={msg_id} ({marker}): {truncate_for_log(description, max_len=300)}"
-            for msg_id, marker, _image_bytes, description in images
-        ]
-
-    async def get_recent_images_with_captions_for_control_channel(
-        self,
-        chat_id: int,
-        limit: int = 3,
-    ) -> list[tuple[bytes, str]]:
-        images = await self._collect_recent_chat_images(chat_id, limit=limit)
-        return [
-            (
-                image_bytes,
-                f"Chat {chat_id} | msg_id={msg_id} ({marker})\nCaption: {description}",
+        try:
+            initial_response = call_hf_openai_chat(
+                token=token,
+                model=model,
+                messages=initial_messages,
+                max_tokens=max_tokens,
+                # Dry run is pinned to HF router to avoid accidental provider drift via HF_BASE_URL.
+                base_url=None,
             )
-            for msg_id, marker, image_bytes, description in images
-        ]
-
-    async def describe_image(self, image_bytes: bytes, language_hint: str | None = None) -> str | None:
-        image_hash = hashlib.sha256(image_bytes).hexdigest()
-        cache_key = image_hash
-        normalized_lang = self._normalize_language_hint(language_hint)
-        if normalized_lang:
-            cache_key = f"{image_hash}:{normalized_lang}"
-        if self.store:
-            cached = self.store.image_description_get(cache_key)
-            if cached and cached.description.strip():
-                cached_description = extract_image_description(cached.description)
-                if cached_description:
-                    if cached_description != cached.description:
-                        self.store.image_description_set(cache_key, cached_description)
-                    return cached_description
-
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        language_instruction = (
-            "Write the description in German. "
-            if normalized_lang == "de"
-            else "Write the description in English. "
-            if normalized_lang == "en"
-            else ""
-        )
-        completion = self.hf_client.chat.completions.create(
-            model=self.config.hf_vision_model,
-            max_tokens=720,
-            messages=[
+            initial_text = extract_result_text(initial_response)
+        except Exception as exc:
+            attempts.append(
                 {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "You are an image captioning assistant. "
-                                "Return final answer only in this exact format: "
-                                "DESCRIPTION: <2-4 complete sentences>. "
-                                f"{language_instruction}"
-                                "Use concrete observable details, keep a benevolent tone, no speculation. "
-                                "Do not include analysis, planning, bullets, or meta text."
-                            ),
-                        },
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
-                    ],
+                    "phase": "initial",
+                    "status": "error",
+                    "accepted": False,
+                    "reject_reason": "provider_error",
+                    "error_message": str(exc),
+                    "prompt_json": initial_prompt,
+                    "response_json": {},
+                    "result_text": "",
                 }
-            ],
+            )
+            return {
+                "provider": "huggingface_openai_compat",
+                "model": model,
+                "prompt_json": initial_prompt,
+                "response_json": {},
+                "result_text": "",
+                "valid_output": False,
+                "parsed_output": None,
+                "error_message": str(exc),
+                "attempts": attempts,
+            }
+
+        parsed = parse_structured_model_output(initial_text)
+        attempts.append(
+            {
+                "phase": "initial",
+                "status": "ok" if parsed is not None else "invalid",
+                "accepted": parsed is not None,
+                "reject_reason": None if parsed is not None else "contract_validation_failed",
+                "error_message": None,
+                "prompt_json": initial_prompt,
+                "response_json": initial_response,
+                "result_text": initial_text,
+            }
         )
-        content = completion.choices[0].message.content
-        raw_description = _normalize_text_content(content).strip()
-        description = extract_image_description(raw_description)
-        if not description:
-            self._debug(f"Ungültige Bildbeschreibung verworfen: {truncate_for_log(raw_description, max_len=600)}")
-            return None
 
-        if self.store:
-            self.store.image_description_set(cache_key, description)
-        return description
+        final_prompt = initial_prompt
+        final_response = initial_response
+        final_text = initial_text
 
-    async def _format_message_line(self, message, my_id: int, dialog_title: str, chat_id: int) -> ChatMessage | None:
-        text = (message.message or "").strip()
-        is_own_message = message.sender_id == my_id
-        sender = "Ich" if is_own_message else dialog_title
-        role: Literal["assistant", "user"] = "assistant" if is_own_message else "user"
-        message_id_raw = getattr(message, "id", None)
-        message_id = int(message_id_raw) if isinstance(message_id_raw, int) else None
-        reply_to = self._extract_reply_to_message_id(message)
-
-        document = getattr(message, "document", None)
-        mime_type = getattr(document, "mime_type", "") if document else ""
-        has_image = bool(getattr(message, "photo", None)) or bool(mime_type and mime_type.startswith("image/"))
-
-        if has_image and message.sender_id != my_id:
-            marker = IMAGE_MARKER_PREFIX + "]"
+        if parsed is None:
+            repair_messages = _build_repair_messages(initial_text)
+            repair_prompt = {"messages": repair_messages, "max_tokens": max_tokens}
             try:
-                image_bytes = await self.client.download_media(message, file=bytes)
-                if image_bytes:
-                    description = await self.describe_image(image_bytes, language_hint=self._chat_language_hint(chat_id))
-                    if description:
-                        marker = f"{IMAGE_MARKER_PREFIX}: {description}]"
-                else:
-                    self._debug(f"Keine Bilddaten heruntergeladen (msg_id={message.id}).")
-            except Exception as exc:
-                self._debug(f"Bildbeschreibung fehlgeschlagen (msg_id={message.id}): {exc}")
-
-            if text:
-                return ChatMessage(
-                    timestamp=message.date,
-                    sender=sender,
-                    role=role,
-                    text=f"{marker} {text}",
-                    message_id=message_id,
-                    reply_to=reply_to,
+                repair_response = call_hf_openai_chat(
+                    token=token,
+                    model=model,
+                    messages=repair_messages,
+                    max_tokens=max_tokens,
+                    base_url=None,
                 )
-            return ChatMessage(
-                timestamp=message.date,
-                sender=sender,
-                role=role,
-                text=marker,
-                message_id=message_id,
-                reply_to=reply_to,
-            )
+                repair_text = extract_result_text(repair_response)
+                repaired = parse_structured_model_output(repair_text)
+                attempts.append(
+                    {
+                        "phase": "repair",
+                        "status": "ok" if repaired is not None else "invalid",
+                        "accepted": repaired is not None,
+                        "reject_reason": None if repaired is not None else "contract_validation_failed",
+                        "error_message": None,
+                        "prompt_json": repair_prompt,
+                        "response_json": repair_response,
+                        "result_text": repair_text,
+                    }
+                )
+                if repaired is not None:
+                    parsed = repaired
+                    final_prompt = repair_prompt
+                    final_response = repair_response
+                    final_text = repair_text
+                else:
+                    final_prompt = repair_prompt
+                    final_response = repair_response
+                    final_text = repair_text
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "phase": "repair",
+                        "status": "error",
+                        "accepted": False,
+                        "reject_reason": "provider_error",
+                        "error_message": str(exc),
+                        "prompt_json": repair_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                    }
+                )
+                return {
+                    "provider": "huggingface_openai_compat",
+                    "model": model,
+                    "prompt_json": repair_prompt,
+                    "response_json": {},
+                    "result_text": "",
+                    "valid_output": False,
+                    "parsed_output": None,
+                    "error_message": str(exc),
+                    "attempts": attempts,
+                }
 
-        if text:
-            return ChatMessage(
-                timestamp=message.date,
-                sender=sender,
-                role=role,
-                text=text,
-                message_id=message_id,
-                reply_to=reply_to,
-            )
-
-        return None
-
-    @staticmethod
-    def _extract_reply_to_message_id(message: object) -> int | None:
-        direct = getattr(message, "reply_to_msg_id", None)
-        if isinstance(direct, int):
-            return direct
-        nested = getattr(message, "reply_to", None)
-        nested_id = getattr(nested, "reply_to_msg_id", None) if nested is not None else None
-        if isinstance(nested_id, int):
-            return nested_id
-        return None
-
-    def generate_suggestion(self, context: ChatContext) -> str:
-        return self.generate_output(context).suggestion
-
-    @staticmethod
-    def build_language_system_prompt(language_hint: str | None = None) -> str | None:
-        if not language_hint:
-            return None
-
-        lang = language_hint.strip().lower()
-        if lang in {"en", "english", "englisch"}:
-            return "You must respond exclusively in English."
-        if lang in {"de", "deutsch", "german"}:
-            return "Du antwortest immer auf Deutsch."
-        return None
-
-    def _chat_language_hint(self, chat_id: int) -> str | None:
-        if not self.store:
-            return None
-        latest = self.store.latest_for_chat(int(chat_id))
-        if not latest or not latest.analysis:
-            return None
-        for key in ("language", "sprache"):
-            value = latest.analysis.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
-
-    @staticmethod
-    def _normalize_language_hint(language_hint: str | None) -> str | None:
-        if not language_hint:
-            return None
-        lang = language_hint.strip().lower()
-        if lang in {"de", "deutsch", "german"}:
-            return "de"
-        if lang in {"en", "english", "englisch"}:
-            return "en"
-        return None
+        return {
+            "provider": "huggingface_openai_compat",
+            "model": model,
+            "prompt_json": final_prompt,
+            "response_json": final_response,
+            "result_text": final_text,
+            "valid_output": parsed is not None,
+            "parsed_output": {
+                "analysis": parsed.analysis,
+                "message": {"text": parsed.suggestion},
+                "actions": parsed.actions,
+                "metadata": parsed.metadata,
+            }
+            if parsed is not None
+            else None,
+            "error_message": None if parsed is not None else "invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)",
+            "attempts": attempts,
+        }
 
     def generate_output(
         self,
         context: ChatContext,
         language_hint: str | None = None,
-        prompt_context: dict[str, object] | None = None,
-        on_warning: Callable[[str], None] | None = None,
-        on_attempt: GenerationAttemptCallback | None = None,
-        on_model_exception: Callable[[ModelExceptionEvent], None] | None = None,
+        prompt_context: dict[str, Any] | None = None,
     ) -> ModelOutput:
-        last_output: ModelOutput | None = None
-        language_system_prompt = self.build_language_system_prompt(language_hint)
-        conversation_messages = self.build_conversation_messages(context, prompt_context=prompt_context)
+        _ = (language_hint, prompt_context)
+        last_text = ""
+        for message in reversed(context.messages):
+            if isinstance(message, dict):
+                candidate = message.get("text")
+                if isinstance(candidate, str) and candidate.strip():
+                    last_text = candidate.strip()
+                    break
+            elif isinstance(message, ChatEvent) and isinstance(message.text, str) and message.text.strip():
+                last_text = message.text.strip()
+                break
+        suggestion = "Noted."
+        if last_text:
+            suggestion = f"Noted: {last_text[:120]}"
 
-        self._debug(
-            f"Generierung gestartet für {context.title} ({context.chat_id}) | language_hint={language_hint!r}"
+        candidate_payload = {
+            "schema": "scambait.llm.v1",
+            "analysis": {},
+            "message": {"text": suggestion},
+            "actions": [{"type": "send_message"}],
+        }
+        raw = json.dumps(candidate_payload, ensure_ascii=True)
+        parsed = parse_structured_model_output(raw)
+        if parsed is not None:
+            return parsed
+
+        # Safety fallback (should be unreachable unless parser contract changes unexpectedly).
+        return ModelOutput(
+            raw=raw,
+            suggestion=suggestion,
+            analysis={},
+            metadata={"schema": "scambait.llm.v1", "fallback": True},
+            actions=[{"type": "noop"}],
         )
-        self._debug(f"System-Prompt (Basis): {truncate_for_log(SYSTEM_PROMPT)}")
-        if language_system_prompt:
-            self._debug(f"System-Prompt (Sprache): {truncate_for_log(language_system_prompt)}")
-        self._debug(f"Conversation-Messages: {truncate_for_log(str(conversation_messages), max_len=3000)}")
-        self._debug("Prompt-Zusammenfassung:\n" + self.build_prompt_debug_summary(context))
-
-        for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
-            messages = self.build_model_messages(
-                context=context,
-                language_hint=language_hint,
-                prompt_context=prompt_context,
-            )
-            if attempt > 1:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Deine letzte Antwort war nicht sendefertig. "
-                            "Gib jetzt ausschließlich ein valides JSON-Objekt zurück "
-                            "mit schema=\"scambait.llm.v1\", analysis als OBJEKT, "
-                            "message.text als nicht-leerem String und actions als nicht-leerem Array. "
-                            "Keine Tool-Calls oder Funktionsaufrufe. "
-                            "Keine Zusatztexte."
-                        ),
-                    }
-                )
-
-            self._debug(f"Model-Request (Versuch {attempt}): {truncate_for_log(str(messages), max_len=2000)}")
-
-            try:
-                completion = self.hf_client.chat.completions.create(
-                    model=self.config.hf_model,
-                    max_tokens=self.config.hf_max_tokens,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                )
-            except Exception as exc:
-                error_detail = format_model_exception_details(exc)
-                print(
-                    f"[ERROR] Model-Request fehlgeschlagen für {context.title} ({context.chat_id}) "
-                    f"in Versuch {attempt}: {error_detail}"
-                )
-                failed_generation = extract_failed_generation_from_exception(exc)
-                if on_model_exception:
-                    try:
-                        prompt_json = json.dumps(messages, ensure_ascii=False, indent=2)
-                    except Exception as prompt_exc:
-                        prompt_json = f"<failed to serialize prompt: {prompt_exc}>"
-                    event = ModelExceptionEvent(
-                        chat_id=context.chat_id,
-                        title=context.title,
-                        attempt_no=attempt,
-                        phase="initial",
-                        prompt_json=prompt_json,
-                        failed_generation=failed_generation,
-                        error_details=error_detail,
-                    )
-                    try:
-                        on_model_exception(event)
-                    except Exception as listener_exc:
-                        self._debug(f"Model exception listener failed: {listener_exc}")
-                if on_attempt:
-                    on_attempt(
-                        {
-                            "attempt_no": attempt,
-                            "phase": "initial",
-                            "parsed_ok": False,
-                            "accepted": False,
-                            "reject_reason": "request_error",
-                            "raw_excerpt": truncate_for_log(failed_generation or "", max_len=1000) if failed_generation else None,
-                            "suggestion": None,
-                            "schema": None,
-                        }
-                    )
-                if on_warning:
-                    tool_name = extract_tool_call_name_from_failed_generation(failed_generation)
-                    if tool_name:
-                        on_warning(
-                            "Modell versuchte unzulässigen Tool-Call "
-                            f"({tool_name}). failed_generation="
-                            f"{truncate_for_log(failed_generation or '', max_len=600)}"
-                        )
-                if failed_generation:
-                    repaired = self._attempt_repair_output(
-                        source_text=failed_generation,
-                        language_system_prompt=language_system_prompt,
-                        on_attempt=on_attempt,
-                        attempt_no=attempt,
-                    )
-                    if repaired is not None:
-                        if on_warning:
-                            short_error = truncate_for_log(error_detail, max_len=500)
-                            source_hint = truncate_for_log(failed_generation, max_len=400)
-                            on_warning(
-                                f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) "
-                                f"nach Request-Fehler. detail={short_error} | source={source_hint}"
-                            )
-                        return repaired
-                if attempt < MAX_GENERATION_ATTEMPTS:
-                    continue
-                raise RuntimeError(
-                    "Model request failed after retries. "
-                    "Details im Log unter [ERROR] Model-Request fehlgeschlagen."
-                ) from exc
-            choice = completion.choices[0]
-            finish_reason = (getattr(choice, "finish_reason", None) or "").strip().lower()
-            usage = getattr(completion, "usage", None)
-            usage_fields = _extract_usage_fields(usage)
-            if usage is not None:
-                self._debug(f"Model-Usage (Versuch {attempt}): {usage}")
-            if finish_reason:
-                self._debug(f"Model-Finish-Reason (Versuch {attempt}): {finish_reason}")
-            if finish_reason == "length":
-                warning_message = (
-                    f"Token-Limit erreicht: Ausgabe für {context.title} ({context.chat_id}) "
-                    f"wurde abgeschnitten (HF_MAX_TOKENS={self.config.hf_max_tokens})."
-                )
-                print(f"[WARN] {warning_message}")
-                if on_warning:
-                    on_warning(warning_message)
-
-            content = choice.message.content
-            raw = _normalize_text_content(content)
-            structured = parse_structured_model_output(raw)
-            if structured is None:
-                if on_attempt:
-                    on_attempt(
-                        {
-                            "attempt_no": attempt,
-                            "phase": "initial",
-                            "parsed_ok": False,
-                            "accepted": False,
-                            "reject_reason": "invalid_json",
-                            "raw_excerpt": truncate_for_log(raw, max_len=1000),
-                            "suggestion": None,
-                            "schema": None,
-                            **usage_fields,
-                        }
-                    )
-                print(
-                    f"[WARN] Keine valide JSON-Ausgabe für {context.title} ({context.chat_id}) in Versuch {attempt}."
-                )
-                repaired = self._attempt_repair_output(
-                    source_text=raw,
-                    language_system_prompt=language_system_prompt,
-                    on_attempt=on_attempt,
-                    attempt_no=attempt,
-                    usage_fields=usage_fields,
-                )
-                if repaired is not None:
-                    if on_warning:
-                        raw_hint = truncate_for_log(raw, max_len=500)
-                        on_warning(
-                            f"Repair-Pfad genutzt für {context.title} ({context.chat_id}) "
-                            f"nach invalidem JSON. source={raw_hint}"
-                        )
-                    return repaired
-                last_output = ModelOutput(raw=raw, suggestion="", analysis=None, metadata={}, actions=[])
-                continue
-
-            suggestion = structured.suggestion.strip()
-            analysis = structured.analysis
-            metadata = structured.metadata
-
-            self._debug(f"Model-Raw-Ausgabe (Versuch {attempt}) für {context.title} ({context.chat_id}): {raw}")
-            self._debug(f"Extrahierte Antwort (Versuch {attempt}) für {context.title} ({context.chat_id}): {suggestion}")
-
-            current_output = ModelOutput(
-                raw=raw,
-                suggestion=suggestion,
-                analysis=analysis,
-                metadata=metadata,
-                actions=structured.actions,
-            )
-            last_output = current_output
-            has_send_message = any(str(action.get("type")) == "send_message" for action in current_output.actions)
-            if has_send_message and suggestion and not looks_like_reasoning_output(suggestion):
-                if on_attempt:
-                    on_attempt(
-                        {
-                            "attempt_no": attempt,
-                            "phase": "initial",
-                            "parsed_ok": True,
-                            "accepted": True,
-                            "reject_reason": None,
-                            "raw_excerpt": truncate_for_log(raw, max_len=1000),
-                            "suggestion": suggestion,
-                            "schema": metadata.get("schema"),
-                            **usage_fields,
-                        }
-                    )
-                return current_output
-            if not has_send_message and (not suggestion or not looks_like_reasoning_output(suggestion)):
-                if on_attempt:
-                    on_attempt(
-                        {
-                            "attempt_no": attempt,
-                            "phase": "initial",
-                            "parsed_ok": True,
-                            "accepted": True,
-                            "reject_reason": None,
-                            "raw_excerpt": truncate_for_log(raw, max_len=1000),
-                            "suggestion": suggestion,
-                            "schema": metadata.get("schema"),
-                            **usage_fields,
-                        }
-                    )
-                return current_output
-
-            print(
-                f"[WARN] Extrahierte Antwort wirkt wie Denkprozess oder ist leer für {context.title} "
-                f"({context.chat_id}) in Versuch {attempt}: {suggestion}"
-            )
-            if on_attempt:
-                on_attempt(
-                    {
-                        "attempt_no": attempt,
-                        "phase": "initial",
-                        "parsed_ok": True,
-                        "accepted": False,
-                        "reject_reason": "reasoning_or_empty",
-                        "raw_excerpt": truncate_for_log(raw, max_len=1000),
-                        "suggestion": suggestion,
-                        "schema": metadata.get("schema"),
-                        **usage_fields,
-                    }
-                )
-
-        if last_output is None:
-            return ModelOutput(raw="", suggestion="", analysis=None, metadata={}, actions=[])
-        return last_output
-
-    def build_model_messages(
-        self,
-        context: ChatContext,
-        language_hint: str | None = None,
-        prompt_context: dict[str, object] | None = None,
-    ) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        language_system_prompt = self.build_language_system_prompt(language_hint)
-        if language_system_prompt:
-            messages.append({"role": "system", "content": language_system_prompt})
-        messages.extend(self.build_conversation_messages(context, prompt_context=prompt_context))
-        return messages
-
-    def _attempt_repair_output(
-        self,
-        source_text: str,
-        language_system_prompt: str | None = None,
-        on_attempt: GenerationAttemptCallback | None = None,
-        attempt_no: int = 0,
-        usage_fields: dict[str, int | None] | None = None,
-    ) -> ModelOutput | None:
-        candidate = (source_text or "").strip()
-        if not candidate:
-            return None
-        if len(candidate) > MAX_REPAIR_SOURCE_CHARS:
-            candidate = candidate[:MAX_REPAIR_SOURCE_CHARS]
-
-        repair_messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "Du bist ein JSON-Reparaturmodul. "
-                    "Gib exakt ein valides JSON-Objekt im geforderten Schema zurück. "
-                    "Keine Erklärungen, kein Markdown."
-                ),
-            }
-        ]
-        if language_system_prompt:
-            repair_messages.append({"role": "system", "content": language_system_prompt})
-        repair_messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Repariere die folgende fehlerhafte Modellausgabe in ein valides JSON-Objekt "
-                    "mit den Top-Level-Feldern schema, analysis, message und actions. "
-                    "schema MUSS exakt \"scambait.llm.v1\" sein. "
-                    "analysis MUSS ein JSON-Objekt sein (kein String). "
-                    "message.text darf leer sein, aber nur wenn keine send_message-Action enthalten ist. "
-                    "actions muss mindestens ein Element enthalten "
-                    "(falls nötig: noop). "
-                    "Jede Action muss ein Objekt mit Pflichtfeld \"type\" sein. "
-                    "Keine Kurzformen wie {\"send_message\":{}}.\n\n"
-                    "Keine Tool-Calls oder Funktionsaufrufe. "
-                    "Verboten sind Strukturen wie {\"name\":\"...\",\"arguments\":{...}}.\n\n"
-                    "Falls eine Wartezeit geplant ist, nutze die Action \"wait\" mit "
-                    "\"value\" und \"unit\" (seconds|minutes).\n\n"
-                    f"Fehlerhafte Ausgabe:\n{candidate}"
-                ),
-            }
-        )
-
-        try:
-            repair_completion = self.hf_client.chat.completions.create(
-                model=self.config.hf_model,
-                max_tokens=self.config.hf_max_tokens,
-                messages=repair_messages,
-                response_format={"type": "json_object"},
-            )
-        except Exception as exc:
-            print(f"[WARN] Repair-Request fehlgeschlagen: {format_model_exception_details(exc)}")
-            return None
-        repair_usage_fields = _extract_usage_fields(getattr(repair_completion, "usage", None))
-        base_usage_fields = dict(usage_fields or {})
-        usage_payload = {**base_usage_fields}
-        for key, value in repair_usage_fields.items():
-            if isinstance(value, int):
-                usage_payload[key] = (usage_payload.get(key) or 0) + value
-
-        repair_raw = _normalize_text_content(repair_completion.choices[0].message.content)
-        repaired = parse_structured_model_output(repair_raw)
-        if repaired is None:
-            print(f"[WARN] Repair-Request lieferte weiterhin invalides JSON: {truncate_for_log(repair_raw, max_len=1200)}")
-            if on_attempt:
-                on_attempt(
-                    {
-                        "attempt_no": attempt_no,
-                        "phase": "repair",
-                        "parsed_ok": False,
-                        "accepted": False,
-                        "reject_reason": "invalid_json",
-                        "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
-                        "suggestion": None,
-                        "schema": None,
-                        **usage_payload,
-                    }
-                )
-            return None
-        has_send_message = any(str(action.get("type")) == "send_message" for action in repaired.actions)
-        if has_send_message and (not repaired.suggestion or looks_like_reasoning_output(repaired.suggestion)):
-            if on_attempt:
-                on_attempt(
-                    {
-                        "attempt_no": attempt_no,
-                        "phase": "repair",
-                        "parsed_ok": True,
-                        "accepted": False,
-                        "reject_reason": "reasoning_or_empty",
-                        "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
-                        "suggestion": repaired.suggestion,
-                        "schema": repaired.metadata.get("schema"),
-                        **usage_payload,
-                    }
-                )
-            return None
-        if not has_send_message and repaired.suggestion and looks_like_reasoning_output(repaired.suggestion):
-            if on_attempt:
-                on_attempt(
-                    {
-                        "attempt_no": attempt_no,
-                        "phase": "repair",
-                        "parsed_ok": True,
-                        "accepted": False,
-                        "reject_reason": "reasoning_output",
-                        "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
-                        "suggestion": repaired.suggestion,
-                        "schema": repaired.metadata.get("schema"),
-                        **usage_payload,
-                    }
-                )
-            return None
-        if on_attempt:
-            on_attempt(
-                {
-                    "attempt_no": attempt_no,
-                    "phase": "repair",
-                    "parsed_ok": True,
-                    "accepted": True,
-                    "reject_reason": None,
-                    "raw_excerpt": truncate_for_log(repair_raw, max_len=1000),
-                    "suggestion": repaired.suggestion,
-                    "schema": repaired.metadata.get("schema"),
-                    **usage_payload,
-                }
-            )
-        return repaired
-
-    async def maybe_send_suggestion(self, context: ChatContext, suggestion: str) -> bool:
-        if not self.config.send_enabled:
-            return False
-        if looks_like_reasoning_output(suggestion):
-            print(
-                f"[WARN] Nachricht für {context.title} ({context.chat_id}) nicht gesendet: extrahierter Text wirkt wie Denkprozess."
-            )
-            return False
-        if not suggestion.strip():
-            print(f"[WARN] Leerer Antwortvorschlag für {context.title} (ID: {context.chat_id}) - Nachricht wird nicht gesendet.")
-            return False
-        await self.send_message_with_optional_delete(context, suggestion)
-        return True
-
-    async def send_message_with_optional_delete(self, context: ChatContext, message: str) -> None:
-        if not message.strip():
-            print(f"[WARN] Leere Nachricht für {context.title} (ID: {context.chat_id}) verworfen.")
-            return
-        sent = await self.client.send_message(context.chat_id, message)
-        print(f"[SEND] Nachricht an {context.title} gesendet (msg_id={sent.id}).")
-        if self.config.delete_after_seconds > 0:
-            await asyncio.sleep(self.config.delete_after_seconds)
-            await self.client.delete_messages(context.chat_id, [sent.id])
-            print(f"[SEND] Nachricht {sent.id} in {context.title} gelöscht.")
-
-    async def maybe_interactive_console_reply(self, context: ChatContext, suggestion: str) -> bool:
-        if not self.config.interactive_enabled:
-            return False
-        if not __import__("os").isatty(0):
-            print("[WARN] Interaktiv-Modus aktiv, aber kein TTY verfügbar.")
-            return False
-
-        print("Aktion: [Enter]=nicht senden | s=Vorschlag senden | e=editieren+senden")
-        choice = input("> ").strip().lower()
-        if choice == "s":
-            await self.send_message_with_optional_delete(context, suggestion)
-            return True
-        if choice == "e":
-            print("Gib deine Nachricht ein (leere Zeile = Abbruch):")
-            custom = input("> ").strip()
-            if custom:
-                await self.send_message_with_optional_delete(context, custom)
-            return True
-        return True
 
     @staticmethod
-    def _fmt_dt(dt: datetime | None) -> str:
-        if dt is None:
-            return "?"
-        return dt.strftime("%Y-%m-%d %H:%M")
-
-
-
-def truncate_for_log(text: str, max_len: int = 1200) -> str:
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + "... [gekürzt]"
-
-
-def strip_think_segments(text: str) -> str:
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
-    return cleaned.replace("<think>", "").replace("</think>", "").strip()
-
-
-def strip_wrapping_quotes(text: str) -> str:
-    pairs = [('"', '"'), ("'", "'")]
-    cleaned = text.strip()
-    changed = True
-    while changed and len(cleaned) >= 2:
-        changed = False
-        for left, right in pairs:
-            if cleaned.startswith(left) and cleaned.endswith(right):
-                cleaned = cleaned[len(left) : -len(right)].strip()
-                changed = True
-                break
-    return cleaned
-
-
-def extract_image_description(text: str) -> str | None:
-    cleaned = strip_think_segments(text)
-
-    # Prefer explicit markers if the model follows instructions.
-    marker_match = re.search(r"(?:^|\n)\s*(?:BESCHREIBUNG|DESCRIPTION)\s*:\s*(.+)", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if marker_match:
-        cleaned = marker_match.group(1).strip()
-
-    # If the model emits preamble + draft in one line, keep only the draft tail.
-    drafting_match = re.search(r"(?:drafting|entwurf|final(?: answer)?|beschreibung)\s*:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if drafting_match:
-        cleaned = drafting_match.group(1).strip()
-
-    raw_lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    if not raw_lines:
-        return None
-
-    filtered: list[str] = []
-    reject_patterns = (
-        r"^(the user wants|let me|looking at the image|now i need|i will|i should|analysis|analyse|reasoning)\b",
-        r"^(description should|bildbeschreibung)\b",
-        r"^(meta|antwort|reply|hinweis|note)\s*:",
-        r"^[-*]\s*",
-    )
-    for line in raw_lines:
-        normalized = line.strip().strip('"').strip("'")
-        if not normalized:
-            continue
-
-        # Drop inline reasoning lead-ins before a colon and keep trailing candidate text.
-        if re.search(r"^(looking at the image|analysis|let me|drafting|entwurf)\s*:", normalized, flags=re.IGNORECASE):
-            parts = normalized.split(":", 1)
-            normalized = parts[1].strip() if len(parts) > 1 else ""
-            if not normalized:
-                continue
-
-        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in reject_patterns):
-            continue
-        filtered.append(normalized)
-
-    if not filtered:
-        return None
-
-    description = " ".join(filtered)
-    description = re.sub(r"\s+", " ", description).strip()
-    description = strip_wrapping_quotes(description)
-    if not description or looks_like_reasoning_output(description):
-        return None
-    return description
-
-
-
-def looks_like_reasoning_output(text: str) -> bool:
-    stripped = text.strip().lower()
-    if not stripped:
-        return True
-    if "<think>" in stripped or "</think>" in stripped:
-        return True
-    reasoning_patterns = (
-        r"^(analyse|analysis|gedanke|thinking|thought|chain[- ]of[- ]thought|schritt\s*\d+)\b",
-        r"^(let me think|i should|zuerst|first|danach|then|abschließend|finally)\b",
-    )
-    return any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in reasoning_patterns)
-
-
-def _find_key_deep(obj: object, key: str) -> object | None:
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj.get(key)
-        for value in obj.values():
-            found = _find_key_deep(value, key)
-            if found is not None:
-                return found
-    elif isinstance(obj, list):
-        for item in obj:
-            found = _find_key_deep(item, key)
-            if found is not None:
-                return found
-    return None
-
-
-def extract_failed_generation_from_exception(exc: Exception) -> str | None:
-    response = getattr(exc, "response", None)
-    if response is None:
-        return None
-    try:
-        payload = response.json()
-    except Exception:
-        return None
-    failed_generation = _find_key_deep(payload, "failed_generation")
-    if isinstance(failed_generation, str):
-        cleaned = failed_generation.strip()
-        return cleaned or None
-    return None
-
-
-def extract_tool_call_name_from_failed_generation(failed_generation: str | None) -> str | None:
-    if not failed_generation:
-        return None
-    try:
-        payload = json.loads(failed_generation)
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    name = payload.get("name")
-    if isinstance(name, str):
-        cleaned = name.strip()
-        return cleaned or None
-    return None
-
-
-def format_model_exception_details(exc: Exception) -> str:
-    parts = [f"{type(exc).__name__}: {exc}"]
-
-    response = getattr(exc, "response", None)
-    if response is not None:
-        status = getattr(response, "status_code", None)
-        if status is not None:
-            parts.append(f"status_code={status}")
-        url = getattr(response, "url", None)
-        if url:
-            parts.append(f"response_url={url}")
-        request = getattr(response, "request", None)
-        if request is not None:
-            method = getattr(request, "method", None)
-            request_url = getattr(request, "url", None)
-            if method:
-                parts.append(f"request_method={method}")
-            if request_url:
-                parts.append(f"request_url={request_url}")
-        headers = getattr(response, "headers", None)
-        if headers:
-            header_dict: dict[str, str] = {}
-            for key, value in headers.items():
-                key_l = str(key).lower()
-                if key_l in {
-                    "x-request-id",
-                    "x-amzn-requestid",
-                    "x-amz-request-id",
-                    "x-trace-id",
-                    "cf-ray",
-                    "content-type",
-                    "content-length",
-                    "date",
-                    "server",
-                }:
-                    header_dict[str(key)] = str(value)
-            if header_dict:
-                parts.append(
-                    "response_headers="
-                    + truncate_for_log(json.dumps(header_dict, ensure_ascii=False), max_len=1200)
-                )
+    def _as_hhmm(ts_utc: str | None) -> str | None:
+        if not ts_utc:
+            return None
         try:
-            payload = response.json()
-            failed_generation = _find_key_deep(payload, "failed_generation")
-            if failed_generation:
-                parts.append(f"failed_generation={truncate_for_log(str(failed_generation), max_len=2500)}")
-            parts.append(f"response_json={truncate_for_log(json.dumps(payload, ensure_ascii=False), max_len=2500)}")
-        except Exception:
-            pass
+            cleaned = ts_utc.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(cleaned)
+            return parsed.astimezone(timezone.utc).strftime("%H:%M")
+        except ValueError:
+            return ts_utc[-8:-3] if len(ts_utc) >= 5 else ts_utc
 
-        text = getattr(response, "text", None)
-        if text:
-            parts.append(f"response_text={truncate_for_log(str(text), max_len=2500)}")
-        content = getattr(response, "content", None)
-        if isinstance(content, (bytes, bytearray)) and content:
-            parts.append(f"response_content_bytes={truncate_for_log(repr(bytes(content)), max_len=1200)}")
+    @classmethod
+    def _trim_prompt_events(cls, events: list[dict[str, Any]], token_limit: int) -> list[dict[str, Any]]:
+        if token_limit <= 0:
+            return []
+        kept_rev: list[dict[str, Any]] = []
+        running = 0
+        # Keep newest events and drop from conversation start when limit is hit.
+        for event in reversed(events):
+            estimated = cls._estimate_tokens(event)
+            if kept_rev and running + estimated > token_limit:
+                break
+            if not kept_rev and estimated > token_limit:
+                # Ensure we keep at least one newest event.
+                kept_rev.append(event)
+                break
+            kept_rev.append(event)
+            running += estimated
+        kept_rev.reverse()
+        return kept_rev
 
-    stack = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-    if stack:
-        parts.append(f"exception_only={truncate_for_log(stack, max_len=800)}")
-    return " | ".join(parts)
+    @staticmethod
+    def _estimate_tokens(event: dict[str, Any]) -> int:
+        text = str(event.get("text") or "")
+        meta = str(event.get("meta") or "")
+        base = len(text) + len(meta) + 24
+        return max(1, base // 4)

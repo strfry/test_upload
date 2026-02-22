@@ -1,9 +1,21 @@
 # Telegram Scambaiter
 
-Das Tool hat jetzt zwei Betriebsarten:
+Scambaiter wird aktuell von der Dokumentation aus neu implementiert. Die Architektur- und Steuerreferenz liegt in einer Reihe von Dokumenten unter `docs/` und wird fortlaufend angepasst, während sich die Codebasis auf diesem Repo entwickelt.
 
-1. **Batch-Modus (Standard):** läuft einmal durch und zeigt Vorschläge an (wie bisher).
-2. **BotAPI-Modus:** läuft dauerhaft im Hintergrund und wird per Telegram-Bot gesteuert.
+## Dokumentation
+
+- `docs/backlog.md` – Priorisiertes Backlog und Guardrail-Ideen; hier landen auch die laufenden Dokumentations-/Review-Aufgaben für Prompt, Memory und Bot-UX.
+- `docs/architecture.md` – Architekturbeschreibung des Scambaiter-Systems und der Komponenten.
+- `docs/implementation_plan.md` – Umsetzungsschritte und Meilensteine für die Neuentwicklung.
+- `docs/client_api_reference.md` – Referenz für Bot-/Control-Channel-Befehle, Payloads und erlaubte Actions.
+- `docs/event_schema_draft.md` – Entwurf für das eventbasierte Prompt/Inputmodell der Telegram-Verläufe.
+- `docs/profile_schema_draft.md` – Schema, wie Chatprofile und Profiländerungen persistiert werden.
+- `docs/prompt_sharpening_report.md` – Stand der Prompt-Nachscharfung, Beobachtungen und zu überprüfende Ideen.
+- `docs/prompt_cases/README.md` und die zugehörigen JSON-Fixtures – strukturierte Prompt-Testfälle (Escalation, No-Repeat, Topic Guard usw.).
+- `docs/card_prompt_rebuild.txt` – Notizen zum Prompt-Card/UIschicht-Relaunch.
+- `docs/scambaiter-relations.md` – Beziehungsübersicht, z. B. welche Services, Skripte und Datenquellen beteiligt sind.
+- `docs/snippets/prompt_konkretheit.txt` – Kürzere Richtlinie zur gewünschten Prompt-Konkretheit.
+- `docs/skills.md` – Sammlung nützlicher Codex-Skills für dieses Projekt.
 
 ## Setup
 
@@ -11,7 +23,7 @@ Das Tool hat jetzt zwei Betriebsarten:
 pip install -r requirements.txt
 ```
 
-Pflicht-Umgebungsvariablen:
+Benötigte Umgebungsvariablen:
 
 ```bash
 export TELEGRAM_API_ID="..."
@@ -22,7 +34,7 @@ export HF_TOKEN="..."
 export HF_MODEL="..."
 export HF_VISION_MODEL="..."          # optional, fallback: HF_MODEL
 export HF_BASE_URL="https://..."       # optional
-export HF_MAX_TOKENS="350"             # optional, längere Modellantworten erlauben
+export HF_MAX_TOKENS="350"             # optional
 ```
 
 Optionale Laufzeit-Konfiguration:
@@ -33,117 +45,99 @@ export SCAMBAITER_HISTORY_LIMIT="20"
 export SCAMBAITER_DEBUG="1"
 
 export SCAMBAITER_SEND="1"
-export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30" # optional
+export SCAMBAITER_DELETE_OWN_AFTER_SECONDS="30"
 
-export SCAMBAITER_INTERACTIVE="1"              # nur Batch-Modus
-export SCAMBAITER_ANALYSIS_DB_PATH="scambaiter.sqlite3"  # Persistenz für Analysen
+export SCAMBAITER_INTERACTIVE="1"
+export SCAMBAITER_ANALYSIS_DB_PATH="scambaiter.sqlite3"
 ```
 
 ## Batch-Modus
 
-Wenn **kein** `SCAMBAITER_BOT_TOKEN` gesetzt ist, läuft das Tool einmal:
+Wenn **kein** `SCAMBAITER_BOT_TOKEN` gesetzt ist, läuft das Tool einmal durch:
 
 ```bash
 python scam_baiter.py
 ```
 
-## BotAPI-Modus (Hintergrund + Steuerung per Telegram)
+## BotAPI-Modus (Control Channel)
 
-Setze zusätzlich einen Bot-Token, dann startet das Tool als dauerhafter Prozess mit Polling:
+Setze einen Bot-Token, dann startet das Tool dauerhaft mit Polling:
 
 ```bash
 export SCAMBAITER_BOT_TOKEN="123456:ABC..."
 export SCAMBAITER_AUTO_INTERVAL_SECONDS="120"
-
 python scam_baiter.py
 ```
 
-Hinweis: Der Control-Chat wird beim Start automatisch über die Telegram-App-API ermittelt. Dazu wird ein Dialog mit dem Bot-Username gesucht; wenn gefunden, wird die eigene User-ID als erlaubter Bot-Chat verwendet. Wenn kein Dialog gefunden wird, bricht der Start mit Fehler ab.
+Der Control-Chat wird automatisch über die Telegram-App-API ermittelt; nach dem Start wird dort eine Begrüßung mit verfügbaren Aktionen gepostet. Die wichtigsten Commands:
 
-Beim Start sendet der Bot außerdem automatisch eine Begrüßungs-/Befehlsübersicht in diesen erlaubten Chat.
-Beim Start im BotAPI-Modus wird der Ordner asynchron über die Telegram-API eingelesen; Vorschlagsgenerierung läuft dabei separat im Hintergrund.
+- `/runonce` – Einzelnen Durchlauf starten
+- `/runonce <chat_id[,chat_id2,...]>` – Gefilterter Lauf
+- `/chats` – Menü für bekannte Chats mit Detailansicht (Generate, Send, Stop, Auto an/aus, Bilder, Analysis)
+- `/last` – Zeigt die letzten Vorschläge (max. 5)
+- `/history` – Listet die zuletzt gespeicherten Events und Analysen
+- `/analysisget`/`/analysisset` – Zugriff auf gespeicherte Analysis-JSONs
 
-Verfügbare Bot-Kommandos:
+Die Prompt Card im Control-Chat bietet jetzt zusätzlich eine eigene **Prompt**-Ansicht: dort sieht man die JSON-Nachricht, die an das Modell geschickt wird (Memory Summary + `model_messages`), neben den bisherigen Schema/Analysis/Message/Actions/Raw-Ansichten.
 
-- `/runonce` – startet sofort einen Einmaldurchlauf
-- `/runonce <chat_id[,chat_id2,...]>` – Einmaldurchlauf nur für bestimmte Chat-IDs
-- `/chats` – zeigt ein paginiertes Chat-Menü; pro Chat öffnet sich ein Detailmenü mit den neuesten Infos und Aktionen `Generate`, `Send`, `Stop`, `Auto an`, `Auto aus`, `Bilder`, `Analysis`
-  - Beim Start im Bot-Modus wird dieses Menü automatisch gepostet
-  - Beim Öffnen eines Chats wird eine Profil-Card mit Profilbild (falls vorhanden) als Bot-Nachricht gepostet
-  - `Refresh` startet den Hintergrund-Refresh und aktualisiert die Liste ohne blockierenden Vollscan im Handler
-  - Das Menü bleibt stabil: Aktionen aktualisieren diese Card-Ansicht (Caption + Buttons) und behalten Navigation (`Zurueck`, `Aktualisieren`) bei
-  - **Generate** erzeugt immer einen neuen Antwort-Vorschlag und setzt den Nachrichtenprozess auf **Wartephase**
-  - Fehlt ein Vorschlag, wird beim Öffnen der Detailansicht automatisch eine Generierung gestartet
-  - **Send** löst das Senden aus (manueller Trigger)
-  - **Stop** bricht den laufenden Prozess ab; falls die Nachricht bereits versendet wurde, wird sie gelöscht
-  - **Auto an** aktiviert das automatische Senden nach Wartezeit nur für diesen Chat
-  - **Auto aus** deaktiviert das automatische Senden für diesen Chat (Wartephase bleibt unbegrenzt)
-  - **Bilder** postet die letzten Chat-Bilder mit KI-Caption in den Kontrollkanal
-  - Mit **Auto an** läuft die Wartephase dieses Chats mit Timeout (`SCAMBAITER_AUTO_INTERVAL_SECONDS`), mit **Auto aus** unbegrenzt
-- `/last` – zeigt die letzten Vorschläge (max. 5) für Analyse/Einblick
-- `/history` – zeigt die letzten persistent gespeicherten Analysen inkl. Metadaten (lange Ausgaben werden in mehrere Nachrichten aufgeteilt)
-- `/analysisget <scammer_chat_id>` – zeigt das zuletzt gespeicherte Analysis-JSON für einen Chat
-- `/analysisset <scammer_chat_id> <json_objekt>` – überschreibt das zuletzt gespeicherte Analysis-JSON für einen Chat
+## Tests
 
-Hinweis: Nach jedem Lauf wird das vom Modell gelieferte `analysis`-Objekt direkt als JSON gespeichert.
-Eingehende Bildnachrichten vom Scammer werden automatisch mit `HF_VISION_MODEL` ausführlich und wohlwollend beschrieben und als Marker (`[Bild gesendet: ...]`) in den Chatverlauf für die Textgenerierung eingefügt.
-Die Bildbeschreibung wird per Bild-Hash in der SQLite-DB (`image_descriptions`) gecacht, damit jedes identische Bild nur einmal an das Vision-Modell geschickt wird.
-Wenn in der letzten gespeicherten Analyse ein `language`- oder `sprache`-Feld gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
+Dev-Setup:
 
-## Dokumentation
+```bash
+python3 -m pip install -r requirements-dev.txt
+```
 
-- `docs/backlog.md` – prioritisiertes Backlog und Guardrail-Ideen (inklusive der aktuellen Dokumentations-Echtzeitaufgaben); dieses README verweist dorthin für Kontext.
-- `docs/event_schema_draft.md` – Entwurf für das Event-/Promptschema, wie wir Telegram-Verläufe modellieren.
-- `docs/prompt_cases/README.md` (+JSON-Fixtures) – Einsatzfälle für Prompt-Tests (Escalation, No-Repeat, Topic Guard und mehr).
-- `docs/snippets/prompt_konkretheit.txt` – prägnante Prompt-Richtlinien („Konkretheit“), die bei der Prompt-Feinjustierung helfen.
+Tests ausführen:
+
+```bash
+python3 -m pytest -q
+```
+
+oder über den Repo-Runner:
+
+```bash
+python3 scripts/run_tests.py -q
+```
 
 ## Projektstruktur
 
-Zur Trennung der Concerns wurde der Code aufgeteilt:
-
-- `scam_baiter.py`: Einstieg und Modus-Umschaltung
-- `scambaiter/config.py`: Umgebungsvariablen/Config
-- `scambaiter/core.py`: Telegram- und HF-Kernlogik
-- `scambaiter/service.py`: Hintergrund-Loop + Laufstatus
-- `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos (inkl. Prompt Card mit neuer “Prompt” Ansicht, die den JSON-Prompt + Memory Summary anzeigt)
-- `scambaiter/storage.py`: SQLite-Persistenz für Analysen und Bildbeschreibungen
-- `scripts/prompt_runner.py`: lokaler Prompt-Runner (Prompt/Raw/Parsed) für schnelle Iteration
-- `scripts/loop_analyzer.py`: analysiert gepastete Verläufe auf Loop-Muster (Wiederholungsfragen/Themen-Drift)
-- `scripts/prompt_cli.py` & `scripts/history_cli.py`: Werkzeuge für Prompt/Memory/History-Inspektionen (`--history`, `--model-view`, `--memory`, `--refresh-memory`, `--max-tokens`) plus Chatliste mithilfe gespeicherter Profile.
-- `scripts/telethon_forward_helper.py`: Hilfsskript, um ganze Chats über eine Telethon-Session in den Control-Chat weiterzuleiten (nützlich für Langzeit-Tests).
-
-
-- Für unbeantwortete Chats wird beim Öffnen von `/chats` asynchron ein Vorschlag vorgezogen, damit die Chatliste sofort erscheint.
-
-Nachrichtenzustände im BotInterface:
-- `generating`: Vorschlag wird gerade erzeugt
-- `waiting`: Vorschlag erzeugt, wartet auf manuellen Send-Trigger oder Auto-Timeout
-- `sending_typing`: Senden läuft, inkl. Tippbenachrichtigung
-- `sent`: Nachricht wurde gesendet
-- `cancelled`: Vorgang per Stop abgebrochen (inkl. ggf. Löschung beim Empfänger)
-- `error`: Senden fehlgeschlagen oder nicht möglich
+- `scam_baiter.py`: Einstieg und Modusumschaltung
+- `scambaiter/config.py`: Umgebungskonfiguration
+- `scambaiter/core.py`: Kernlogik für Telegram/Model
+- `scambaiter/service.py`: Laufzeit-Loop und Scheduling
+- `scambaiter/bot_api.py`: Telegram-Bot, Prompt Card und Inline-Views
+- `scambaiter/storage.py`: SQLite-Store für Events, Analysen, Memory Context
+- `scambaiter/forward_meta.py`: Helfer für Namen/Metadaten aus Forward-Messages
+- `scambaiter/model_client.py`: HF/OpenAI-Client und Ergebnisparser
+- `scripts/prompt_runner.py`: Prompt-Interpretation und künftige C2-Tests
+- `scripts/prompt_cli.py` / `scripts/history_cli.py`: CLI-Inspektion für Prompt/Memory/History (`--history`, `--model-view`, `--memory`, `--refresh-memory`, `--max-tokens`) inklusive profilgestützter Chatliste
+- `scripts/forward_profile_cli.py`: CLI zum Extrahieren von Profilinformationen aus Beispielen
+- `scripts/run_control_bot.py`: Startet den BotAPI-Modus
+- `scripts/run_tests.py`: Wrapper für Entwicklertests
+- `scripts/dry_run_cli.py`: Testet prompt + response offline
+- `scripts/telethon_forward_helper.py`: Telethon-Helfer zum automatisierten Weiterleiten kompletter Chats (für Langzeit-Tests)
+- `scripts/loop_analyzer.py`: Analysiert Verläufe auf Loops/Wiederholungen
 
 ## Prompt-Runner
 
-Lokaler Testlauf für Prompt/Modelausgabe:
+Lokale Prompt/Modellausgabe testen:
 
 ```bash
 python scripts/prompt_runner.py --chat-id 123456789 --show-prompt
 ```
 
-Ohne Telegram-Verbindung (kollidiert nicht mit laufendem Bot), mit Fixture-Datei:
-
 ```bash
 python scripts/prompt_runner.py --input-json ./case.json --show-prompt
 ```
 
-Nur Prompt ansehen, ohne Modell-Request:
+Prompt ohne Modell-Request anzeigen:
 
 ```bash
 python scripts/prompt_runner.py --input-json ./case.json --show-prompt --preview-only
 ```
 
-Request-Body für externen Model-Call exportieren (z.B. auf einem Host mit Internet):
+Request-Body exportieren:
 
 ```bash
 python scripts/prompt_runner.py \
@@ -153,13 +147,13 @@ python scripts/prompt_runner.py \
   --print-curl
 ```
 
-Gesprächs-Loop analysieren (JSON-Case):
+Loop-Analyse (JSON-Case):
 
 ```bash
 python scripts/loop_analyzer.py --input-json docs/prompt_cases/no_repeat_validator_contact.json
 ```
 
-Gesprächs-Loop analysieren (Paste-Textdatei):
+Loop-Analyse (Paste-Text):
 
 ```bash
 python scripts/loop_analyzer.py \
@@ -168,10 +162,7 @@ python scripts/loop_analyzer.py \
   --output-json /tmp/loop_report.json
 ```
 
-Hinweis: Für Telegram-Kopierformat (`Name, [Datum Uhrzeit]`) den eigenen Sendernamen per
-`--assistant-sender` angeben (bei Bedarf mehrfach).
-
-Direkt ins Tool pasten bis EOF (Ctrl+D):
+Direkt ins Tool bis EOF (Ctrl+D):
 
 ```bash
 python scripts/loop_analyzer.py --transcript-stdin --assistant-sender "Me"

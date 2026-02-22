@@ -3,530 +3,820 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 
-@dataclass
+ALLOWED_EVENT_TYPES = {"message", "photo", "forward", "typing_interval"}
+ALLOWED_ROLES = {"manual", "scammer", "scambaiter", "system"}
+
+
+@dataclass(slots=True)
 class StoredAnalysis:
-    created_at: datetime
+    id: int
     chat_id: int
     title: str
     suggestion: str
-    analysis: dict[str, object] | None
-    actions: list[dict[str, object]] | None
-    metadata: dict[str, str]
+    analysis: dict[str, Any]
+    actions: list[dict[str, Any]]
+    metadata: dict[str, Any]
+    created_at: str
 
 
-@dataclass
-class StoredImageDescription:
-    image_hash: str
-    description: str
-    updated_at: datetime
-
-
-@dataclass
-class StoredKnownChat:
-    chat_id: int
-    title: str
-    updated_at: datetime
-
-
-@dataclass
-class StoredDirective:
+@dataclass(slots=True)
+class Directive:
     id: int
     chat_id: int
     text: str
     scope: str
     active: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: str
 
 
-@dataclass
-class StoredGenerationAttempt:
+@dataclass(slots=True)
+class EventRecord:
     id: int
-    created_at: datetime
     chat_id: int
-    title: str
-    trigger: str
+    event_type: str
+    role: str
+    text: str | None
+    ts_utc: str | None
+    source_message_id: str | None
+    meta: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ChatProfile:
+    chat_id: int
+    snapshot: dict[str, Any]
+    last_source: str
+    last_updated_at: str
+
+
+@dataclass(slots=True)
+class ProfileChange:
+    id: int
+    chat_id: int
+    field_path: str
+    old_value: Any
+    new_value: Any
+    source: str
+    changed_at: str
+
+
+@dataclass(slots=True)
+class GenerationAttempt:
+    id: int
+    chat_id: int
+    provider: str
+    model: str
+    prompt_json: dict[str, Any]
+    response_json: dict[str, Any]
+    result_text: str
+    status: str
+    error_message: str | None
     attempt_no: int
     phase: str
-    parsed_ok: bool
     accepted: bool
     reject_reason: str | None
-    heuristic_score: float | None
-    heuristic_flags: list[str]
-    raw_excerpt: str | None
-    suggestion: str | None
-    schema: str | None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    total_tokens: int | None = None
-    reasoning_tokens: int | None = None
+    created_at: str
+
+
+@dataclass(slots=True)
+class MemoryContext:
+    chat_id: int
+    summary: dict[str, Any]
+    cursor_event_id: int
+    model: str
+    last_updated_at: str
 
 
 class AnalysisStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._init_db()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(db_path)
+        self._conn.row_factory = sqlite3.Row
+        self._create_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS analyses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL,
-                    chat_id INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    suggestion TEXT NOT NULL,
-                    analysis TEXT,
-                    actions_json TEXT,
-                    metadata_json TEXT
-                )
-                """
+    def _create_schema(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                suggestion TEXT NOT NULL,
+                analysis_json TEXT NOT NULL,
+                actions_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
-            self._ensure_column(conn, "analyses", "actions_json", "TEXT")
-            self._ensure_column(conn, "analyses", "metadata_json", "TEXT")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS image_descriptions (
-                    image_hash TEXT PRIMARY KEY,
-                    description TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS directives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS directives (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER NOT NULL,
-                    text TEXT NOT NULL,
-                    scope TEXT NOT NULL DEFAULT 'session',
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                role TEXT NOT NULL,
+                text TEXT,
+                ts_utc TEXT,
+                source_message_id TEXT,
+                meta_json TEXT NOT NULL
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_directives_chat_active ON directives (chat_id, active, id DESC)"
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_chat_source
+            ON events(chat_id, source_message_id)
+            WHERE source_message_id IS NOT NULL
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_profiles (
+                chat_id INTEGER PRIMARY KEY,
+                snapshot_json TEXT NOT NULL,
+                last_source TEXT NOT NULL,
+                last_updated_at TEXT NOT NULL
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS generation_attempts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL,
-                    chat_id INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    trigger TEXT NOT NULL,
-                    attempt_no INTEGER NOT NULL,
-                    phase TEXT NOT NULL,
-                    parsed_ok INTEGER NOT NULL,
-                    accepted INTEGER NOT NULL,
-                    reject_reason TEXT,
-                    heuristic_score REAL,
-                    heuristic_flags_json TEXT,
-                    raw_excerpt TEXT,
-                    suggestion TEXT,
-                    schema TEXT,
-                    prompt_tokens INTEGER,
-                    completion_tokens INTEGER,
-                    total_tokens INTEGER,
-                    reasoning_tokens INTEGER
-                )
-                """
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profile_change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                field_path TEXT NOT NULL,
+                old_value_json TEXT NOT NULL,
+                new_value_json TEXT NOT NULL,
+                source TEXT NOT NULL,
+                changed_at TEXT NOT NULL
             )
-            self._ensure_column(conn, "generation_attempts", "prompt_tokens", "INTEGER")
-            self._ensure_column(conn, "generation_attempts", "completion_tokens", "INTEGER")
-            self._ensure_column(conn, "generation_attempts", "total_tokens", "INTEGER")
-            self._ensure_column(conn, "generation_attempts", "reasoning_tokens", "INTEGER")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_generation_attempts_chat_id_id ON generation_attempts (chat_id, id DESC)"
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generation_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_json TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                result_text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                attempt_no INTEGER NOT NULL DEFAULT 1,
+                phase TEXT NOT NULL DEFAULT 'initial',
+                accepted INTEGER NOT NULL DEFAULT 0,
+                reject_reason TEXT,
+                created_at TEXT NOT NULL
             )
-
-    @staticmethod
-    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-        existing = {row[1] for row in rows}
-        if column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_contexts (
+                chat_id INTEGER PRIMARY KEY,
+                summary_json TEXT NOT NULL,
+                cursor_event_id INTEGER NOT NULL DEFAULT 0,
+                model TEXT NOT NULL,
+                last_updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._ensure_generation_attempt_columns()
+        # Legacy cleanup: older builds embedded source labels in profile_update text.
+        # Normalize persisted rows so views stay clean without data loss.
+        self._conn.execute(
+            """
+            UPDATE events
+            SET text = TRIM(REPLACE(text, ' (botapi_forward)', ''))
+            WHERE role = 'system'
+              AND event_type = 'message'
+              AND text LIKE 'profile_update:%(botapi_forward)%'
+            """
+        )
+        self._conn.commit()
 
     def save(
         self,
-        *,
         chat_id: int,
         title: str,
         suggestion: str,
-        analysis: dict[str, object] | None,
-        actions: list[dict[str, object]] | None,
-        metadata: dict[str, str],
-    ) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        analysis_json = json.dumps(analysis, ensure_ascii=False) if isinstance(analysis, dict) else None
-        actions_json = json.dumps(actions, ensure_ascii=False) if isinstance(actions, list) else None
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO analyses (created_at, chat_id, title, suggestion, analysis, actions_json, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    now,
-                    chat_id,
-                    title,
-                    suggestion,
-                    analysis_json,
-                    actions_json,
-                    json.dumps(metadata, ensure_ascii=False),
-                ),
-            )
-
-    def latest(self, limit: int = 5) -> list[StoredAnalysis]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT created_at, chat_id, title, suggestion, analysis, actions_json, metadata_json
-                FROM analyses
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [
-            StoredAnalysis(
-                created_at=datetime.fromisoformat(row[0]),
-                chat_id=int(row[1]),
-                title=str(row[2]),
-                suggestion=str(row[3]),
-                analysis=self._decode_analysis(row[4]),
-                actions=self._decode_actions(row[5]),
-                metadata=self._decode_metadata(row[6]),
-            )
-            for row in rows
-        ]
+        analysis: dict[str, Any] | None,
+        actions: list[dict[str, Any]] | None,
+        metadata: dict[str, Any] | None,
+    ) -> int:
+        ts_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        cur = self._conn.execute(
+            """
+            INSERT INTO analyses(chat_id, title, suggestion, analysis_json, actions_json, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                title,
+                suggestion,
+                json.dumps(analysis or {}, ensure_ascii=True),
+                json.dumps(actions or [], ensure_ascii=True),
+                json.dumps(metadata or {}, ensure_ascii=True),
+                ts_utc,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
 
     def latest_for_chat(self, chat_id: int) -> StoredAnalysis | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT created_at, chat_id, title, suggestion, analysis, actions_json, metadata_json
-                FROM analyses
-                WHERE chat_id = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (chat_id,),
-            ).fetchone()
-        if not row:
+        row = self._conn.execute(
+            """
+            SELECT id, chat_id, title, suggestion, analysis_json, actions_json, metadata_json, created_at
+            FROM analyses
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
             return None
         return StoredAnalysis(
-            created_at=datetime.fromisoformat(row[0]),
-            chat_id=int(row[1]),
-            title=str(row[2]),
-            suggestion=str(row[3]),
-            analysis=self._decode_analysis(row[4]),
-            actions=self._decode_actions(row[5]),
-            metadata=self._decode_metadata(row[6]),
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            title=str(row["title"]),
+            suggestion=str(row["suggestion"]),
+            analysis=self._loads_dict(row["analysis_json"]),
+            actions=self._loads_list(row["actions_json"]),
+            metadata=self._loads_dict(row["metadata_json"]),
+            created_at=str(row["created_at"]),
         )
 
-    def update_latest_analysis(self, chat_id: int, analysis: dict[str, object]) -> bool:
-        serialized = json.dumps(analysis, ensure_ascii=False)
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT id FROM analyses WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
-                (chat_id,),
-            ).fetchone()
-            if not row:
-                return False
-            conn.execute("UPDATE analyses SET analysis = ? WHERE id = ?", (serialized, int(row[0])))
-            return True
+    def add_directive(self, chat_id: int, text: str, scope: str = "chat") -> Directive:
+        ts_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        cur = self._conn.execute(
+            """
+            INSERT INTO directives(chat_id, text, scope, active, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (chat_id, text, scope, ts_utc),
+        )
+        self._conn.commit()
+        return Directive(
+            id=int(cur.lastrowid),
+            chat_id=chat_id,
+            text=text,
+            scope=scope,
+            active=True,
+            created_at=ts_utc,
+        )
 
-    def list_known_chats(self, limit: int = 50) -> list[StoredKnownChat]:
-        with self._connect() as conn:
-            rows = conn.execute(
+    def list_directives(self, chat_id: int, active_only: bool = True, limit: int = 50) -> list[Directive]:
+        if active_only:
+            rows = self._conn.execute(
                 """
-                SELECT a.chat_id, a.title, MAX(a.created_at) AS updated_at
-                FROM analyses a
-                GROUP BY a.chat_id
-                ORDER BY updated_at DESC
+                SELECT id, chat_id, text, scope, active, created_at
+                FROM directives
+                WHERE chat_id = ? AND active = 1
+                ORDER BY id DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (chat_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT id, chat_id, text, scope, active, created_at
+                FROM directives
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
             ).fetchall()
         return [
-            StoredKnownChat(
-                chat_id=int(row[0]),
-                title=str(row[1]),
-                updated_at=datetime.fromisoformat(row[2]),
+            Directive(
+                id=int(row["id"]),
+                chat_id=int(row["chat_id"]),
+                text=str(row["text"]),
+                scope=str(row["scope"]),
+                active=bool(row["active"]),
+                created_at=str(row["created_at"]),
             )
             for row in rows
         ]
 
-    def add_directive(self, chat_id: int, text: str, scope: str = "session") -> StoredDirective | None:
-        clean_text = text.strip()
-        clean_scope = scope.strip().lower() or "session"
-        if not clean_text:
-            return None
-        now = datetime.now().isoformat(timespec="seconds")
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO directives (chat_id, text, scope, active, created_at, updated_at)
-                VALUES (?, ?, ?, 1, ?, ?)
-                """,
-                (int(chat_id), clean_text, clean_scope, now, now),
-            )
-            row_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-            row = conn.execute(
-                """
-                SELECT id, chat_id, text, scope, active, created_at, updated_at
-                FROM directives
-                WHERE id = ?
-                """,
-                (row_id,),
-            ).fetchone()
-        if not row:
-            return None
-        return StoredDirective(
-            id=int(row[0]),
-            chat_id=int(row[1]),
-            text=str(row[2]),
-            scope=str(row[3]),
-            active=bool(int(row[4])),
-            created_at=datetime.fromisoformat(row[5]),
-            updated_at=datetime.fromisoformat(row[6]),
+    def deactivate_directive(self, directive_id: int) -> None:
+        self._conn.execute("UPDATE directives SET active = 0 WHERE id = ?", (directive_id,))
+        self._conn.commit()
+
+    def ingest_event(
+        self,
+        chat_id: int,
+        event_type: str,
+        role: str,
+        text: str | None = None,
+        ts_utc: str | None = None,
+        source_message_id: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> EventRecord:
+        if event_type not in ALLOWED_EVENT_TYPES:
+            raise ValueError(f"unsupported event_type: {event_type}")
+        if role not in ALLOWED_ROLES:
+            raise ValueError(f"unsupported role: {role}")
+        timestamp = ts_utc if ts_utc is not None else ""
+        payload = json.dumps(meta or {}, ensure_ascii=True)
+        cur = self._conn.execute(
+            """
+            INSERT INTO events(chat_id, event_type, role, text, ts_utc, source_message_id, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, event_type, role, text, timestamp, source_message_id, payload),
+        )
+        self._conn.commit()
+        return EventRecord(
+            id=int(cur.lastrowid),
+            chat_id=chat_id,
+            event_type=event_type,
+            role=role,
+            text=text,
+            ts_utc=timestamp,
+            source_message_id=source_message_id,
+            meta=meta or {},
         )
 
-    def list_directives(self, chat_id: int, active_only: bool = True, limit: int = 50) -> list[StoredDirective]:
-        query = (
+    def ingest_user_forward(
+        self,
+        chat_id: int,
+        event_type: str,
+        text: str | None,
+        source_message_id: str,
+        role: str = "manual",
+        ts_utc: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> EventRecord:
+        row = self._conn.execute(
+            "SELECT id, chat_id, event_type, role, text, ts_utc, source_message_id, meta_json FROM events WHERE chat_id = ? AND source_message_id = ?",
+            (chat_id, source_message_id),
+        ).fetchone()
+        if row:
+            return EventRecord(
+                id=int(row["id"]),
+                chat_id=int(row["chat_id"]),
+                event_type=str(row["event_type"]),
+                role=str(row["role"]),
+                text=row["text"],
+                ts_utc=row["ts_utc"],
+                source_message_id=row["source_message_id"],
+                meta=self._loads_dict(row["meta_json"]),
+            )
+        # Forwarded events keep their original event_type.
+        return self.ingest_event(
+            chat_id=chat_id,
+            event_type=event_type,
+            role=role,
+            text=text,
+            ts_utc=ts_utc,
+            source_message_id=source_message_id,
+            meta=meta,
+        )
+
+    def list_events(self, chat_id: int, limit: int = 500) -> list[EventRecord]:
+        rows = self._conn.execute(
             """
-            SELECT id, chat_id, text, scope, active, created_at, updated_at
-            FROM directives
+            SELECT id, chat_id, event_type, role, text, ts_utc, source_message_id, meta_json
+            FROM events
             WHERE chat_id = ?
-            """
-        )
-        params: list[object] = [int(chat_id)]
-        if active_only:
-            query += " AND active = 1"
-        query += " ORDER BY id DESC LIMIT ?"
-        params.append(int(limit))
-        with self._connect() as conn:
-            rows = conn.execute(query, tuple(params)).fetchall()
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
         return [
-            StoredDirective(
-                id=int(row[0]),
-                chat_id=int(row[1]),
-                text=str(row[2]),
-                scope=str(row[3]),
-                active=bool(int(row[4])),
-                created_at=datetime.fromisoformat(row[5]),
-                updated_at=datetime.fromisoformat(row[6]),
+            EventRecord(
+                id=int(row["id"]),
+                chat_id=int(row["chat_id"]),
+                event_type=str(row["event_type"]),
+                role=str(row["role"]),
+                text=row["text"],
+                ts_utc=row["ts_utc"],
+                source_message_id=row["source_message_id"],
+                meta=self._loads_dict(row["meta_json"]),
             )
             for row in rows
         ]
 
-    def delete_directive(self, chat_id: int, directive_id: int) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT id FROM directives WHERE id = ? AND chat_id = ? LIMIT 1",
-                (int(directive_id), int(chat_id)),
-            ).fetchone()
-            if not row:
-                return False
-            conn.execute("DELETE FROM directives WHERE id = ?", (int(directive_id),))
-            return True
+    def clear_chat_history(self, chat_id: int) -> int:
+        cur = self._conn.execute("DELETE FROM events WHERE chat_id = ?", (chat_id,))
+        self._conn.commit()
+        deleted = cur.rowcount
+        if deleted is None or deleted < 0:
+            return 0
+        return int(deleted)
+
+    def clear_chat_context(self, chat_id: int) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        table_map = {
+            "events": "events",
+            "analyses": "analyses",
+            "directives": "directives",
+            "generation_attempts": "generation_attempts",
+            "profile_changes": "profile_change_log",
+            "chat_profile": "chat_profiles",
+            "memory_context": "memory_contexts",
+        }
+        for label, table in table_map.items():
+            cur = self._conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
+            rowcount = cur.rowcount
+            counts[label] = int(rowcount) if isinstance(rowcount, int) and rowcount > 0 else 0
+        self._conn.commit()
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def list_chat_ids(self, limit: int = 100) -> list[int]:
+        rows = self._conn.execute(
+            """
+            SELECT chat_id
+            FROM (
+                SELECT DISTINCT chat_id AS chat_id FROM events
+                UNION
+                SELECT DISTINCT chat_id AS chat_id FROM analyses
+                UNION
+                SELECT DISTINCT chat_id AS chat_id FROM chat_profiles
+                UNION
+                SELECT DISTINCT chat_id AS chat_id FROM memory_contexts
+            )
+            ORDER BY chat_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [int(row["chat_id"]) for row in rows]
+
+    def get_memory_context(self, chat_id: int) -> MemoryContext | None:
+        row = self._conn.execute(
+            """
+            SELECT chat_id, summary_json, cursor_event_id, model, last_updated_at
+            FROM memory_contexts
+            WHERE chat_id = ?
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MemoryContext(
+            chat_id=int(row["chat_id"]),
+            summary=self._loads_dict(row["summary_json"]),
+            cursor_event_id=int(row["cursor_event_id"]),
+            model=str(row["model"]),
+            last_updated_at=str(row["last_updated_at"]),
+        )
+
+    def upsert_memory_context(
+        self,
+        chat_id: int,
+        summary: dict[str, Any],
+        cursor_event_id: int,
+        model: str,
+        last_updated_at: str | None = None,
+    ) -> MemoryContext:
+        ts = last_updated_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._conn.execute(
+            """
+            INSERT INTO memory_contexts(chat_id, summary_json, cursor_event_id, model, last_updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                summary_json = excluded.summary_json,
+                cursor_event_id = excluded.cursor_event_id,
+                model = excluded.model,
+                last_updated_at = excluded.last_updated_at
+            """,
+            (chat_id, json.dumps(summary, ensure_ascii=True), int(cursor_event_id), model, ts),
+        )
+        self._conn.commit()
+        return MemoryContext(
+            chat_id=chat_id,
+            summary=summary,
+            cursor_event_id=int(cursor_event_id),
+            model=model,
+            last_updated_at=ts,
+        )
+
+    def clear_memory_context(self, chat_id: int) -> int:
+        cur = self._conn.execute("DELETE FROM memory_contexts WHERE chat_id = ?", (chat_id,))
+        self._conn.commit()
+        rowcount = cur.rowcount
+        return int(rowcount) if isinstance(rowcount, int) and rowcount > 0 else 0
+
+    def get_chat_profile(self, chat_id: int) -> ChatProfile | None:
+        row = self._conn.execute(
+            """
+            SELECT chat_id, snapshot_json, last_source, last_updated_at
+            FROM chat_profiles
+            WHERE chat_id = ?
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ChatProfile(
+            chat_id=int(row["chat_id"]),
+            snapshot=self._loads_dict(row["snapshot_json"]),
+            last_source=str(row["last_source"]),
+            last_updated_at=str(row["last_updated_at"]),
+        )
+
+    def upsert_chat_profile(
+        self,
+        chat_id: int,
+        patch: dict[str, Any],
+        source: str,
+        changed_at: str | None = None,
+    ) -> list[ProfileChange]:
+        existing = self.get_chat_profile(chat_id)
+        base = existing.snapshot if existing else {}
+        merged = self._deep_merge_dicts(base, patch)
+        old_flat = self._flatten_dict(base)
+        new_flat = self._flatten_dict(merged)
+        keys = set(old_flat.keys()) | set(new_flat.keys())
+        ts = changed_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        changes: list[ProfileChange] = []
+        for key in sorted(keys):
+            old_value = old_flat.get(key)
+            new_value = new_flat.get(key)
+            if old_value == new_value:
+                continue
+            cur = self._conn.execute(
+                """
+                INSERT INTO profile_change_log(chat_id, field_path, old_value_json, new_value_json, source, changed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    key,
+                    json.dumps(old_value, ensure_ascii=True),
+                    json.dumps(new_value, ensure_ascii=True),
+                    source,
+                    ts,
+                ),
+            )
+            changes.append(
+                ProfileChange(
+                    id=int(cur.lastrowid),
+                    chat_id=chat_id,
+                    field_path=key,
+                    old_value=old_value,
+                    new_value=new_value,
+                    source=source,
+                    changed_at=ts,
+                )
+            )
+        if existing is None:
+            self._conn.execute(
+                """
+                INSERT INTO chat_profiles(chat_id, snapshot_json, last_source, last_updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, json.dumps(merged, ensure_ascii=True), source, ts),
+            )
+        else:
+            self._conn.execute(
+                """
+                UPDATE chat_profiles
+                SET snapshot_json = ?, last_source = ?, last_updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (json.dumps(merged, ensure_ascii=True), source, ts, chat_id),
+            )
+        self._conn.commit()
+        return changes
+
+    def list_profile_changes(self, chat_id: int, limit: int = 50) -> list[ProfileChange]:
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_id, field_path, old_value_json, new_value_json, source, changed_at
+            FROM profile_change_log
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+        return [
+            ProfileChange(
+                id=int(row["id"]),
+                chat_id=int(row["chat_id"]),
+                field_path=str(row["field_path"]),
+                old_value=json.loads(row["old_value_json"]),
+                new_value=json.loads(row["new_value_json"]),
+                source=str(row["source"]),
+                changed_at=str(row["changed_at"]),
+            )
+            for row in rows
+        ]
+
+    def list_profile_system_messages(self, chat_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        # Keep only the latest change per field_path to avoid repeating old profile churn
+        # in every prompt view.
+        rows = self._conn.execute(
+            """
+            SELECT id, field_path, new_value_json, source, changed_at
+            FROM profile_change_log
+            WHERE chat_id = ?
+              AND id IN (
+                SELECT MAX(id)
+                FROM profile_change_log
+                WHERE chat_id = ?
+                GROUP BY field_path
+              )
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, chat_id, limit),
+        ).fetchall()
+        rows = list(reversed(rows))
+        messages: list[dict[str, Any]] = []
+        for row in rows:
+            new_value = json.loads(row["new_value_json"])
+            rendered = self._stringify_profile_value(new_value)
+            messages.append(
+                {
+                    "event_type": "message",
+                    "role": "system",
+                    "text": f"profile_update: {row['field_path']} = {rendered}",
+                    "ts_utc": str(row["changed_at"]),
+                    "meta": {"kind": "profile_change", "change_id": int(row["id"])},
+                }
+            )
+        return messages
+
+    def _ensure_generation_attempt_columns(self) -> None:
+        rows = self._conn.execute("PRAGMA table_info(generation_attempts)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "attempt_no" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1")
+        if "phase" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN phase TEXT NOT NULL DEFAULT 'initial'")
+        if "accepted" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0")
+        if "reject_reason" not in columns:
+            self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN reject_reason TEXT")
+
+    def next_attempt_no(self, chat_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) FROM generation_attempts WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        current = int(row[0]) if row is not None and row[0] is not None else 0
+        return current + 1
 
     def save_generation_attempt(
         self,
-        *,
         chat_id: int,
-        title: str,
-        trigger: str,
-        attempt_no: int,
-        phase: str,
-        parsed_ok: bool,
-        accepted: bool,
-        reject_reason: str | None,
-        heuristic_score: float | None,
-        heuristic_flags: list[str] | None,
-        raw_excerpt: str | None,
-        suggestion: str | None,
-        schema: str | None,
-        prompt_tokens: int | None = None,
-        completion_tokens: int | None = None,
-        total_tokens: int | None = None,
-        reasoning_tokens: int | None = None,
-    ) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        flags_json = json.dumps(list(heuristic_flags or []), ensure_ascii=False)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO generation_attempts (
-                    created_at, chat_id, title, trigger, attempt_no, phase,
-                    parsed_ok, accepted, reject_reason, heuristic_score,
-                    heuristic_flags_json, raw_excerpt, suggestion, schema,
-                    prompt_tokens, completion_tokens, total_tokens, reasoning_tokens
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    now,
-                    int(chat_id),
-                    str(title),
-                    str(trigger),
-                    int(attempt_no),
-                    str(phase),
-                    1 if parsed_ok else 0,
-                    1 if accepted else 0,
-                    reject_reason,
-                    float(heuristic_score) if heuristic_score is not None else None,
-                    flags_json,
-                    raw_excerpt,
-                    suggestion,
-                    schema,
-                    (int(prompt_tokens) if isinstance(prompt_tokens, int) else None),
-                    (int(completion_tokens) if isinstance(completion_tokens, int) else None),
-                    (int(total_tokens) if isinstance(total_tokens, int) else None),
-                    (int(reasoning_tokens) if isinstance(reasoning_tokens, int) else None),
-                ),
-            )
-
-    def list_generation_attempts_for_chat(self, chat_id: int, limit: int = 20) -> list[StoredGenerationAttempt]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, created_at, chat_id, title, trigger, attempt_no, phase,
-                       parsed_ok, accepted, reject_reason, heuristic_score,
-                       heuristic_flags_json, raw_excerpt, suggestion, schema,
-                       prompt_tokens, completion_tokens, total_tokens, reasoning_tokens
-                FROM generation_attempts
-                WHERE chat_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (int(chat_id), int(limit)),
-            ).fetchall()
-        return [self._decode_generation_attempt_row(row) for row in rows]
-
-    def list_generation_attempts_recent(self, limit: int = 50) -> list[StoredGenerationAttempt]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, created_at, chat_id, title, trigger, attempt_no, phase,
-                       parsed_ok, accepted, reject_reason, heuristic_score,
-                       heuristic_flags_json, raw_excerpt, suggestion, schema,
-                       prompt_tokens, completion_tokens, total_tokens, reasoning_tokens
-                FROM generation_attempts
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (int(limit),),
-            ).fetchall()
-        return [self._decode_generation_attempt_row(row) for row in rows]
-
-    @staticmethod
-    def _decode_analysis(value: str | None) -> dict[str, object] | None:
-        if not value:
-            return None
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(parsed, dict):
-            return parsed
-        return None
-
-    @staticmethod
-    def _decode_metadata(metadata_json: str | None) -> dict[str, str]:
-        metadata: dict[str, str] = {}
-        if metadata_json:
-            try:
-                data = json.loads(metadata_json)
-                if isinstance(data, dict):
-                    metadata = {str(k): str(v) for k, v in data.items()}
-            except json.JSONDecodeError:
-                pass
-        return metadata
-
-    @staticmethod
-    def _decode_actions(actions_json: str | None) -> list[dict[str, object]] | None:
-        if not actions_json:
-            return None
-        try:
-            parsed = json.loads(actions_json)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(parsed, list):
-            return None
-        actions: list[dict[str, object]] = []
-        for item in parsed:
-            if isinstance(item, dict):
-                actions.append({str(k): v for k, v in item.items()})
-        return actions or None
-
-    @staticmethod
-    def _decode_generation_attempt_row(row: tuple) -> StoredGenerationAttempt:
-        flags: list[str] = []
-        raw_flags = row[11]
-        if isinstance(raw_flags, str) and raw_flags:
-            try:
-                parsed = json.loads(raw_flags)
-                if isinstance(parsed, list):
-                    flags = [str(item) for item in parsed if str(item).strip()]
-            except json.JSONDecodeError:
-                flags = []
-        return StoredGenerationAttempt(
-            id=int(row[0]),
-            created_at=datetime.fromisoformat(str(row[1])),
-            chat_id=int(row[2]),
-            title=str(row[3]),
-            trigger=str(row[4]),
-            attempt_no=int(row[5]),
-            phase=str(row[6]),
-            parsed_ok=bool(int(row[7])),
-            accepted=bool(int(row[8])),
-            reject_reason=(str(row[9]) if row[9] is not None else None),
-            heuristic_score=(float(row[10]) if row[10] is not None else None),
-            heuristic_flags=flags,
-            raw_excerpt=(str(row[12]) if row[12] is not None else None),
-            suggestion=(str(row[13]) if row[13] is not None else None),
-            schema=(str(row[14]) if row[14] is not None else None),
-            prompt_tokens=(int(row[15]) if row[15] is not None else None),
-            completion_tokens=(int(row[16]) if row[16] is not None else None),
-            total_tokens=(int(row[17]) if row[17] is not None else None),
-            reasoning_tokens=(int(row[18]) if row[18] is not None else None),
+        provider: str,
+        model: str,
+        prompt_json: dict[str, Any],
+        response_json: dict[str, Any],
+        result_text: str,
+        status: str,
+        error_message: str | None = None,
+        created_at: str | None = None,
+        attempt_no: int | None = None,
+        phase: str = "initial",
+        accepted: bool = False,
+        reject_reason: str | None = None,
+    ) -> GenerationAttempt:
+        ts = created_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        attempt_no_value = int(attempt_no if attempt_no is not None else self.next_attempt_no(chat_id))
+        cur = self._conn.execute(
+            """
+            INSERT INTO generation_attempts(
+                chat_id, provider, model, prompt_json, response_json, result_text, status, error_message,
+                attempt_no, phase, accepted, reject_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                provider,
+                model,
+                json.dumps(prompt_json, ensure_ascii=True),
+                json.dumps(response_json, ensure_ascii=True),
+                result_text,
+                status,
+                error_message,
+                attempt_no_value,
+                phase,
+                1 if accepted else 0,
+                reject_reason,
+                ts,
+            ),
+        )
+        self._conn.commit()
+        return GenerationAttempt(
+            id=int(cur.lastrowid),
+            chat_id=chat_id,
+            provider=provider,
+            model=model,
+            prompt_json=prompt_json,
+            response_json=response_json,
+            result_text=result_text,
+            status=status,
+            error_message=error_message,
+            attempt_no=attempt_no_value,
+            phase=phase,
+            accepted=bool(accepted),
+            reject_reason=reject_reason,
+            created_at=ts,
         )
 
-    def image_description_get(self, image_hash: str) -> StoredImageDescription | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT image_hash, description, updated_at
-                FROM image_descriptions
-                WHERE image_hash = ?
-                """,
-                (image_hash,),
-            ).fetchone()
-        if not row:
-            return None
-        return StoredImageDescription(image_hash=row[0], description=row[1], updated_at=datetime.fromisoformat(row[2]))
-
-    def image_description_set(self, image_hash: str, description: str) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO image_descriptions (image_hash, description, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(image_hash) DO UPDATE SET
-                    description=excluded.description,
-                    updated_at=excluded.updated_at
-                """,
-                (image_hash, description, now),
+    def list_generation_attempts(self, chat_id: int, limit: int = 20) -> list[GenerationAttempt]:
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_id, provider, model, prompt_json, response_json, result_text, status,
+                   error_message, attempt_no, phase, accepted, reject_reason, created_at
+            FROM generation_attempts
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+        return [
+            GenerationAttempt(
+                id=int(row["id"]),
+                chat_id=int(row["chat_id"]),
+                provider=str(row["provider"]),
+                model=str(row["model"]),
+                prompt_json=self._loads_dict(row["prompt_json"]),
+                response_json=self._loads_dict(row["response_json"]),
+                result_text=str(row["result_text"]),
+                status=str(row["status"]),
+                error_message=row["error_message"],
+                attempt_no=int(row["attempt_no"]),
+                phase=str(row["phase"]),
+                accepted=bool(int(row["accepted"])),
+                reject_reason=row["reject_reason"],
+                created_at=str(row["created_at"]),
             )
+            for row in rows
+        ]
+
+    @staticmethod
+    def _loads_dict(raw: str) -> dict[str, Any]:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _loads_list(raw: str) -> list[dict[str, Any]]:
+        value = json.loads(raw)
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, dict)]
+
+    @classmethod
+    def _deep_merge_dicts(cls, base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+        merged: dict[str, Any] = dict(base)
+        for key, value in patch.items():
+            if value is None:
+                continue
+            old_value = merged.get(key)
+            if isinstance(old_value, dict) and isinstance(value, dict):
+                merged[key] = cls._deep_merge_dicts(old_value, value)
+            else:
+                merged[key] = value
+        return merged
+
+    @classmethod
+    def _flatten_dict(cls, value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(item, dict):
+                out.update(cls._flatten_dict(item, prefix=path))
+            else:
+                out[path] = item
+        return out
+
+    @staticmethod
+    def _stringify_profile_value(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=True)
+        return str(value)

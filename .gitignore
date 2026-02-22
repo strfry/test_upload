@@ -3,9 +3,10 @@ __pycache__/
 *.pyc
 
 scambaiter.session
+scambaiter.session-journal
 scambaiter.sqlite3
 scambaiter.sqlite3.bak
 
 secret.sh
 
-.idea
+.idea/

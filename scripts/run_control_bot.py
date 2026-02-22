@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import asyncio
+import os
+
+from scambaiter.bot_api import create_bot_app
+from scambaiter.config import load_config
+from scambaiter.core import ScambaiterCore
+from scambaiter.service import BackgroundService
+from scambaiter.storage import AnalysisStore
+
+
+async def _run() -> None:
+    config = load_config()
+    token = config.bot_token or os.getenv("SCAMBAITER_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("SCAMBAITER_BOT_TOKEN is required")
+    allowed = os.getenv("SCAMBAITER_CONTROL_CHAT_ID")
+    allowed_chat_id = int(allowed) if allowed else None
+
+    store = AnalysisStore(config.analysis_db_path)
+    core = ScambaiterCore(config=config, store=store)
+    service = BackgroundService(core=core, interval_seconds=config.auto_interval_seconds, store=store)
+
+    app = create_bot_app(token=token, service=service, allowed_chat_id=allowed_chat_id)
+    await app.initialize()
+    await app.start()
+    register_command_menu = app.bot_data.get("register_command_menu")
+    if callable(register_command_menu):
+        await register_command_menu()
+    await app.updater.start_polling()
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+def main() -> None:
+    asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    main()
