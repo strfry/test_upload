@@ -564,8 +564,9 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("recent_messages_count: 2", text)
         self.assertIn("showing_recent_messages: 2", text)
         self.assertIn("[...] earlier context summarized in memory", text)
-        self.assertIn("01:01 🔹 user: user msg", text)
-        self.assertIn("01:02 🔸 assistant: assistant msg", text)
+        self.assertIn("```", text)
+        self.assertIn("01:01 U: user msg", text)
+        self.assertIn("01:02 A: assistant msg", text)
         self.assertNotIn('"recent_messages"', text)
         self.assertNotIn("system msg", text)
 

@@ -981,13 +981,8 @@ def _render_messages_chat_window(
     def _role_name(raw_role: str) -> str:
         role = raw_role.strip().lower()
         if role in ("assistant", "scammer", "scambaiter"):
-            return "assistant"
-        return "user"
-
-    def _role_marker(role: str) -> str:
-        if role == "assistant":
-            return "🔸"
-        return "🔹"
+            return "A"
+        return "U"
 
     def _clean_and_truncate(text: str) -> str:
         compact = " ".join(text.split())
@@ -1001,11 +996,10 @@ def _render_messages_chat_window(
         role = _role_name(str(row.get("role") or "user"))
         text = _clean_and_truncate(str(row.get("content") or ""))
         raw_time = str(row.get("time") or "").strip()
-        marker = _role_marker(role)
         if raw_time:
-            lines.append(f"{raw_time} {marker} {role}: {text}")
+            lines.append(f"{raw_time} {role}: {text}")
         else:
-            lines.append(f"{marker} {role}: {text}")
+            lines.append(f"{role}: {text}")
     return lines
 
 
@@ -1035,12 +1029,9 @@ def _render_prompt_section_text(
         ]
         if has_memory:
             lines.append("[...] earlier context summarized in memory")
-        lines.extend(
-            [
-            "---",
-            ]
-        )
+        lines.extend(["---", "```"])
         lines.extend(message_lines if message_lines else ["(no recent messages)"])
+        lines.append("```")
         return _trim_block("\n".join(lines))
 
     if section == "system":
