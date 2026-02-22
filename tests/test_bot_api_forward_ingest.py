@@ -16,6 +16,7 @@ from scambaiter.bot_api import (
     _profile_lines_from_events,
     _render_prompt_card_text,
     _render_prompt_section_text,
+    _render_whoami_text,
     _prompt_keyboard,
     _render_user_card,
     _resolve_target_and_role_without_active,
@@ -369,6 +370,14 @@ class BotApiForwardIngestTest(unittest.TestCase):
         prompt_row = keyboard.inline_keyboard[0]
         self.assertEqual("• prompt", prompt_row[0].text)
         self.assertEqual("sc:psec:prompt:999", prompt_row[0].callback_data)
+
+    def test_render_whoami_text_reports_authorization_state(self) -> None:
+        message = type("Msg", (), {"chat_id": 1234})()
+        text = _render_whoami_text(message=message, user_id=777, allowed_chat_id=8450305774)
+        self.assertIn("chat_id: 1234", text)
+        self.assertIn("user_id: 777", text)
+        self.assertIn("allowed_chat_id: 8450305774", text)
+        self.assertIn("authorized_here: no", text)
 
 
 if __name__ == "__main__":

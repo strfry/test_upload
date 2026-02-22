@@ -71,6 +71,7 @@ python scam_baiter.py
 
 Der Control-Chat wird automatisch über die Telegram-App-API ermittelt; nach dem Start wird dort eine Begrüßung mit verfügbaren Aktionen gepostet. Die wichtigsten Commands:
 
+- `/whoami` – zeigt die aktuelle `chat_id`, `user_id`, konfigurierte `allowed_chat_id` und ob der aktuelle Chat autorisiert ist
 - `/runonce` – Einzelnen Durchlauf starten
 - `/runonce <chat_id[,chat_id2,...]>` – Gefilterter Lauf
 - `/chats` – Menü für bekannte Chats mit Detailansicht (Generate, Send, Stop, Auto an/aus, Bilder, Analysis)
@@ -100,6 +101,22 @@ oder über den Repo-Runner:
 python3 scripts/run_tests.py -q
 ```
 
+## Chat-ID Scanner (Safe)
+
+Nur Dialoge aus einem bestimmten Telegram-Ordner (Default `Scammers`) auslesen:
+
+```bash
+python scripts/list_chat_ids.py --folder Scammers
+```
+
+JSON-Ausgabe mit Filter:
+
+```bash
+python scripts/list_chat_ids.py --folder Scammers --filter scam --json
+```
+
+Sicherheitsverhalten: Wenn der Ordner nicht existiert, bricht das Skript mit Fehler ab und gibt keine IDs aus.
+
 ## Projektstruktur
 
 - `scam_baiter.py`: Einstieg und Modusumschaltung
@@ -117,6 +134,7 @@ python3 scripts/run_tests.py -q
 - `scripts/run_tests.py`: Wrapper für Entwicklertests
 - `scripts/dry_run_cli.py`: Testet prompt + response offline
 - `scripts/telethon_forward_helper.py`: Telethon-Helfer zum automatisierten Weiterleiten kompletter Chats (für Langzeit-Tests)
+- `scripts/list_chat_ids.py`: Liest Chat-IDs ausschließlich aus einem expliziten Telegram-Ordner (Default `Scammers`)
 - `scripts/loop_analyzer.py`: Analysiert Verläufe auf Loops/Wiederholungen
 
 ## Prompt-Runner

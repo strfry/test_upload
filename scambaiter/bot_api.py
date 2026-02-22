@@ -1349,6 +1349,7 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     text = (
         "ScamBaiterControl commands:\n"
+        "/whoami - show current chat/user ids and auth status\n"
         "/chat <chat_id> - set target chat for forwarded history\n"
         "/<chat_id> or /c<chat_id> - quick select chat and show Chat Card\n"
         "/chats - list known chat ids\n"
@@ -1357,6 +1358,34 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Use /chat <chat_id> only to force an explicit target override."
     )
     await _send_control_text(application=app, message=message, text=text)
+
+
+def _render_whoami_text(message: Message, user_id: int | None, allowed_chat_id: int | None) -> str:
+    chat_id = int(message.chat_id)
+    authorized = allowed_chat_id is None or chat_id == int(allowed_chat_id)
+    expected = str(allowed_chat_id) if allowed_chat_id is not None else "(not set)"
+    return (
+        "Control identity\n"
+        f"chat_id: {chat_id}\n"
+        f"user_id: {user_id if user_id is not None else 'unknown'}\n"
+        f"allowed_chat_id: {expected}\n"
+        f"authorized_here: {'yes' if authorized else 'no'}"
+    )
+
+
+async def _cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    message = update.effective_message
+    if message is None:
+        return
+    user = update.effective_user
+    user_id = int(user.id) if user is not None else None
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    await _send_control_text(
+        application=app,
+        message=message,
+        text=_render_whoami_text(message=message, user_id=user_id, allowed_chat_id=allowed_chat_id),
+    )
 
 
 async def _cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1605,6 +1634,7 @@ async def _register_command_menu(application: Application) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand("start", "show control help"),
+            BotCommand("whoami", "show current chat/user ids"),
             BotCommand("chat", "set active target chat id"),
             BotCommand("chats", "list known chat ids"),
             BotCommand("history", "show history for active chat"),
@@ -1618,6 +1648,7 @@ def create_bot_app(token: str, service: Any, allowed_chat_id: int | None = None)
     app.bot_data["allowed_chat_id"] = allowed_chat_id
     app.bot_data["register_command_menu"] = lambda: _register_command_menu(app)
     app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("whoami", _cmd_whoami))
     app.add_handler(CommandHandler("chat", _cmd_chat))
     app.add_handler(CommandHandler("chats", _cmd_chats))
     app.add_handler(CommandHandler("history", _cmd_history))
