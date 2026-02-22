@@ -90,6 +90,13 @@ Eingehende Bildnachrichten vom Scammer werden automatisch mit `HF_VISION_MODEL` 
 Die Bildbeschreibung wird per Bild-Hash in der SQLite-DB (`image_descriptions`) gecacht, damit jedes identische Bild nur einmal an das Vision-Modell geschickt wird.
 Wenn in der letzten gespeicherten Analyse ein `language`- oder `sprache`-Feld gesetzt ist (`de`/`en`), wird zusätzlich eine starke Sprach-Systeminstruktion erzwungen.
 
+## Dokumentation
+
+- `docs/backlog.md` – prioritisiertes Backlog und Guardrail-Ideen (inklusive der aktuellen Dokumentations-Echtzeitaufgaben); dieses README verweist dorthin für Kontext.
+- `docs/event_schema_draft.md` – Entwurf für das Event-/Promptschema, wie wir Telegram-Verläufe modellieren.
+- `docs/prompt_cases/README.md` (+JSON-Fixtures) – Einsatzfälle für Prompt-Tests (Escalation, No-Repeat, Topic Guard und mehr).
+- `docs/snippets/prompt_konkretheit.txt` – prägnante Prompt-Richtlinien („Konkretheit“), die bei der Prompt-Feinjustierung helfen.
+
 ## Projektstruktur
 
 Zur Trennung der Concerns wurde der Code aufgeteilt:
@@ -98,10 +105,12 @@ Zur Trennung der Concerns wurde der Code aufgeteilt:
 - `scambaiter/config.py`: Umgebungsvariablen/Config
 - `scambaiter/core.py`: Telegram- und HF-Kernlogik
 - `scambaiter/service.py`: Hintergrund-Loop + Laufstatus
-- `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos
+- `scambaiter/bot_api.py`: Telegram BotAPI-Kommandos (inkl. Prompt Card mit neuer “Prompt” Ansicht, die den JSON-Prompt + Memory Summary anzeigt)
 - `scambaiter/storage.py`: SQLite-Persistenz für Analysen und Bildbeschreibungen
 - `scripts/prompt_runner.py`: lokaler Prompt-Runner (Prompt/Raw/Parsed) für schnelle Iteration
 - `scripts/loop_analyzer.py`: analysiert gepastete Verläufe auf Loop-Muster (Wiederholungsfragen/Themen-Drift)
+- `scripts/prompt_cli.py` & `scripts/history_cli.py`: Werkzeuge für Prompt/Memory/History-Inspektionen (`--history`, `--model-view`, `--memory`, `--refresh-memory`, `--max-tokens`) plus Chatliste mithilfe gespeicherter Profile.
+- `scripts/telethon_forward_helper.py`: Hilfsskript, um ganze Chats über eine Telethon-Session in den Control-Chat weiterzuleiten (nützlich für Langzeit-Tests).
 
 
 - Für unbeantwortete Chats wird beim Öffnen von `/chats` asynchron ein Vorschlag vorgezogen, damit die Chatliste sofort erscheint.
