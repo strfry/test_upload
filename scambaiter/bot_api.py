@@ -3185,10 +3185,17 @@ def _plan_forward_merge(store: Any, target_chat_id: int, payloads: list[dict[str
             if not existing_rows:
                 batch_new_scammer_keys.append(identity_key)
         sig = _forward_item_signature(payload)
+        payload_event_type = str(payload.get("event_type") or "").strip().lower()
         has_same = False
         has_changed = False
         for row in existing_rows:
-            row_sig = (str(getattr(row, "event_type", "") or ""), str(getattr(row, "text", "") or ""))
+            row_event_type = str(getattr(row, "event_type", "") or "")
+            row_text = str(getattr(row, "text", "") or "")
+            row_sig = (row_event_type, row_text)
+            row_event_type_lower = row_event_type.strip().lower()
+            if row_event_type_lower == "forward" and payload_event_type != "forward":
+                has_changed = True
+                continue
             if row_sig == sig:
                 has_same = True
                 break

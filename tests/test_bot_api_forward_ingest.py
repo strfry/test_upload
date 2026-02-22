@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -398,6 +399,31 @@ class BotApiForwardIngestTest(unittest.TestCase):
             assert isinstance(insert_payloads, list)
             self.assertEqual(1, len(insert_payloads))
             self.assertEqual(101, insert_payloads[0].get("origin_message_id"))
+
+    def test_plan_forward_merge_reopens_forward_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            message = _FakeMessage(
+                chat_id=5000,
+                message_id=50,
+                text=None,
+                caption=None,
+                has_photo=False,
+                has_sticker=True,
+                with_forward_origin=True,
+            )
+            payload = _build_forward_payload(message, role="scammer")
+            placeholder_payload = copy.deepcopy(payload)
+            placeholder_payload["event_type"] = "forward"
+            _ingest_forward_payload(store=store, target_chat_id=1234, payload=placeholder_payload)
+            merge = _plan_forward_merge(store, target_chat_id=1234, payloads=[payload])
+            self.assertNotEqual("blocked", merge.get("mode"))
+            insert_payloads = merge.get("insert_payloads")
+            self.assertIsInstance(insert_payloads, list)
+            assert isinstance(insert_payloads, list)
+            self.assertEqual(1, len(insert_payloads))
+            self.assertEqual("sticker", insert_payloads[0].get("event_type"))
 
     def test_forward_payload_stores_scanner_and_baiter_metadata(self) -> None:
         message = _FakeMessage(
