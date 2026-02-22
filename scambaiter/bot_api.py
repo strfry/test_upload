@@ -317,16 +317,69 @@ def _chat_card_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
-            [InlineKeyboardButton("Delete Context", callback_data=f"sc:clear_history:{target_chat_id}")],
+            [InlineKeyboardButton("Close", callback_data=f"sc:chat_close:{target_chat_id}")],
         ]
     )
 
 
-def _known_chats_keyboard(chat_ids: list[int], max_buttons: int = 30) -> InlineKeyboardMarkup:
+def _truncate_chat_button_label(base: str, chat_id: int, max_len: int = 56) -> str:
+    suffix = f" · /{chat_id}"
+    compact = " ".join((base or "").split()).strip()
+    if not compact:
+        compact = "Unknown"
+    full = f"{compact}{suffix}"
+    if len(full) <= max_len:
+        return full
+    remaining = max_len - len(suffix)
+    if remaining <= 4:
+        return f"/{chat_id}"
+    return f"{compact[: remaining - 3]}...{suffix}"
+
+
+def _chat_button_label(store: Any, chat_id: int) -> str:
+    display_name: str | None = None
+    username: str | None = None
+    try:
+        profile = store.get_chat_profile(chat_id=chat_id)
+    except Exception:
+        profile = None
+    if profile is not None:
+        snapshot = getattr(profile, "snapshot", None)
+        if isinstance(snapshot, dict):
+            identity = snapshot.get("identity")
+            if isinstance(identity, dict):
+                candidate_display = identity.get("display_name")
+                if isinstance(candidate_display, str) and candidate_display.strip():
+                    display_name = candidate_display.strip()
+                candidate_username = identity.get("username")
+                if isinstance(candidate_username, str) and candidate_username.strip():
+                    value = candidate_username.strip()
+                    username = value if value.startswith("@") else f"@{value}"
+    if display_name:
+        base = display_name
+        if username:
+            base = f"{display_name} ({username})"
+    elif username:
+        base = username
+    else:
+        base = "Unknown"
+    return _truncate_chat_button_label(base, chat_id)
+
+
+def _known_chats_keyboard(store: Any, chat_ids: list[int], max_buttons: int = 30) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for item in chat_ids[:max_buttons]:
-        rows.append([InlineKeyboardButton(f"/{item}", callback_data=f"sc:selchat:{item}")])
+        rows.append([InlineKeyboardButton(_chat_button_label(store, item), callback_data=f"sc:selchat:{item}")])
     return InlineKeyboardMarkup(rows)
+
+
+def _known_chats_card_content(store: Any, chat_ids: list[int]) -> tuple[str, InlineKeyboardMarkup]:
+    shown = chat_ids[:30]
+    extra = len(chat_ids) - len(shown)
+    title = f"Known chat ids ({len(chat_ids)} total):\nSelect one:"
+    if extra > 0:
+        title += f"\n(showing first {len(shown)}, {extra} hidden)"
+    return title, _known_chats_keyboard(store, chat_ids)
 
 
 def _chat_card_clear_confirm_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
@@ -509,6 +562,7 @@ def _render_prompt_card_text(chat_id: int, prompt_events: list[dict[str, Any]], 
 PROMPT_SECTION_LABELS: dict[str, str] = {
     "messages": "messages",
     "memory": "memory",
+    "system": "system",
 }
 
 
@@ -567,7 +621,7 @@ def _prompt_keyboard(
 
     return InlineKeyboardMarkup(
         [
-            [_btn("messages"), _btn("memory")],
+            [_btn("messages"), _btn("memory"), _btn("system")],
             [
                 InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
                 InlineKeyboardButton("Close", callback_data=f"sc:prompt_close:{chat_id}"),
@@ -616,6 +670,146 @@ def _memory_summary_prompt_lines(memory: dict[str, Any] | None) -> list[str]:
     return lines
 
 
+def _normalize_memory_payload(memory: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    meta: dict[str, Any] = {
+        "state": "missing",
+        "cursor_event_id": None,
+        "model": None,
+        "last_updated_at": None,
+    }
+    if memory is None:
+        return {}, meta
+    if isinstance(memory, dict):
+        meta["state"] = "ok"
+        return memory, meta
+
+    summary = getattr(memory, "summary", None)
+    if isinstance(summary, dict):
+        meta["state"] = "ok"
+        cursor = getattr(memory, "cursor_event_id", None)
+        model = getattr(memory, "model", None)
+        updated = getattr(memory, "last_updated_at", None)
+        if isinstance(cursor, int):
+            meta["cursor_event_id"] = cursor
+        if isinstance(model, str):
+            meta["model"] = model
+        if isinstance(updated, str):
+            meta["last_updated_at"] = updated
+        return summary, meta
+
+    meta["state"] = "invalid"
+    meta["reason"] = f"unsupported memory type: {type(memory).__name__}"
+    return {}, meta
+
+
+def _render_memory_compact(summary: dict[str, Any], meta: dict[str, Any], *, chat_id: int, events_in_prompt: int) -> str:
+    state = str(meta.get("state") or "missing")
+    lines = [
+        "Model Input Section: memory",
+        f"chat_id: /{chat_id}",
+        f"events_in_prompt: {events_in_prompt}",
+        f"state: {state}",
+    ]
+    cursor_event_id = meta.get("cursor_event_id")
+    if isinstance(cursor_event_id, int):
+        lines.append(f"cursor_event_id: {cursor_event_id}")
+    model = meta.get("model")
+    if isinstance(model, str) and model.strip():
+        lines.append(f"model: {model.strip()}")
+    last_updated = meta.get("last_updated_at")
+    if isinstance(last_updated, str) and last_updated.strip():
+        lines.append(f"last_updated_at: {last_updated.strip()}")
+    lines.append("---")
+
+    if state == "missing":
+        lines.append("memory unavailable (not built yet)")
+        return _trim_block("\n".join(lines))
+    if state == "invalid":
+        reason = str(meta.get("reason") or "unknown")
+        lines.append(f"memory unavailable ({reason})")
+        return _trim_block("\n".join(lines))
+
+    claimed = summary.get("claimed_identity") if isinstance(summary.get("claimed_identity"), dict) else {}
+    current_intent = summary.get("current_intent") if isinstance(summary.get("current_intent"), dict) else {}
+    narrative = summary.get("narrative") if isinstance(summary.get("narrative"), dict) else {}
+    key_facts = summary.get("key_facts") if isinstance(summary.get("key_facts"), dict) else {}
+    risk_flags = summary.get("risk_flags") if isinstance(summary.get("risk_flags"), list) else []
+    open_questions = summary.get("open_questions") if isinstance(summary.get("open_questions"), list) else []
+    next_focus = summary.get("next_focus") if isinstance(summary.get("next_focus"), list) else []
+
+    identity_name = str(claimed.get("name") or "").strip() or "-"
+    identity_role = str(claimed.get("role_claim") or "").strip() or "-"
+    identity_conf = str(claimed.get("confidence") or "").strip() or "-"
+    lines.append(f"claimed_identity: {identity_name} ({identity_role}, confidence={identity_conf})")
+
+    scammer_intent = str(current_intent.get("scammer_intent") or "").strip() or "-"
+    baiter_intent = str(current_intent.get("baiter_intent") or "").strip() or "-"
+    latest_topic = str(current_intent.get("latest_topic") or "").strip() or "-"
+    lines.append(f"current_intent.scammer: {scammer_intent}")
+    lines.append(f"current_intent.baiter: {baiter_intent}")
+    lines.append(f"current_intent.topic: {latest_topic}")
+
+    phase = str(narrative.get("phase") or "").strip() or "-"
+    short_story = str(narrative.get("short_story") or "").strip()
+    if short_story and len(short_story) > 220:
+        short_story = short_story[:217] + "..."
+    lines.append(f"narrative.phase: {phase}")
+    if short_story:
+        lines.append(f"narrative.story: {short_story}")
+
+    fact_keys = [str(key) for key in key_facts.keys()][:8]
+    lines.append(f"key_facts.keys: {', '.join(fact_keys) if fact_keys else '-'}")
+
+    if risk_flags:
+        compact_risks = ", ".join(str(item) for item in risk_flags[:5])
+        lines.append(f"risk_flags: {compact_risks}")
+    else:
+        lines.append("risk_flags: -")
+
+    if open_questions:
+        lines.append("open_questions:")
+        for item in open_questions[:5]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("open_questions: -")
+
+    if next_focus:
+        lines.append("next_focus:")
+        for item in next_focus[:5]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("next_focus: -")
+
+    return _trim_block("\n".join(lines))
+
+
+def _extract_recent_messages(model_messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for item in model_messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role == "system":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            out.append({"role": role or "user", "content": content})
+    return out
+
+
+def _extract_system_prompt(model_messages: list[dict[str, str]]) -> str:
+    for item in model_messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role != "system":
+            continue
+        content = item.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
 def _render_prompt_section_text(
     *,
     chat_id: int,
@@ -629,8 +823,9 @@ def _render_prompt_section_text(
     memory: dict[str, Any] | None = None,
 ) -> str:
     if section == "messages":
+        recent_messages = _extract_recent_messages(model_messages)
         payload = {
-            "messages": model_messages,
+            "recent_messages": recent_messages,
         }
         lines = [
             "Model Input Section: messages",
@@ -641,18 +836,18 @@ def _render_prompt_section_text(
         ]
         return _trim_block("\n".join(lines))
 
-    # memory
-    payload = {
-        "memory_summary": memory or {},
-    }
-    lines = [
-        "Model Input Section: memory",
-        f"chat_id: /{chat_id}",
-        f"events_in_prompt: {len(prompt_events)}",
-        "---",
-        json.dumps(payload, ensure_ascii=False, indent=2),
-    ]
-    return _trim_block("\n".join(lines))
+    if section == "system":
+        system_prompt = _extract_system_prompt(model_messages)
+        lines = [
+            "Model Input Section: system",
+            f"chat_id: /{chat_id}",
+            "---",
+            system_prompt or "system prompt unavailable",
+        ]
+        return _trim_block("\n".join(lines))
+
+    summary, meta = _normalize_memory_payload(memory)
+    return _render_memory_compact(summary, meta, chat_id=chat_id, events_in_prompt=len(prompt_events))
 
 
 async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -951,6 +1146,52 @@ async def _handle_prompt_close_button(update: Update, context: ContextTypes.DEFA
         target_chat_id=chat_id,
     )
     await _delete_control_message(message)
+
+
+async def _handle_chat_close_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    try:
+        int(data.split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    chat_ids = store.list_chat_ids(limit=100)
+    await query.answer("Closed")
+    await _delete_control_message(message)
+    _last_user_card_message(app).pop(int(message.chat_id), None)
+    if not chat_ids:
+        await _send_control_text(
+            application=app,
+            message=message,
+            text="No chat history stored yet.",
+            replace_previous_status=False,
+        )
+        return
+    title, keyboard = _known_chats_card_content(store, chat_ids)
+    sent = await app.bot.send_message(
+        chat_id=int(message.chat_id),
+        text=title,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
+    sent_messages.append(int(sent.message_id))
+    if len(sent_messages) > 500:
+        del sent_messages[: len(sent_messages) - 500]
 
 
 def _load_attempt_for_send(store: Any, chat_id: int, attempt_id: int) -> tuple[Any | None, Any | None, str | None]:
@@ -1884,16 +2125,12 @@ async def _cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not chat_ids:
         await _send_control_text(application=app, message=message, text="No chat history stored yet.")
         return
-    shown = chat_ids[:30]
-    extra = len(chat_ids) - len(shown)
-    title = f"Known chat ids ({len(chat_ids)} total):\nSelect one:"
-    if extra > 0:
-        title += f"\n(showing first {len(shown)}, {extra} hidden)"
+    title, keyboard = _known_chats_card_content(store, chat_ids)
     await _send_control_text(
         application=app,
         message=message,
         text=title,
-        reply_markup=_known_chats_keyboard(chat_ids),
+        reply_markup=keyboard,
     )
 
 
@@ -2070,6 +2307,7 @@ def create_bot_app(
     app.add_handler(MessageHandler(filters.Regex(r"^/(?:c)?[0-9]+(?:\s.*)?$"), _cmd_chat_id_shortcut))
     app.add_handler(CallbackQueryHandler(_handle_select_chat_button, pattern=r"^sc:selchat:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_chat_close_button, pattern=r"^sc:chat_close:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_clear_history_button, pattern=r"^sc:clear_history:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_clear_history_arm_button, pattern=r"^sc:clear_history_arm:[0-9]+$"))
     app.add_handler(
@@ -2078,7 +2316,7 @@ def create_bot_app(
     app.add_handler(
         CallbackQueryHandler(_handle_clear_history_cancel_button, pattern=r"^sc:clear_history_cancel:[0-9]+$")
     )
-    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:messages|memory):[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:messages|memory|system):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_close_button, pattern=r"^sc:prompt_close:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_send_button, pattern=r"^sc:send:[0-9]+:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_send_confirm_button, pattern=r"^sc:send_confirm:[0-9]+:[0-9]+$"))

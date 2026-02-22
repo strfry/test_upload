@@ -4,9 +4,11 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from scambaiter.bot_api import (
     _build_forward_payload,
+    _chat_button_label,
     _delete_control_message,
     _event_ts_utc_for_store,
     _extract_partial_message_preview,
@@ -21,6 +23,7 @@ from scambaiter.bot_api import (
     _prompt_keyboard,
     _render_user_card,
     _resolve_target_and_role_without_active,
+    _truncate_chat_button_label,
     ingest_forwarded_message,
 )
 from scambaiter.forward_meta import baiter_name_from_meta, scammer_name_from_meta
@@ -288,6 +291,43 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("chat_id: /12345", text)
         self.assertIn("events: 7", text)
 
+    def test_chat_button_label_prefers_display_name_and_username(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.upsert_chat_profile(
+                chat_id=9001,
+                patch={"identity": {"display_name": "Julia Rose", "username": "jrose"}},
+                source="test",
+            )
+            label = _chat_button_label(store, 9001)
+            self.assertEqual("Julia Rose (@jrose) · /9001", label)
+
+    def test_chat_button_label_uses_username_when_display_name_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.upsert_chat_profile(
+                chat_id=9002,
+                patch={"identity": {"username": "onlyuser"}},
+                source="test",
+            )
+            label = _chat_button_label(store, 9002)
+            self.assertEqual("@onlyuser · /9002", label)
+
+    def test_chat_button_label_falls_back_to_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            label = _chat_button_label(store, 9999)
+            self.assertEqual("Unknown · /9999", label)
+
+    def test_truncate_chat_button_label_keeps_chat_id_suffix(self) -> None:
+        base = "A Very Long Name That Should Be Trimmed Aggressively For Telegram Button Labels"
+        label = _truncate_chat_button_label(base, 123456789, max_len=30)
+        self.assertIn("/123456789", label)
+        self.assertLessEqual(len(label), 30)
+
     def test_extract_forward_profile_info_contains_sender_user_fields(self) -> None:
         message = _FakeMessage(
             chat_id=5000,
@@ -362,8 +402,9 @@ class BotApiForwardIngestTest(unittest.TestCase):
             memory={"current_intent": {"latest_topic": "topic"}, "key_facts": {"fact": "value"}},
         )
         self.assertIn("Model Input Section: messages", text)
-        self.assertIn('"messages"', text)
+        self.assertIn('"recent_messages"', text)
         self.assertNotIn('"memory_summary"', text)
+        self.assertNotIn("system msg", text)
 
     def test_prompt_keyboard_includes_prompt_button(self) -> None:
         keyboard = _prompt_keyboard(chat_id=999, active_section="messages")
@@ -371,6 +412,8 @@ class BotApiForwardIngestTest(unittest.TestCase):
         prompt_row = keyboard.inline_keyboard[0]
         self.assertEqual("• messages", prompt_row[0].text)
         self.assertEqual("sc:psec:messages:999", prompt_row[0].callback_data)
+        self.assertEqual("memory", prompt_row[1].text)
+        self.assertEqual("system", prompt_row[2].text)
 
     def test_render_whoami_text_reports_authorization_state(self) -> None:
         message = type("Msg", (), {"chat_id": 1234})()
@@ -413,7 +456,90 @@ class BotApiForwardIngestTest(unittest.TestCase):
             memory={"current_intent": {"latest_topic": "topic"}},
         )
         self.assertIn("Model Input Section: memory", text)
-        self.assertIn('"memory_summary"', text)
+        self.assertIn("state: ok", text)
+        self.assertIn("current_intent.topic: topic", text)
+
+    def test_render_prompt_section_system_shows_only_system_prompt(self) -> None:
+        prompt_events = [{"time": "01:00", "role": "manual", "text": "user"}]
+        model_messages = [
+            {"role": "system", "content": "system-only"},
+            {"role": "user", "content": "user msg"},
+        ]
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=prompt_events,
+            model_messages=model_messages,
+            latest_payload=None,
+            latest_raw="",
+            latest_attempt_id=None,
+            latest_status=None,
+            section="system",
+            memory=None,
+        )
+        self.assertIn("Model Input Section: system", text)
+        self.assertIn("system-only", text)
+        self.assertNotIn("user msg", text)
+
+    def test_render_prompt_section_memory_handles_none_gracefully(self) -> None:
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=[],
+            model_messages=[],
+            latest_payload=None,
+            latest_raw="",
+            latest_attempt_id=None,
+            latest_status=None,
+            section="memory",
+            memory=None,
+        )
+        self.assertIn("state: missing", text)
+        self.assertIn("memory unavailable", text)
+
+    def test_render_prompt_section_memory_handles_memory_context_object(self) -> None:
+        memory_obj = SimpleNamespace(
+            summary={
+                "claimed_identity": {"name": "Julia", "role_claim": "investor", "confidence": "medium"},
+                "current_intent": {"scammer_intent": "convert", "baiter_intent": "delay", "latest_topic": "wallet"},
+                "narrative": {"phase": "pitch", "short_story": "story"},
+                "key_facts": {"platform": "x"},
+                "risk_flags": ["guaranteed return"],
+                "open_questions": ["which wallet?"],
+                "next_focus": ["ask tx hash"],
+            },
+            cursor_event_id=88,
+            model="openai/gpt-oss-120b",
+            last_updated_at="2026-02-22T06:00:00Z",
+        )
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=[],
+            model_messages=[],
+            latest_payload=None,
+            latest_raw="",
+            latest_attempt_id=None,
+            latest_status=None,
+            section="memory",
+            memory=memory_obj,
+        )
+        self.assertIn("state: ok", text)
+        self.assertIn("cursor_event_id: 88", text)
+        self.assertIn("model: openai/gpt-oss-120b", text)
+        self.assertIn("current_intent.topic: wallet", text)
+
+    def test_render_prompt_section_memory_handles_invalid_type_gracefully(self) -> None:
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=[],
+            model_messages=[],
+            latest_payload=None,
+            latest_raw="",
+            latest_attempt_id=None,
+            latest_status=None,
+            section="memory",
+            memory="broken",
+        )
+        self.assertIn("state: invalid", text)
+        self.assertIn("unsupported memory type", text)
 
     def test_extract_partial_message_preview_empty_on_non_json(self) -> None:
         preview = _extract_partial_message_preview("not-json")
