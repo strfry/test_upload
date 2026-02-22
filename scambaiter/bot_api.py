@@ -10,6 +10,7 @@ from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Mes
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+from scambaiter.core import parse_structured_model_output
 from scambaiter.forward_meta import baiter_name_from_meta, scammer_name_from_meta
 
 
@@ -73,6 +74,22 @@ def _user_card_tasks(application: Application) -> dict[int, asyncio.Task[Any]]:
     if not isinstance(state, dict):
         state = {}
         application.bot_data["user_card_task_by_chat"] = state
+    return state
+
+
+def _prompt_card_contexts(application: Application) -> dict[int, dict[str, int]]:
+    state = application.bot_data.setdefault("prompt_card_context_by_message", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["prompt_card_context_by_message"] = state
+    return state
+
+
+def _last_sent_by_chat(application: Application) -> dict[int, dict[str, int]]:
+    state = application.bot_data.setdefault("last_sent_by_target_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["last_sent_by_target_chat"] = state
     return state
 
 
@@ -147,7 +164,34 @@ def _render_html_error_block(
         "<b>hint</b>",
         html.escape(hint),
     ])
+    partial_preview = _extract_partial_message_preview(result_text or "")
+    if partial_preview:
+        lines.extend(
+            [
+                "<b>partial message preview</b>",
+                f"<pre>{html.escape(partial_preview)}</pre>",
+            ]
+        )
     return "\n".join(lines)
+
+
+def _extract_partial_message_preview(result_text: str) -> str:
+    raw = (result_text or "").strip()
+    if not raw:
+        return ""
+    try:
+        loaded = json.loads(raw)
+    except Exception:
+        return ""
+    if not isinstance(loaded, dict):
+        return ""
+    message = loaded.get("message")
+    if isinstance(message, dict):
+        text = message.get("text")
+        if isinstance(text, str) and text.strip():
+            compact = " ".join(text.split())
+            return compact[:800] + ("..." if len(compact) > 800 else "")
+    return ""
 
 
 async def _send_control_text(
@@ -222,6 +266,17 @@ def _chat_card_clear_confirm_keyboard(target_chat_id: int) -> InlineKeyboardMark
         [
             [
                 InlineKeyboardButton("Confirm Delete", callback_data=f"sc:clear_history_confirm:{target_chat_id}"),
+                InlineKeyboardButton("Cancel", callback_data=f"sc:clear_history_cancel:{target_chat_id}"),
+            ]
+        ]
+    )
+
+
+def _chat_card_clear_safety_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("I Understand, Continue", callback_data=f"sc:clear_history_arm:{target_chat_id}"),
                 InlineKeyboardButton("Cancel", callback_data=f"sc:clear_history_cancel:{target_chat_id}"),
             ]
         ]
@@ -415,22 +470,74 @@ def _load_latest_reply_payload(store: Any, chat_id: int) -> tuple[dict[str, Any]
     return payload, raw_text, int(attempt.id), str(attempt.status)
 
 
-def _prompt_keyboard(chat_id: int, active_section: str = "prompt") -> InlineKeyboardMarkup:
+def _set_prompt_card_context(
+    application: Application,
+    message_id: int,
+    chat_id: int,
+    attempt_id: int | None,
+) -> None:
+    contexts = _prompt_card_contexts(application)
+    if isinstance(attempt_id, int):
+        contexts[int(message_id)] = {"chat_id": int(chat_id), "attempt_id": int(attempt_id)}
+    else:
+        contexts.pop(int(message_id), None)
+
+
+def _matches_prompt_card_context(application: Application, message_id: int, chat_id: int, attempt_id: int) -> bool:
+    contexts = _prompt_card_contexts(application)
+    payload = contexts.get(int(message_id))
+    if not isinstance(payload, dict):
+        return False
+    return int(payload.get("chat_id", -1)) == int(chat_id) and int(payload.get("attempt_id", -1)) == int(attempt_id)
+
+
+def _prompt_keyboard(
+    chat_id: int,
+    active_section: str = "prompt",
+    attempt_id: int | None = None,
+    send_enabled: bool = False,
+) -> InlineKeyboardMarkup:
     def _btn(code: str) -> InlineKeyboardButton:
         label = PROMPT_SECTION_LABELS.get(code, code)
         if code == active_section:
             label = f"• {label}"
         return InlineKeyboardButton(label, callback_data=f"sc:psec:{code}:{chat_id}")
 
+    if send_enabled and isinstance(attempt_id, int):
+        send_button = InlineKeyboardButton("Send", callback_data=f"sc:send:{chat_id}:{attempt_id}")
+    else:
+        send_button = InlineKeyboardButton("Send unavailable", callback_data="sc:nop")
+
     return InlineKeyboardMarkup(
         [
             [_btn("prompt"), _btn("schema")],
             [_btn("analysis"), _btn("message")],
             [_btn("actions"), _btn("raw")],
+            [send_button],
             [
                 InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
                 InlineKeyboardButton("Delete", callback_data="sc:prompt_delete"),
             ],
+        ]
+    )
+
+
+def _send_confirm_keyboard(chat_id: int, attempt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Confirm Send", callback_data=f"sc:send_confirm:{chat_id}:{attempt_id}"),
+                InlineKeyboardButton("Cancel", callback_data=f"sc:send_cancel:{chat_id}:{attempt_id}"),
+            ]
+        ]
+    )
+
+
+def _send_result_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Cancel/Delete Last", callback_data=f"sc:undo_send:{chat_id}")],
+            [InlineKeyboardButton("Delete", callback_data="sc:prompt_delete")],
         ]
     )
 
@@ -604,6 +711,7 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     memory = store.get_memory_context(chat_id=chat_id)
+    send_enabled = app.bot_data.get("telethon_executor") is not None and isinstance(latest_attempt_id, int)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -617,8 +725,14 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
     )
     sent = await message.reply_text(
         prompt_text,
-        reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="schema"),
+        reply_markup=_prompt_keyboard(
+            chat_id=chat_id,
+            active_section="schema",
+            attempt_id=latest_attempt_id,
+            send_enabled=send_enabled,
+        ),
     )
+    _set_prompt_card_context(app, int(sent.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
     sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
     sent_messages.append(int(sent.message_id))
     if len(sent_messages) > 500:
@@ -646,10 +760,47 @@ async def _handle_clear_history_button(update: Update, context: ContextTypes.DEF
         await query.answer("Invalid chat_id")
         return
 
-    confirm_text = (
+    safety_text = (
+        "Safety check: destructive action\n"
         "Delete stored chat context?\n"
         f"chat_id: /{chat_id}\n"
-        "This deletes events, analyses, directives, attempts and profile data for this chat."
+        "This permanently deletes events, analyses, directives, attempts and profile data.\n"
+        "Please confirm you understand this cannot be undone."
+    )
+    try:
+        await query.edit_message_text(
+            safety_text,
+            reply_markup=_chat_card_clear_safety_keyboard(chat_id),
+        )
+    except Exception:
+        await message.reply_text(safety_text, reply_markup=_chat_card_clear_safety_keyboard(chat_id))
+    await query.answer("Safety check")
+
+
+async def _handle_clear_history_arm_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    try:
+        chat_id = int(data.split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+
+    confirm_text = (
+        "Final confirmation required\n"
+        f"chat_id: /{chat_id}\n"
+        "Press Confirm Delete to permanently erase this chat context."
     )
     try:
         await query.edit_message_text(
@@ -658,7 +809,7 @@ async def _handle_clear_history_button(update: Update, context: ContextTypes.DEF
         )
     except Exception:
         await message.reply_text(confirm_text, reply_markup=_chat_card_clear_confirm_keyboard(chat_id))
-    await query.answer("Confirm deletion")
+    await query.answer("Final confirmation")
 
 
 async def _handle_clear_history_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -778,6 +929,7 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     memory = store.get_memory_context(chat_id=chat_id)
+    send_enabled = app.bot_data.get("telethon_executor") is not None and isinstance(latest_attempt_id, int)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -792,14 +944,243 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
     try:
         await query.edit_message_text(
             prompt_text,
-            reply_markup=_prompt_keyboard(chat_id=chat_id, active_section=section),
+            reply_markup=_prompt_keyboard(
+                chat_id=chat_id,
+                active_section=section,
+                attempt_id=latest_attempt_id,
+                send_enabled=send_enabled,
+            ),
         )
+        _set_prompt_card_context(app, int(message.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
     except Exception:
-        await message.reply_text(
+        sent = await message.reply_text(
             prompt_text,
-            reply_markup=_prompt_keyboard(chat_id=chat_id, active_section=section),
+            reply_markup=_prompt_keyboard(
+                chat_id=chat_id,
+                active_section=section,
+                attempt_id=latest_attempt_id,
+                send_enabled=send_enabled,
+            ),
         )
+        _set_prompt_card_context(app, int(sent.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
     await query.answer(f"Section: {PROMPT_SECTION_LABELS.get(section, section)}")
+
+
+def _load_attempt_for_send(store: Any, chat_id: int, attempt_id: int) -> tuple[Any | None, Any | None, str | None]:
+    attempt = store.get_generation_attempt(attempt_id)
+    if attempt is None:
+        return None, None, "Attempt not found."
+    if int(attempt.chat_id) != int(chat_id):
+        return None, None, "Attempt does not belong to this chat."
+    parsed = parse_structured_model_output(str(attempt.result_text or ""))
+    if parsed is None:
+        return attempt, None, "Attempt payload is invalid and cannot be sent."
+    return attempt, parsed, None
+
+
+async def _handle_send_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await query.answer("Invalid send action")
+        return
+    try:
+        chat_id = int(parts[2])
+        attempt_id = int(parts[3])
+    except ValueError:
+        await query.answer("Invalid ids")
+        return
+    if not _matches_prompt_card_context(app, int(message.message_id), chat_id=chat_id, attempt_id=attempt_id):
+        await query.answer("Card outdated")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    attempt, parsed, error = _load_attempt_for_send(store, chat_id=chat_id, attempt_id=attempt_id)
+    if error:
+        await query.answer(error)
+        return
+    assert attempt is not None and parsed is not None
+    preview = parsed.suggestion.strip()
+    if len(preview) > 700:
+        preview = preview[:697] + "..."
+    action_labels = ", ".join(str(action.get("type") or "?") for action in parsed.actions if isinstance(action, dict))
+    confirm_text = (
+        "Confirm send via Telethon?\n"
+        f"chat_id: /{chat_id}\n"
+        f"attempt_id: {attempt_id}\n"
+        f"actions: {action_labels or '(none)'}\n"
+        "---\n"
+        f"{preview or '(empty message)'}"
+    )
+    try:
+        await query.edit_message_text(confirm_text, reply_markup=_send_confirm_keyboard(chat_id=chat_id, attempt_id=attempt_id))
+        _set_prompt_card_context(app, int(message.message_id), chat_id=chat_id, attempt_id=attempt_id)
+    except Exception:
+        sent = await message.reply_text(confirm_text, reply_markup=_send_confirm_keyboard(chat_id=chat_id, attempt_id=attempt_id))
+        _set_prompt_card_context(app, int(sent.message_id), chat_id=chat_id, attempt_id=attempt_id)
+    await query.answer("Ready to send")
+
+
+async def _handle_send_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    await query.answer("Send cancelled")
+    try:
+        await query.edit_message_text("Send cancelled.")
+    except Exception:
+        await message.reply_text("Send cancelled.")
+
+
+async def _handle_send_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await query.answer("Invalid send action")
+        return
+    try:
+        chat_id = int(parts[2])
+        attempt_id = int(parts[3])
+    except ValueError:
+        await query.answer("Invalid ids")
+        return
+    if not _matches_prompt_card_context(app, int(message.message_id), chat_id=chat_id, attempt_id=attempt_id):
+        await query.answer("Card outdated")
+        return
+    executor = app.bot_data.get("telethon_executor")
+    if executor is None:
+        await query.answer("Telethon sender unavailable")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    attempt, parsed, error = _load_attempt_for_send(store, chat_id=chat_id, attempt_id=attempt_id)
+    if error:
+        await query.answer(error)
+        return
+    assert parsed is not None
+    await query.answer("Sending...")
+    report = await executor.execute_actions(
+        chat_id=chat_id,
+        parsed_output={
+            "message": {"text": parsed.suggestion},
+            "actions": parsed.actions,
+        },
+    )
+    if report.ok:
+        lines = [
+            f"Sent via Telethon for /{chat_id}",
+            f"attempt_id: {attempt_id}",
+            f"actions_executed: {len(report.executed_actions)}",
+        ]
+        if report.sent_message_id is not None:
+            lines.append(f"sent_message_id: {report.sent_message_id}")
+            _last_sent_by_chat(app)[chat_id] = {
+                "message_id": int(report.sent_message_id),
+                "attempt_id": int(attempt_id),
+            }
+        if report.executed_actions:
+            lines.append("---")
+            lines.extend(report.executed_actions[:12])
+        text = "\n".join(lines)
+        try:
+            await query.edit_message_text(text, reply_markup=_send_result_keyboard(chat_id=chat_id))
+        except Exception:
+            await message.reply_text(text, reply_markup=_send_result_keyboard(chat_id=chat_id))
+        return
+
+    errors = "\n".join(report.errors) if report.errors else "unknown error"
+    fail_text = (
+        "Telethon send failed.\n"
+        f"chat_id: /{chat_id}\n"
+        f"attempt_id: {attempt_id}\n"
+        f"failed_action_index: {report.failed_action_index or '?'}\n"
+        "---\n"
+        f"{errors}"
+    )
+    try:
+        await query.edit_message_text(fail_text, reply_markup=_send_result_keyboard(chat_id=chat_id))
+    except Exception:
+        await message.reply_text(fail_text, reply_markup=_send_result_keyboard(chat_id=chat_id))
+
+
+async def _handle_undo_send_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Invalid undo action")
+        return
+    try:
+        chat_id = int(parts[2])
+    except ValueError:
+        await query.answer("Invalid chat id")
+        return
+    executor = app.bot_data.get("telethon_executor")
+    if executor is None:
+        await query.answer("Telethon sender unavailable")
+        return
+    last = _last_sent_by_chat(app).get(chat_id)
+    if not isinstance(last, dict) or not isinstance(last.get("message_id"), int):
+        await query.answer("No sent message to delete")
+        return
+    message_id = int(last["message_id"])
+    try:
+        await executor.delete_message(chat_id=chat_id, message_id=message_id)
+        _last_sent_by_chat(app).pop(chat_id, None)
+        await query.answer("Deleted sent message")
+        await message.reply_text(f"Deleted sent message {message_id} for /{chat_id}.")
+    except Exception as exc:
+        await query.answer("Delete failed")
+        await message.reply_text(f"Delete failed for {message_id} on /{chat_id}: {exc}")
+
+
+async def _handle_noop_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _ = context
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer("Unavailable in current state")
 
 
 async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -852,6 +1233,9 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
             attempt_records = [item for item in records if isinstance(item, dict)]
         if (not valid_output) or error_message:
             status = "error"
+        if status == "ok" and not result_text.strip():
+            status = "error"
+            error_message = "empty model result"
     except Exception as exc:
         status = "error"
         error_message = str(exc)
@@ -1642,10 +2026,16 @@ async def _register_command_menu(application: Application) -> None:
     )
 
 
-def create_bot_app(token: str, service: Any, allowed_chat_id: int | None = None) -> Any:
+def create_bot_app(
+    token: str,
+    service: Any,
+    allowed_chat_id: int | None = None,
+    telethon_executor: Any | None = None,
+) -> Any:
     app = Application.builder().token(token).build()
     app.bot_data["service"] = service
     app.bot_data["allowed_chat_id"] = allowed_chat_id
+    app.bot_data["telethon_executor"] = telethon_executor
     app.bot_data["register_command_menu"] = lambda: _register_command_menu(app)
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("whoami", _cmd_whoami))
@@ -1656,6 +2046,7 @@ def create_bot_app(token: str, service: Any, allowed_chat_id: int | None = None)
     app.add_handler(CallbackQueryHandler(_handle_select_chat_button, pattern=r"^sc:selchat:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_clear_history_button, pattern=r"^sc:clear_history:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_clear_history_arm_button, pattern=r"^sc:clear_history_arm:[0-9]+$"))
     app.add_handler(
         CallbackQueryHandler(_handle_clear_history_confirm_button, pattern=r"^sc:clear_history_confirm:[0-9]+$")
     )
@@ -1663,7 +2054,12 @@ def create_bot_app(token: str, service: Any, allowed_chat_id: int | None = None)
         CallbackQueryHandler(_handle_clear_history_cancel_button, pattern=r"^sc:clear_history_cancel:[0-9]+$")
     )
     app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:schema|analysis|message|actions|raw):[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_send_button, pattern=r"^sc:send:[0-9]+:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_send_confirm_button, pattern=r"^sc:send_confirm:[0-9]+:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_send_cancel_button, pattern=r"^sc:send_cancel:[0-9]+:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_undo_send_button, pattern=r"^sc:undo_send:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
+    app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:nop$"))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
     return app

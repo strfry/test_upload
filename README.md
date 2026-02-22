@@ -115,7 +115,22 @@ JSON-Ausgabe mit Filter:
 python scripts/list_chat_ids.py --folder Scammers --filter scam --json
 ```
 
+Alternativ mit semantischem Alias:
+
+```bash
+python scripts/list_chat_ids.py --folder Scammers --find julia --json
+```
+
 Sicherheitsverhalten: Wenn der Ordner nicht existiert, bricht das Skript mit Fehler ab und gibt keine IDs aus.
+
+One-step Forward mit Query-Auflösung (nur innerhalb `Scammers`):
+
+```bash
+source secret.sh && python3 scripts/telethon_forward_helper.py --source-query julia --limit 20 --delay 0.4
+```
+
+Bei 0 oder mehreren Treffern wird nicht geforwardet; stattdessen gibt das Skript eine Treffer-/Fehlerliste aus.
+Das Ziel wird standardmäßig über `@ScamBaiterControlBot` angesprochen (optional überschreibbar per `--target` oder `SCAMBAITER_CONTROL_TARGET`).
 
 ## Projektstruktur
 
@@ -132,7 +147,7 @@ Sicherheitsverhalten: Wenn der Ordner nicht existiert, bricht das Skript mit Feh
 - `scripts/forward_profile_cli.py`: CLI zum Extrahieren von Profilinformationen aus Beispielen
 - `scripts/run_control_bot.py`: Startet den BotAPI-Modus
 - `scripts/run_tests.py`: Wrapper für Entwicklertests
-- `scripts/dry_run_cli.py`: Testet prompt + response offline
+- `scripts/dry_run_cli.py`: Führt einen read-only Live-Dry-Run gegen das Modell aus (keine DB-Schreibvorgänge)
 - `scripts/telethon_forward_helper.py`: Telethon-Helfer zum automatisierten Weiterleiten kompletter Chats (für Langzeit-Tests)
 - `scripts/list_chat_ids.py`: Liest Chat-IDs ausschließlich aus einem expliziten Telegram-Ordner (Default `Scammers`)
 - `scripts/loop_analyzer.py`: Analysiert Verläufe auf Loops/Wiederholungen

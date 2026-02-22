@@ -21,6 +21,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--folder", default="Scammers", help="Exact Telegram folder name to scan.")
     parser.add_argument("--limit", type=int, default=200, help="Max number of dialogs to list (0 = no limit).")
     parser.add_argument("--filter", default="", help="Optional substring filter for title/username.")
+    parser.add_argument("--find", default="", help="Alias for --filter, optimized for quick ID search.")
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser.parse_args()
 
@@ -112,7 +113,7 @@ async def _run() -> None:
                 break
         if folder_filter is None:
             raise RuntimeError(f"Resolved folder id {folder_id}, but folder object could not be loaded.")
-        needle = args.filter.strip().lower()
+        needle = (args.find or args.filter).strip().lower()
         rows: list[dict[str, Any]] = []
         dialogs = await _iter_folder_dialogs(client, folder_filter=folder_filter, limit=args.limit)
         for dialog in dialogs:
