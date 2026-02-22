@@ -70,3 +70,53 @@ def extract_result_text(response_json: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content.strip()
     return ""
+
+
+def extract_reasoning_details(response_json: dict[str, Any]) -> tuple[int, str]:
+    def _text_from_reasoning(reasoning: object) -> str | None:
+        if isinstance(reasoning, str):
+            normalized = reasoning.strip()
+            return normalized or None
+        if isinstance(reasoning, dict):
+            for key in ("content", "text", "reasoning"):
+                value = reasoning.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            # There might be nested structures; try flattening to JSON.
+            try:
+                return json.dumps(reasoning, ensure_ascii=True)
+            except Exception:
+                return None
+        if isinstance(reasoning, list):
+            parts: list[str] = []
+            for item in reasoning:
+                text_part = _text_from_reasoning(item)
+                if text_part:
+                    parts.append(text_part)
+            return "\n".join(parts) if parts else None
+        return None
+
+    cycles = 0
+    snippet: str = ""
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return 0, ""
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        reasoning = message.get("reasoning")
+        if reasoning is None:
+            continue
+        text = _text_from_reasoning(reasoning)
+        if text:
+            cycles += 1
+            if not snippet:
+                snippet = text
+        else:
+            cycles += 1
+    if snippet and len(snippet) > 1000:
+        snippet = snippet[: 997] + "..."
+    return cycles, snippet

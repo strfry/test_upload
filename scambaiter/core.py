@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .forward_meta import baiter_name_from_meta, scammer_name_from_meta
-from .model_client import call_hf_openai_chat, extract_result_text
+from .model_client import call_hf_openai_chat, extract_reasoning_details, extract_result_text
 
 EventType = str
 RoleType = str
@@ -1034,6 +1034,8 @@ class ScambaiterCore:
         attempts: list[dict[str, Any]] = []
         initial_messages = self.build_model_messages(chat_id=chat_id, include_memory=False)
         initial_prompt = {"messages": initial_messages, "max_tokens": max_tokens}
+        reasoning_cycles = 0
+        reasoning_snippet: str = ""
 
         try:
             initial_response = call_hf_openai_chat(
@@ -1045,6 +1047,7 @@ class ScambaiterCore:
                 base_url=None,
             )
             initial_text = extract_result_text(initial_response)
+            reasoning_cycles, reasoning_snippet = extract_reasoning_details(initial_response)
         except Exception as exc:
             attempts.append(
                 {
@@ -1074,6 +1077,8 @@ class ScambaiterCore:
                 "repair_available": False,
                 "repair_context": None,
                 "attempts": attempts,
+                "reasoning_cycles": reasoning_cycles,
+                "reasoning_snippet": reasoning_snippet,
             }
 
         parsed_result = parse_structured_model_output_detailed(initial_text)
@@ -1098,9 +1103,85 @@ class ScambaiterCore:
             }
         )
 
+        final_reasoning_cycles = reasoning_cycles
+        final_reasoning_snippet = reasoning_snippet
         final_prompt = initial_prompt
         final_response = initial_response
         final_text = initial_text
+
+        if parsed is None and reasoning_cycles > 0:
+            retry_prompt_message = (
+                "I only received your reasoning. "
+                "Continue the thought above and return a valid scambait.llm.v1 payload "
+                "(analysis/message/actions)."
+            )
+            if reasoning_snippet:
+                retry_prompt_message += f"\nReasoning snippet:\n{reasoning_snippet}"
+            follow_messages = initial_messages + [
+                {"role": "user", "content": retry_prompt_message}
+            ]
+            follow_prompt = {"messages": follow_messages, "max_tokens": max_tokens}
+            try:
+                follow_response = call_hf_openai_chat(
+                    token=token,
+                    model=model,
+                    messages=follow_messages,
+                    max_tokens=max_tokens,
+                    base_url=None,
+                )
+                follow_text = extract_result_text(follow_response)
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "phase": "reasoning_retry",
+                        "status": "error",
+                        "accepted": False,
+                        "reject_reason": "provider_error",
+                        "error_message": str(exc),
+                        "prompt_json": follow_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                    }
+                )
+                return {
+                    "provider": "huggingface_openai_compat",
+                    "model": model,
+                    "prompt_json": follow_prompt,
+                    "response_json": {},
+                    "result_text": "",
+                    "valid_output": False,
+                    "parsed_output": None,
+                    "contract_issues": [],
+                    "outcome_class": "provider_error",
+                    "semantic_conflict": False,
+                    "conflict": None,
+                    "pivot": None,
+                    "repair_available": False,
+                    "repair_context": None,
+                    "error_message": str(exc),
+                    "attempts": attempts,
+                    "reasoning_cycles": final_reasoning_cycles,
+                    "reasoning_snippet": final_reasoning_snippet,
+                }
+            follow_result = parse_structured_model_output_detailed(follow_text)
+            parsed = follow_result.output
+            parsed_result = follow_result
+            attempts.append(
+                {
+                    "phase": "reasoning_retry",
+                    "status": "ok" if parsed is not None else "invalid",
+                    "accepted": parsed is not None,
+                    "reject_reason": None,
+                    "error_message": None,
+                    "contract_issues": [item.as_dict() for item in follow_result.issues] if parsed is None else [],
+                    "prompt_json": follow_prompt,
+                    "response_json": follow_response,
+                    "result_text": follow_text,
+                }
+            )
+            final_prompt = follow_prompt
+            final_response = follow_response
+            final_text = follow_text
 
         contract_issues: list[dict[str, Any]] = []
         if parsed is None:
@@ -1185,6 +1266,8 @@ class ScambaiterCore:
                 )
             ),
             "attempts": attempts,
+            "reasoning_cycles": final_reasoning_cycles,
+            "reasoning_snippet": final_reasoning_snippet,
         }
 
     def run_hf_dry_run_repair(
