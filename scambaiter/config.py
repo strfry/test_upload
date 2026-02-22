@@ -13,6 +13,8 @@ class Config:
     hf_token: str | None = None
     hf_model: str | None = None
     hf_base_url: str | None = None
+    hf_memory_model: str | None = None
+    hf_memory_max_tokens: int = 150000
 
 
 def load_config() -> Config:
@@ -24,4 +26,6 @@ def load_config() -> Config:
         hf_token=os.getenv("HF_TOKEN"),
         hf_model=os.getenv("HF_MODEL"),
         hf_base_url=os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1"),
+        hf_memory_model=os.getenv("HF_MEMORY_MODEL", "openai/gpt-oss-120b"),
+        hf_memory_max_tokens=int(os.getenv("HF_MEMORY_MAX_TOKENS", "150000")),
     )

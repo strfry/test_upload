@@ -83,6 +83,15 @@ class GenerationAttempt:
     created_at: str
 
 
+@dataclass(slots=True)
+class MemoryContext:
+    chat_id: int
+    summary: dict[str, Any]
+    cursor_event_id: int
+    model: str
+    last_updated_at: str
+
+
 class AnalysisStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -179,6 +188,17 @@ class AnalysisStore:
                 accepted INTEGER NOT NULL DEFAULT 0,
                 reject_reason TEXT,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_contexts (
+                chat_id INTEGER PRIMARY KEY,
+                summary_json TEXT NOT NULL,
+                cursor_event_id INTEGER NOT NULL DEFAULT 0,
+                model TEXT NOT NULL,
+                last_updated_at TEXT NOT NULL
             )
             """
         )
@@ -402,6 +422,33 @@ class AnalysisStore:
             for row in rows
         ]
 
+    def clear_chat_history(self, chat_id: int) -> int:
+        cur = self._conn.execute("DELETE FROM events WHERE chat_id = ?", (chat_id,))
+        self._conn.commit()
+        deleted = cur.rowcount
+        if deleted is None or deleted < 0:
+            return 0
+        return int(deleted)
+
+    def clear_chat_context(self, chat_id: int) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        table_map = {
+            "events": "events",
+            "analyses": "analyses",
+            "directives": "directives",
+            "generation_attempts": "generation_attempts",
+            "profile_changes": "profile_change_log",
+            "chat_profile": "chat_profiles",
+            "memory_context": "memory_contexts",
+        }
+        for label, table in table_map.items():
+            cur = self._conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
+            rowcount = cur.rowcount
+            counts[label] = int(rowcount) if isinstance(rowcount, int) and rowcount > 0 else 0
+        self._conn.commit()
+        counts["total"] = sum(counts.values())
+        return counts
+
     def list_chat_ids(self, limit: int = 100) -> list[int]:
         rows = self._conn.execute(
             """
@@ -412,6 +459,8 @@ class AnalysisStore:
                 SELECT DISTINCT chat_id AS chat_id FROM analyses
                 UNION
                 SELECT DISTINCT chat_id AS chat_id FROM chat_profiles
+                UNION
+                SELECT DISTINCT chat_id AS chat_id FROM memory_contexts
             )
             ORDER BY chat_id ASC
             LIMIT ?
@@ -419,6 +468,62 @@ class AnalysisStore:
             (limit,),
         ).fetchall()
         return [int(row["chat_id"]) for row in rows]
+
+    def get_memory_context(self, chat_id: int) -> MemoryContext | None:
+        row = self._conn.execute(
+            """
+            SELECT chat_id, summary_json, cursor_event_id, model, last_updated_at
+            FROM memory_contexts
+            WHERE chat_id = ?
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MemoryContext(
+            chat_id=int(row["chat_id"]),
+            summary=self._loads_dict(row["summary_json"]),
+            cursor_event_id=int(row["cursor_event_id"]),
+            model=str(row["model"]),
+            last_updated_at=str(row["last_updated_at"]),
+        )
+
+    def upsert_memory_context(
+        self,
+        chat_id: int,
+        summary: dict[str, Any],
+        cursor_event_id: int,
+        model: str,
+        last_updated_at: str | None = None,
+    ) -> MemoryContext:
+        ts = last_updated_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._conn.execute(
+            """
+            INSERT INTO memory_contexts(chat_id, summary_json, cursor_event_id, model, last_updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                summary_json = excluded.summary_json,
+                cursor_event_id = excluded.cursor_event_id,
+                model = excluded.model,
+                last_updated_at = excluded.last_updated_at
+            """,
+            (chat_id, json.dumps(summary, ensure_ascii=True), int(cursor_event_id), model, ts),
+        )
+        self._conn.commit()
+        return MemoryContext(
+            chat_id=chat_id,
+            summary=summary,
+            cursor_event_id=int(cursor_event_id),
+            model=model,
+            last_updated_at=ts,
+        )
+
+    def clear_memory_context(self, chat_id: int) -> int:
+        cur = self._conn.execute("DELETE FROM memory_contexts WHERE chat_id = ?", (chat_id,))
+        self._conn.commit()
+        rowcount = cur.rowcount
+        return int(rowcount) if isinstance(rowcount, int) and rowcount > 0 else 0
 
     def get_chat_profile(self, chat_id: int) -> ChatProfile | None:
         row = self._conn.execute(

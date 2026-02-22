@@ -19,6 +19,7 @@ from scambaiter.bot_api import (
     _resolve_target_and_role_without_active,
     ingest_forwarded_message,
 )
+from scambaiter.forward_meta import baiter_name_from_meta, scammer_name_from_meta
 from scambaiter.storage import AnalysisStore
 
 
@@ -49,12 +50,17 @@ class _FakeMessage:
                 {
                     "date": origin_date,
                     "message_id": forward_message_id,
-                    "sender_user": type("User", (), {"id": 99})(),
+                    "sender_user": type(
+                        "User",
+                        (),
+                        {"id": 99, "username": "scammer123", "first_name": "Scam", "last_name": "Mer"},
+                    )(),
                     "sender_chat": None,
                 },
             )()
         else:
             self.forward_origin = None
+        self.from_user = type("ControlUser", (), {"id": 555, "username": "baiter", "first_name": "Baiter", "last_name": "Tester"})()
 
 
 class BotApiForwardIngestTest(unittest.TestCase):
@@ -216,6 +222,22 @@ class BotApiForwardIngestTest(unittest.TestCase):
             self.assertEqual("scammer", record.role)
             events = store.list_events(chat_id=1234, limit=10)
             self.assertEqual(1, len(events))
+
+    def test_forward_payload_stores_scanner_and_baiter_metadata(self) -> None:
+        message = _FakeMessage(
+            chat_id=5000,
+            message_id=30,
+            text="meta test",
+            caption=None,
+            has_photo=False,
+            with_forward_origin=True,
+        )
+        payload = _build_forward_payload(message, role="manual")
+        meta = payload.get("meta") or {}
+        self.assertIn("forward_profile", meta)
+        self.assertIn("control_sender", meta)
+        self.assertEqual("Scam Mer", scammer_name_from_meta(meta))
+        self.assertEqual("Baiter Tester", baiter_name_from_meta(meta))
 
     def test_resolve_target_and_role_without_active_for_scammer_sender(self) -> None:
         message = _FakeMessage(

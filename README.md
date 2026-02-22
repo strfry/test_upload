@@ -44,3 +44,23 @@ Im Control-Chat:
 - `/chat <chat_id>` setzt den Ziel-Chat fuer Forwards.
 - Forwarded Nachrichten werden direkt in den Event-Store ingestiert.
 - `/history` zeigt die zuletzt gespeicherten Events des aktiven Ziel-Chats.
+
+## Tests
+
+Dev-Setup:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+```
+
+Tests ausfuehren:
+
+```bash
+python3 -m pytest -q
+```
+
+oder ueber den Repo-Runner:
+
+```bash
+python3 scripts/run_tests.py -q
+```

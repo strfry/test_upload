@@ -10,6 +10,8 @@ from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Mes
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+from scambaiter.forward_meta import baiter_name_from_meta, scammer_name_from_meta
+
 
 def _resolve_store(service: Any) -> Any:
     store = getattr(service, "store", None)
@@ -155,6 +157,7 @@ async def _send_control_text(
     *,
     parse_mode: str | None = None,
     replace_previous_status: bool = True,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     if len(text) > 3500:
         text = text[:3497] + "..."
@@ -167,7 +170,12 @@ async def _send_control_text(
                 await application.bot.delete_message(chat_id=chat_id, message_id=previous_id)
             except Exception:
                 pass
-    sent = await message.reply_text(text, parse_mode=parse_mode, disable_web_page_preview=True)
+    sent = await message.reply_text(
+        text,
+        parse_mode=parse_mode,
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
     sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
     sent_messages.append(int(sent.message_id))
     if len(sent_messages) > 500:
@@ -190,6 +198,33 @@ def _render_user_card(
         f"events: {event_count}\n"
         f"{profile_block}\n"
         f"last: {preview}"
+    )
+
+
+def _chat_card_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
+            [InlineKeyboardButton("Delete Context", callback_data=f"sc:clear_history:{target_chat_id}")],
+        ]
+    )
+
+
+def _known_chats_keyboard(chat_ids: list[int], max_buttons: int = 30) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in chat_ids[:max_buttons]:
+        rows.append([InlineKeyboardButton(f"/{item}", callback_data=f"sc:selchat:{item}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _chat_card_clear_confirm_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Confirm Delete", callback_data=f"sc:clear_history_confirm:{target_chat_id}"),
+                InlineKeyboardButton("Cancel", callback_data=f"sc:clear_history_cancel:{target_chat_id}"),
+            ]
+        ]
     )
 
 
@@ -294,9 +329,7 @@ async def _show_user_card(
     sent = await application.bot.send_message(
         chat_id=chat_id,
         text=_render_user_card(target_chat_id, len(events), last_preview, profile_lines),
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")]]
-        ),
+        reply_markup=_chat_card_keyboard(target_chat_id),
     )
     sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
     sent_messages.append(int(sent.message_id))
@@ -552,6 +585,121 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
     if len(sent_messages) > 500:
         del sent_messages[: len(sent_messages) - 500]
     await query.answer("Prompt generated")
+
+
+async def _handle_clear_history_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    try:
+        chat_id = int(data.split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+
+    confirm_text = (
+        "Delete stored chat context?\n"
+        f"chat_id: /{chat_id}\n"
+        "This deletes events, analyses, directives, attempts and profile data for this chat."
+    )
+    try:
+        await query.edit_message_text(
+            confirm_text,
+            reply_markup=_chat_card_clear_confirm_keyboard(chat_id),
+        )
+    except Exception:
+        await message.reply_text(confirm_text, reply_markup=_chat_card_clear_confirm_keyboard(chat_id))
+    await query.answer("Confirm deletion")
+
+
+async def _handle_clear_history_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    try:
+        chat_id = int(data.split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    deleted = store.clear_chat_context(chat_id=chat_id)
+    pending_messages = getattr(service, "_pending_messages", None)
+    pending_removed = 0
+    if isinstance(pending_messages, dict) and chat_id in pending_messages:
+        pending_messages.pop(chat_id, None)
+        pending_removed = 1
+    await query.answer(f"Deleted context ({deleted.get('total', 0)} rows)")
+    summary_lines = [
+        f"Deleted context for /{chat_id}",
+        f"- events: {deleted.get('events', 0)}",
+        f"- analyses: {deleted.get('analyses', 0)}",
+        f"- directives: {deleted.get('directives', 0)}",
+        f"- attempts: {deleted.get('generation_attempts', 0)}",
+        f"- profile changes: {deleted.get('profile_changes', 0)}",
+        f"- profile: {deleted.get('chat_profile', 0)}",
+        f"- pending runtime message: {pending_removed}",
+        f"- total rows: {deleted.get('total', 0)}",
+    ]
+    # Delete the chat-card/confirm card itself after destructive action.
+    await _delete_control_message(message)
+    _last_user_card_message(app).pop(int(message.chat_id), None)
+    await _send_control_text(
+        application=app,
+        message=message,
+        text="\n".join(summary_lines),
+        replace_previous_status=False,
+    )
+
+
+async def _handle_clear_history_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    try:
+        chat_id = int(data.split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    await query.answer("Cancelled")
+    await _show_user_card(
+        application=app,
+        control_chat_id=int(message.chat_id),
+        store=store,
+        target_chat_id=chat_id,
+    )
 
 
 async def _handle_prompt_section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -957,6 +1105,20 @@ def _resolve_target_and_role_without_active(
     return sender_id, "scammer"
 
 
+def _control_sender_info(message: Message) -> dict[str, Any] | None:
+    sender = getattr(message, "from_user", None)
+    if sender is None:
+        return None
+    info: dict[str, Any] = {}
+    for field in ("id", "username", "first_name", "last_name"):
+        value = getattr(sender, field, None)
+        if value not in (None, ""):
+            info[field] = value
+    if info:
+        return info
+    return None
+
+
 def _build_forward_payload(message: Message, role: str) -> dict[str, Any]:
     event_type = _infer_event_type(message)
     source_message_id = _build_source_message_id(message)
@@ -965,6 +1127,9 @@ def _build_forward_payload(message: Message, role: str) -> dict[str, Any]:
         "control_message_id": int(message.message_id),
         "forward_profile": _extract_forward_profile_info(message),
     }
+    control_sender = _control_sender_info(message)
+    if control_sender:
+        meta["control_sender"] = control_sender
     return {
         "event_type": event_type,
         "source_message_id": source_message_id,
@@ -1194,6 +1359,15 @@ async def _set_active_chat_from_id(update: Update, context: ContextTypes.DEFAULT
         )
     else:
         await _send_control_text(application=app, message=message, text=f"Active target chat set to {target_chat_id}.")
+
+    if not store.list_events(chat_id=target_chat_id, limit=1):
+        await _send_control_text(
+            application=app,
+            message=message,
+            text=f"No stored events for {target_chat_id}; cannot render Chat Card.",
+        )
+        return
+
     await _show_user_card(
         application=app,
         control_chat_id=int(message.chat_id),
@@ -1231,8 +1405,40 @@ async def _cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not chat_ids:
         await _send_control_text(application=app, message=message, text="No chat history stored yet.")
         return
-    lines = "\n".join(f"/{item} (/c{item})" for item in chat_ids)
-    await _send_control_text(application=app, message=message, text=f"Known chat ids:\n{lines}")
+    shown = chat_ids[:30]
+    extra = len(chat_ids) - len(shown)
+    title = f"Known chat ids ({len(chat_ids)} total):\nSelect one:"
+    if extra > 0:
+        title += f"\n(showing first {len(shown)}, {extra} hidden)"
+    await _send_control_text(
+        application=app,
+        message=message,
+        text=title,
+        reply_markup=_known_chats_keyboard(chat_ids),
+    )
+
+
+async def _handle_select_chat_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    data = query.data or ""
+    try:
+        target_chat_id = int(data.split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    await query.answer("Chat selected")
+    await _set_active_chat_from_id(update, context, target_chat_id)
 
 
 async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1261,8 +1467,26 @@ async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not events:
         await _send_control_text(application=app, message=message, text=f"No events stored for {target_chat_id}.")
         return
+    summary_scammer = None
+    summary_baiter = None
+    for event in events:
+        meta = getattr(event, "meta", None)
+        if summary_scammer is None:
+            summary_scammer = scammer_name_from_meta(meta)
+        if summary_baiter is None:
+            summary_baiter = baiter_name_from_meta(meta)
+        if summary_scammer and summary_baiter:
+            break
+    summary_text = (
+        f"Scammer: {summary_scammer or 'unknown'}\n"
+        f"Baiter: {summary_baiter or 'unknown'}"
+    )
     lines = [_format_history_line(event) for event in events[-12:]]
-    await _send_control_text(application=app, message=message, text=f"History {target_chat_id}:\n" + "\n".join(lines))
+    await _send_control_text(
+        application=app,
+        message=message,
+        text=f"History {target_chat_id}:\n{summary_text}\n" + "\n".join(lines),
+    )
 
 
 async def _handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1357,7 +1581,15 @@ def create_bot_app(token: str, service: Any, allowed_chat_id: int | None = None)
     app.add_handler(CommandHandler("chats", _cmd_chats))
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(MessageHandler(filters.Regex(r"^/(?:c)?[0-9]+(?:\s.*)?$"), _cmd_chat_id_shortcut))
+    app.add_handler(CallbackQueryHandler(_handle_select_chat_button, pattern=r"^sc:selchat:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_clear_history_button, pattern=r"^sc:clear_history:[0-9]+$"))
+    app.add_handler(
+        CallbackQueryHandler(_handle_clear_history_confirm_button, pattern=r"^sc:clear_history_confirm:[0-9]+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_handle_clear_history_cancel_button, pattern=r"^sc:clear_history_cancel:[0-9]+$")
+    )
     app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:schema|analysis|message|actions|raw):[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from .forward_meta import baiter_name_from_meta, scammer_name_from_meta
 from .model_client import call_hf_openai_chat, extract_result_text
 
 EventType = str
@@ -26,8 +27,27 @@ Allowed action types:
 - wait (value >=0, unit in seconds|minutes; max 86400 seconds / 10080 minutes)
 - send_message (optional reply_to, optional send_at_utc)
 - edit_message (message_id, new_text)
+- delete_message (message_id)
 - noop
 - escalate_to_human (reason)
+"""
+
+MEMORY_SUMMARY_PROMPT_CONTRACT = """You are ScamBaiter memory summarizer.
+Return exactly one valid JSON object with this schema:
+{
+  "schema": "scambait.memory.v1",
+  "claimed_identity": {"name": string, "role_claim": string, "confidence": "low|medium|high"},
+  "narrative": {"phase": string, "short_story": string, "timeline_points": [string]},
+  "current_intent": {"scammer_intent": string, "baiter_intent": string, "latest_topic": string},
+  "key_facts": object,
+  "risk_flags": [string],
+  "open_questions": [string],
+  "next_focus": [string]
+}
+Rules:
+- JSON only, no markdown or prose outside JSON.
+- Keep key_facts concise and evidence-based.
+- Use empty arrays/objects if information is missing.
 """
 
 ALLOWED_TOP_LEVEL_KEYS = {"schema", "analysis", "message", "actions"}
@@ -348,16 +368,182 @@ class ScambaiterCore:
             )
         return self._trim_prompt_events(prompt_events, token_budget)
 
-    def build_model_messages(self, chat_id: int) -> list[dict[str, str]]:
-        prompt_events = self.build_prompt_events(chat_id=chat_id)
+    def build_memory_events(self, chat_id: int, after_event_id: int = 0) -> list[dict[str, Any]]:
+        events = self.store.list_events(chat_id=chat_id, limit=5000)
+        out: list[dict[str, Any]] = []
+        for event in events:
+            event_id = int(getattr(event, "id", 0))
+            if event_id <= int(after_event_id):
+                continue
+            meta = getattr(event, "meta", None)
+            if not isinstance(meta, dict):
+                meta = {}
+            media_type = str(getattr(event, "event_type", "") or "")
+            caption = None
+            if media_type == "photo":
+                text_value = getattr(event, "text", None)
+                if isinstance(text_value, str) and text_value.strip():
+                    caption = text_value.strip()
+            out.append(
+                {
+                    "event_id": event_id,
+                    "ts_utc": getattr(event, "ts_utc", None),
+                    "role": getattr(event, "role", None),
+                    "scammer_username": scammer_name_from_meta(meta),
+                    "baiter_username": baiter_name_from_meta(meta),
+                    "text": getattr(event, "text", None),
+                    "caption": caption,
+                    "citation": meta.get("citation"),
+                    "media_type": media_type,
+                }
+            )
+        return out
+
+    def _build_memory_messages(
+        self,
+        *,
+        chat_id: int,
+        cursor_event_id: int,
+        existing_memory: dict[str, Any] | None,
+        events: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        payload = {
+            "schema": "scambait.memory.input.v1",
+            "chat_id": chat_id,
+            "memory_cursor_event_id": int(cursor_event_id),
+            "existing_memory": existing_memory,
+            "events": events,
+        }
+        return [
+            {"role": "system", "content": MEMORY_SUMMARY_PROMPT_CONTRACT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+        ]
+
+    @staticmethod
+    def _parse_memory_summary_output(text: str) -> dict[str, Any] | None:
+        cleaned = strip_think_segments(text)
+        try:
+            value = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        if str(value.get("schema") or "").strip() != "scambait.memory.v1":
+            return None
+        required = {
+            "claimed_identity",
+            "narrative",
+            "current_intent",
+            "key_facts",
+            "risk_flags",
+            "open_questions",
+            "next_focus",
+        }
+        if not required.issubset(value.keys()):
+            return None
+        return value
+
+    def ensure_memory_context(self, chat_id: int, force_refresh: bool = False) -> dict[str, Any]:
+        current = self.store.get_memory_context(chat_id=chat_id)
+        if current is not None and not force_refresh:
+            return {"summary": current.summary, "cursor_event_id": current.cursor_event_id, "updated": False}
+        cursor = 0
+        existing_summary = None
+        if current is not None and force_refresh:
+            existing_summary = current.summary
+        token = (getattr(self.config, "hf_token", None) or "").strip()
+        model = (getattr(self.config, "hf_memory_model", None) or "").strip() or "openai/gpt-oss-120b"
+        max_tokens = int(getattr(self.config, "hf_memory_max_tokens", 150000))
+        if not token:
+            # Offline-safe fallback when HF token is unavailable.
+            fallback_summary = {
+                "schema": "scambait.memory.v1",
+                "claimed_identity": {"name": "", "role_claim": "", "confidence": "low"},
+                "narrative": {"phase": "unknown", "short_story": "", "timeline_points": []},
+                "current_intent": {"scammer_intent": "", "baiter_intent": "", "latest_topic": ""},
+                "key_facts": {},
+                "risk_flags": [],
+                "open_questions": [],
+                "next_focus": [],
+            }
+            if current is None or force_refresh:
+                latest = self.store.list_events(chat_id=chat_id, limit=1)
+                latest_id = int(latest[-1].id) if latest else 0
+                saved = self.store.upsert_memory_context(
+                    chat_id=chat_id,
+                    summary=fallback_summary,
+                    cursor_event_id=latest_id,
+                    model=model,
+                )
+                return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
+            return {"summary": fallback_summary, "cursor_event_id": 0, "updated": False}
+
+        events = self.build_memory_events(chat_id=chat_id, after_event_id=cursor)
+        if not events:
+            if current is not None:
+                return {"summary": current.summary, "cursor_event_id": current.cursor_event_id, "updated": False}
+            empty_summary = {
+                "schema": "scambait.memory.v1",
+                "claimed_identity": {"name": "", "role_claim": "", "confidence": "low"},
+                "narrative": {"phase": "empty", "short_story": "", "timeline_points": []},
+                "current_intent": {"scammer_intent": "", "baiter_intent": "", "latest_topic": ""},
+                "key_facts": {},
+                "risk_flags": [],
+                "open_questions": [],
+                "next_focus": [],
+            }
+            saved = self.store.upsert_memory_context(
+                chat_id=chat_id,
+                summary=empty_summary,
+                cursor_event_id=0,
+                model=model,
+            )
+            return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
+
+        messages = self._build_memory_messages(
+            chat_id=chat_id,
+            cursor_event_id=cursor,
+            existing_memory=existing_summary,
+            events=events,
+        )
+        response = call_hf_openai_chat(
+            token=token,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            base_url=(getattr(self.config, "hf_base_url", None) or None),
+        )
+        result_text = extract_result_text(response)
+        parsed = self._parse_memory_summary_output(result_text)
+        if parsed is None:
+            raise RuntimeError("invalid memory summary contract (expected scambait.memory.v1)")
+        latest_cursor = int(events[-1]["event_id"])
+        saved = self.store.upsert_memory_context(
+            chat_id=chat_id,
+            summary=parsed,
+            cursor_event_id=latest_cursor,
+            model=model,
+        )
+        return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
+
+    def build_model_messages(
+        self,
+        chat_id: int,
+        token_limit: int | None = None,
+        force_refresh_memory: bool = False,
+        include_memory: bool = True,
+    ) -> list[dict[str, str]]:
+        prompt_events = self.build_prompt_events(chat_id=chat_id, token_limit=token_limit)
+        memory_state: dict[str, Any] = {"summary": {}, "cursor_event_id": 0, "updated": False}
+        if include_memory:
+            memory_state = self.ensure_memory_context(chat_id=chat_id, force_refresh=force_refresh_memory)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT_CONTRACT},
             {
                 "role": "system",
                 "content": (
-                    "Chat context for chat_id="
-                    f"{chat_id}. Events are chronological. "
-                    "Prefer the newest user/scammer intent."
+                    "Memory summary for chat_id="
+                    f"{chat_id}: {json.dumps(memory_state.get('summary') or {}, ensure_ascii=True)}"
                 ),
             },
         ]
@@ -379,7 +565,7 @@ class ScambaiterCore:
         max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))
 
         attempts: list[dict[str, Any]] = []
-        initial_messages = self.build_model_messages(chat_id=chat_id)
+        initial_messages = self.build_model_messages(chat_id=chat_id, include_memory=False)
         initial_prompt = {"messages": initial_messages, "max_tokens": max_tokens}
 
         try:

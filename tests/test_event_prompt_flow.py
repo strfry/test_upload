@@ -61,6 +61,117 @@ class EventAndPromptFlowTest(unittest.TestCase):
             self.assertEqual("newest short", prompt_events[-1]["text"])
             self.assertFalse(any(item.get("text") == "old message that should be dropped first" for item in prompt_events))
 
+    def test_build_model_messages_contains_memory_summary_system_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            config = SimpleNamespace(hf_max_tokens=100, hf_token="")
+            core = ScambaiterCore(config=config, store=store)
+            store.ingest_event(chat_id=2010, event_type="message", role="scammer", text="hello")
+
+            messages = core.build_model_messages(chat_id=2010)
+
+            self.assertGreaterEqual(len(messages), 3)
+            self.assertEqual("system", messages[0]["role"])
+            self.assertEqual("system", messages[1]["role"])
+            self.assertIn("Memory summary for chat_id=2010", messages[1]["content"])
+            memory = store.get_memory_context(chat_id=2010)
+            self.assertIsNotNone(memory)
+
+    def test_memory_context_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            saved = store.upsert_memory_context(
+                chat_id=2020,
+                summary={"schema": "scambait.memory.v1", "current_intent": {}},
+                cursor_event_id=17,
+                model="openai/gpt-oss-120b",
+            )
+            self.assertEqual(2020, saved.chat_id)
+            loaded = store.get_memory_context(chat_id=2020)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(17, loaded.cursor_event_id)
+            self.assertEqual("openai/gpt-oss-120b", loaded.model)
+            self.assertEqual("scambait.memory.v1", loaded.summary.get("schema"))
+
+    def test_clear_chat_history_deletes_events_for_target_chat_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+
+            store.ingest_event(chat_id=3001, event_type="message", role="manual", text="a")
+            store.ingest_event(chat_id=3001, event_type="message", role="scammer", text="b")
+            store.ingest_event(chat_id=3002, event_type="message", role="manual", text="other")
+
+            deleted = store.clear_chat_history(chat_id=3001)
+
+            self.assertEqual(2, deleted)
+            self.assertEqual(0, len(store.list_events(chat_id=3001, limit=10)))
+            self.assertEqual(1, len(store.list_events(chat_id=3002, limit=10)))
+
+    def test_clear_chat_context_deletes_all_context_tables_for_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+
+            # Seed full context for target chat.
+            store.ingest_event(chat_id=4001, event_type="message", role="manual", text="e1")
+            store.save(
+                chat_id=4001,
+                title="t",
+                suggestion="s",
+                analysis={"a": 1},
+                actions=[{"type": "send_message"}],
+                metadata={"schema": "scambait.llm.v1"},
+            )
+            store.add_directive(chat_id=4001, text="d1", scope="chat")
+            store.save_generation_attempt(
+                chat_id=4001,
+                provider="hf",
+                model="m",
+                prompt_json={"messages": []},
+                response_json={},
+                result_text="{}",
+                status="ok",
+            )
+            store.upsert_chat_profile(
+                chat_id=4001,
+                patch={"identity": {"display_name": "X"}},
+                source="botapi_forward",
+                changed_at="2026-02-21T20:20:00Z",
+            )
+            store.upsert_memory_context(
+                chat_id=4001,
+                summary={"schema": "scambait.memory.v1"},
+                cursor_event_id=1,
+                model="openai/gpt-oss-120b",
+            )
+
+            # Seed another chat to ensure isolation.
+            store.ingest_event(chat_id=4002, event_type="message", role="manual", text="other")
+
+            deleted = store.clear_chat_context(chat_id=4001)
+
+            self.assertGreaterEqual(deleted.get("events", 0), 1)
+            self.assertGreaterEqual(deleted.get("analyses", 0), 1)
+            self.assertGreaterEqual(deleted.get("directives", 0), 1)
+            self.assertGreaterEqual(deleted.get("generation_attempts", 0), 1)
+            self.assertGreaterEqual(deleted.get("profile_changes", 0), 1)
+            self.assertGreaterEqual(deleted.get("chat_profile", 0), 1)
+            self.assertGreaterEqual(deleted.get("memory_context", 0), 1)
+            self.assertGreaterEqual(deleted.get("total", 0), 7)
+
+            self.assertEqual(0, len(store.list_events(chat_id=4001, limit=10)))
+            self.assertIsNone(store.latest_for_chat(chat_id=4001))
+            self.assertEqual(0, len(store.list_directives(chat_id=4001, active_only=False, limit=10)))
+            self.assertEqual(0, len(store.list_generation_attempts(chat_id=4001, limit=10)))
+            self.assertIsNone(store.get_chat_profile(chat_id=4001))
+            self.assertIsNone(store.get_memory_context(chat_id=4001))
+
+            self.assertEqual(1, len(store.list_events(chat_id=4002, limit=10)))
+
 
 if __name__ == "__main__":
     unittest.main()
