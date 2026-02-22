@@ -926,14 +926,26 @@ def _schedule_user_card_update(
     tasks[control_chat_id] = asyncio.create_task(_runner())
 
 
+def _placeholder_for_event_type(event_type: str | None) -> str:
+    label = str(event_type or "event").strip().lower()
+    if not label:
+        label = "event"
+    return f"[{label}]"
+
+
 def _render_prompt_card_text(chat_id: int, prompt_events: list[dict[str, Any]], max_lines: int = 24) -> str:
     lines = [f"Prompt Card", f"chat_id: /{chat_id}", f"events_in_prompt: {len(prompt_events)}", "---"]
     tail = prompt_events[-max_lines:]
     for item in tail:
         role = str(item.get("role", "unknown"))
         time = str(item.get("time") or "--:--")
-        text = str(item.get("text") or "")
-        compact = " ".join(text.split())
+        event_type = str(item.get("event_type") or "message")
+        raw_text = item.get("text")
+        compact = ""
+        if isinstance(raw_text, str) and raw_text.strip():
+            compact = " ".join(raw_text.split())
+        if not compact:
+            compact = _placeholder_for_event_type(event_type)
         if len(compact) > 220:
             compact = compact[:217] + "..."
         lines.append(f"{time} {role}: {compact}")
@@ -1164,21 +1176,79 @@ def _render_memory_compact(summary: dict[str, Any], meta: dict[str, Any], *, cha
     return _trim_block("\n".join(lines))
 
 
+def _parse_prompt_event_content(content: str | None) -> tuple[str | None, str | None, str | None, str | None, bool]:
+    if not isinstance(content, str):
+        return None, None, None, None
+    trimmed = content.strip()
+    if not trimmed:
+        return None, None, None, None
+    normalized_trimmed = " ".join(trimmed.split())
+    try:
+        payload = json.loads(trimmed)
+    except Exception:
+        return normalized_trimmed, None, None, None, False
+    if not isinstance(payload, dict):
+        return normalized_trimmed, None, None, None, False
+    text = payload.get("text")
+    normalized_text: str | None = None
+    if isinstance(text, str) and text.strip():
+        normalized_text = " ".join(text.split())
+    event_type = payload.get("event_type")
+    if isinstance(event_type, str):
+        event_type = event_type.strip()
+        if not event_type:
+            event_type = None
+    else:
+        event_type = None
+    payload_time = payload.get("time")
+    if isinstance(payload_time, str):
+        payload_time = payload_time.strip()
+        if not payload_time:
+            payload_time = None
+    else:
+        payload_time = None
+    role = payload.get("role")
+    if isinstance(role, str):
+        role = role.strip()
+        if not role:
+            role = None
+    else:
+        role = None
+    return normalized_text, event_type, payload_time, role, True
+
+
 def _extract_recent_messages(model_messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for item in model_messages:
         if not isinstance(item, dict):
             continue
-        role = str(item.get("role") or "").strip().lower()
-        if role == "system":
+        candidate_role = str(item.get("role") or "user")
+        if candidate_role.strip().lower() == "system":
             continue
+        row: dict[str, str] = {"role": candidate_role or "user"}
+        raw_time = item.get("time")
+        if isinstance(raw_time, str) and raw_time.strip():
+            row["time"] = raw_time.strip()
         content = item.get("content")
-        if isinstance(content, str):
-            row: dict[str, str] = {"role": role or "user", "content": content}
-            raw_time = item.get("time")
-            if isinstance(raw_time, str) and raw_time.strip():
-                row["time"] = raw_time.strip()
-            out.append(row)
+        parsed_text, parsed_event_type, parsed_time, parsed_role, parsed_as_json = _parse_prompt_event_content(content)
+        if parsed_role:
+            row["role"] = parsed_role
+        if parsed_time:
+            row["time"] = parsed_time
+        if parsed_text:
+            row["content"] = parsed_text
+        else:
+            if parsed_as_json:
+                row["content"] = _placeholder_for_event_type(parsed_event_type)
+            elif isinstance(content, str):
+                trimmed = content.strip()
+                if trimmed:
+                    row["content"] = trimmed
+                else:
+                    row["content"] = _placeholder_for_event_type(parsed_event_type)
+            else:
+                row["content"] = _placeholder_for_event_type(parsed_event_type)
+        out.append(row)
     return out
 
 
@@ -2657,6 +2727,8 @@ def _is_forward_message(message: Message) -> bool:
 
 
 def _infer_event_type(message: Message) -> str:
+    if getattr(message, "sticker", None):
+        return "sticker"
     if getattr(message, "photo", None):
         return "photo"
     if getattr(message, "text", None) or getattr(message, "caption", None):

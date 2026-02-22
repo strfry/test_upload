@@ -52,7 +52,7 @@ ScamBaiterControl (BotAPI control channel) <-> ScamBaiterCore <-> Event Store <-
 
 ## Event-Modell
 
-- `event_type` deckt die eigentlichen Chat-Ereignisse ab (`message`, `photo`, `forward`, `typing_interval`).
+- `event_type` deckt die eigentlichen Chat-Ereignisse ab (`message`, `photo`, `sticker`, `forward`, `typing_interval`).
 - `role` ist auf die Klarrollen `manual`, `scammer`, `scambaiter`, `system` begrenzt; `typing_interval` und ähnliche technische Events gehen als `role=system` in die History.
 - Escalation ist kein separates History-Event, sondern eine Control-Action, die in `meta` (z. B. `actions`) oder im Pending-Log vermerkt wird.
 - Beim Prompt-Build wird zuerst der gesamte Verlauf verwendet; bei Limit werden die aeltesten Events entfernt. Zeitangaben gehen als `HH:MM` in den Prompt.

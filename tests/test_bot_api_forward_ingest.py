@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -48,6 +49,7 @@ class _FakeMessage:
         text: str | None,
         caption: str | None,
         has_photo: bool,
+        has_sticker: bool = False,
         with_forward_origin: bool,
         origin_kind: str = "user",
         sender_user_id: int = 99,
@@ -60,6 +62,7 @@ class _FakeMessage:
         self.text = text
         self.caption = caption
         self.photo = [object()] if has_photo else None
+        self.sticker = type("Sticker", (), {"file_id": "sticker"})() if has_sticker else None
         self.date = datetime(2026, 2, 21, 14, 5, 0, tzinfo=timezone.utc)
         if with_forward_origin:
             origin_date = self.date if forward_date_equals_message_date else datetime(2026, 2, 21, 13, 59, 0, tzinfo=timezone.utc)
@@ -153,6 +156,26 @@ class BotApiForwardIngestTest(unittest.TestCase):
             self.assertEqual("photo", record.event_type)
             self.assertEqual("manual", record.role)
             self.assertEqual("photo caption", record.text)
+
+    def test_forwarded_sticker_is_stored_as_sticker_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            message = _FakeMessage(
+                chat_id=5000,
+                message_id=23,
+                text=None,
+                caption=None,
+                has_photo=False,
+                has_sticker=True,
+                with_forward_origin=True,
+            )
+
+            record = ingest_forwarded_message(store=store, target_chat_id=7003, message=message)
+
+            self.assertEqual("sticker", record.event_type)
+            self.assertEqual("manual", record.role)
+            self.assertIsNone(record.text)
 
     def test_forward_origin_sender_user_maps_to_target_chat(self) -> None:
         message = _FakeMessage(
@@ -546,6 +569,13 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("chat_id: /123", text)
         self.assertIn("12:01 scammer: hi back", text)
 
+    def test_render_prompt_card_text_shows_placeholder_for_non_text_event(self) -> None:
+        prompt_events = [
+            {"time": "12:34", "role": "scammer", "text": None, "event_type": "sticker"},
+        ]
+        text = _render_prompt_card_text(chat_id=123, prompt_events=prompt_events)
+        self.assertIn("12:34 scammer: [sticker]", text)
+
     def test_render_prompt_section_text_renders_chat_window(self) -> None:
         prompt_events = [
             {"time": "01:00", "role": "manual", "text": "user"},
@@ -575,6 +605,27 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("01:02 A: assistant msg", text)
         self.assertNotIn('"recent_messages"', text)
         self.assertNotIn("system msg", text)
+
+    def test_render_prompt_section_text_shows_placeholder_for_json_event(self) -> None:
+        prompt_events = [{"time": "01:00", "role": "manual", "text": "user"}]
+        payload = json.dumps({"time": "14:05", "role": "scammer", "event_type": "sticker"})
+        model_messages = [
+            {"role": "system", "content": "system msg"},
+            {"role": "user", "content": payload},
+        ]
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=prompt_events,
+            model_messages=model_messages,
+            latest_payload=None,
+            latest_raw="",
+            latest_attempt_id=None,
+            latest_status=None,
+            section="messages",
+            memory=None,
+        )
+        self.assertIn("```", text)
+        self.assertIn("14:05 A: [sticker]", text)
 
     def test_render_prompt_section_text_messages_limits_to_twenty_items(self) -> None:
         model_messages: list[dict[str, str]] = []

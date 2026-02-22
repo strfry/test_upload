@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-ALLOWED_EVENT_TYPES = {"message", "photo", "forward", "typing_interval"}
+ALLOWED_EVENT_TYPES = {"message", "photo", "forward", "sticker", "typing_interval"}
 ALLOWED_ROLES = {"manual", "scammer", "scambaiter", "system"}
 
 

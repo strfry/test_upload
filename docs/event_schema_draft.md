@@ -42,6 +42,19 @@ Storage keeps full source fields. Prompt payload is a lightweight projection.
 }
 ```
 
+### `sticker`
+
+```json
+{
+  "event_type": "sticker",
+  "event_id": "msg_12347",
+  "role": "scammer",
+  "ts_utc": "2026-02-17T18:11:05Z",
+  "emoji": "🙂",
+  "set_name": "funny_faces"
+}
+```
+
 ### `typing_interval`
 
 ```json
@@ -77,7 +90,7 @@ Storage keeps full source fields. Prompt payload is a lightweight projection.
 ## Prompt Integration
 
 - Persisted enum set:
-  - `event_type in {message, photo, forward, typing_interval}`
+- `event_type in {message, photo, sticker, forward, typing_interval}`
   - `role in {manual, scammer, scambaiter, system}`
 - User forwards keep their original content type (`message`/`photo`/`forward`) and become `role=manual` when not yet known in store.
 - Pass `events[]` to the model in chronological order.
