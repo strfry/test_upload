@@ -384,6 +384,7 @@ def _render_prompt_card_text(chat_id: int, prompt_events: list[dict[str, Any]], 
 
 
 PROMPT_SECTION_LABELS: dict[str, str] = {
+    "prompt": "prompt",
     "schema": "schema",
     "analysis": "analysis",
     "message": "message",
@@ -414,7 +415,7 @@ def _load_latest_reply_payload(store: Any, chat_id: int) -> tuple[dict[str, Any]
     return payload, raw_text, int(attempt.id), str(attempt.status)
 
 
-def _prompt_keyboard(chat_id: int, active_section: str = "ov") -> InlineKeyboardMarkup:
+def _prompt_keyboard(chat_id: int, active_section: str = "prompt") -> InlineKeyboardMarkup:
     def _btn(code: str) -> InlineKeyboardButton:
         label = PROMPT_SECTION_LABELS.get(code, code)
         if code == active_section:
@@ -423,15 +424,35 @@ def _prompt_keyboard(chat_id: int, active_section: str = "ov") -> InlineKeyboard
 
     return InlineKeyboardMarkup(
         [
-            [_btn("schema"), _btn("analysis")],
-            [_btn("message"), _btn("actions")],
-            [_btn("raw")],
+            [_btn("prompt"), _btn("schema")],
+            [_btn("analysis"), _btn("message")],
+            [_btn("actions"), _btn("raw")],
             [
                 InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
                 InlineKeyboardButton("Delete", callback_data="sc:prompt_delete"),
             ],
         ]
     )
+
+
+def _memory_summary_prompt_lines(memory: dict[str, Any] | None) -> list[str]:
+    if not isinstance(memory, dict):
+        return []
+    lines: list[str] = []
+    intent = memory.get("current_intent", {})
+    facts = memory.get("key_facts") or {}
+    risks = memory.get("risk_flags") or []
+    latest_topic = intent.get("latest_topic")
+    if latest_topic:
+        lines.append(f"memory topic: {latest_topic}")
+    current_phase = memory.get("narrative", {}).get("phase")
+    if current_phase:
+        lines.append(f"memory phase: {current_phase}")
+    if facts:
+        lines.append(f"memory facts: {', '.join(str(k) for k in facts.keys())}")
+    if risks:
+        lines.append(f"memory risks: {', '.join(str(r) for r in risks)}")
+    return lines
 
 
 def _render_prompt_section_text(
@@ -444,7 +465,25 @@ def _render_prompt_section_text(
     latest_attempt_id: int | None,
     latest_status: str | None,
     section: str,
+    memory: dict[str, Any] | None = None,
 ) -> str:
+    attempt_meta = f"attempt #{latest_attempt_id}" if isinstance(latest_attempt_id, int) else "attempt ?"
+    status_meta = latest_status or "unknown"
+    if section == "prompt":
+        payload = {
+            "memory_summary": memory or {},
+            "messages": model_messages,
+        }
+        lines = [
+            "Prompt JSON",
+            f"chat_id: /{chat_id}",
+            f"{attempt_meta}, status={status_meta}",
+            f"events_in_prompt: {len(prompt_events)}",
+            "---",
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        ]
+        return _trim_block("\n".join(lines))
+
     if latest_payload is None:
         lines = [
             "Prompt Card",
@@ -453,6 +492,7 @@ def _render_prompt_section_text(
             "latest_reply: unavailable (run Dry Run)",
             "---",
         ]
+        lines.extend(_memory_summary_prompt_lines(memory))
         tail = prompt_events[-12:]
         for item in tail:
             role = str(item.get("role", "unknown"))
@@ -463,9 +503,6 @@ def _render_prompt_section_text(
                 compact = compact[:157] + "..."
             lines.append(f"{time} {role}: {compact}")
         return _trim_block("\n".join(lines))
-
-    attempt_meta = f"attempt #{latest_attempt_id}" if isinstance(latest_attempt_id, int) else "attempt ?"
-    status_meta = latest_status or "unknown"
 
     if section == "schema":
         schema = latest_payload.get("schema")
@@ -566,6 +603,7 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
     prompt_events = core.build_prompt_events(chat_id=chat_id)
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
+    memory = store.get_memory_context(chat_id=chat_id)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -575,6 +613,7 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
         latest_attempt_id=latest_attempt_id,
         latest_status=latest_status,
         section="schema",
+        memory=memory,
     )
     sent = await message.reply_text(
         prompt_text,
@@ -738,6 +777,7 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
     prompt_events = core.build_prompt_events(chat_id=chat_id)
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
+    memory = store.get_memory_context(chat_id=chat_id)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -747,6 +787,7 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
         latest_attempt_id=latest_attempt_id,
         latest_status=latest_status,
         section=section,
+        memory=memory,
     )
     try:
         await query.edit_message_text(

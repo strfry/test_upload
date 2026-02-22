@@ -15,6 +15,8 @@ from scambaiter.bot_api import (
     _ingest_forward_payload,
     _profile_lines_from_events,
     _render_prompt_card_text,
+    _render_prompt_section_text,
+    _prompt_keyboard,
     _render_user_card,
     _resolve_target_and_role_without_active,
     ingest_forwarded_message,
@@ -337,6 +339,36 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("Prompt Card", text)
         self.assertIn("chat_id: /123", text)
         self.assertIn("12:01 scammer: hi back", text)
+
+    def test_render_prompt_section_text_includes_prompt_json(self) -> None:
+        prompt_events = [
+            {"time": "01:00", "role": "manual", "text": "user"},
+        ]
+        model_messages = [
+            {"role": "system", "content": "system msg"},
+            {"role": "user", "content": "user msg"},
+        ]
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=prompt_events,
+            model_messages=model_messages,
+            latest_payload=None,
+            latest_raw="",
+            latest_attempt_id=None,
+            latest_status=None,
+            section="prompt",
+            memory={"current_intent": {"latest_topic": "topic"}, "key_facts": {"fact": "value"}},
+        )
+        self.assertIn("Prompt JSON", text)
+        self.assertIn('"messages"', text)
+        self.assertIn('"memory_summary"', text)
+
+    def test_prompt_keyboard_includes_prompt_button(self) -> None:
+        keyboard = _prompt_keyboard(chat_id=999, active_section="prompt")
+        self.assertTrue(keyboard.inline_keyboard)
+        prompt_row = keyboard.inline_keyboard[0]
+        self.assertEqual("• prompt", prompt_row[0].text)
+        self.assertEqual("sc:psec:prompt:999", prompt_row[0].callback_data)
 
 
 if __name__ == "__main__":

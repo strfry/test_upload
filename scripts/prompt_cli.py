@@ -89,6 +89,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=50, help="Number of history events to show.")
     parser.add_argument("--history", action="store_true", help="Only render the history table.")
     parser.add_argument("--model-view", action="store_true", help="Dump the prompt JSON the model receives.")
+    parser.add_argument("--memory", action="store_true", help="Dump the stored memory summary JSON.")
     parser.add_argument("--refresh-memory", action="store_true", help="Force rebuild of summary memory before output.")
     parser.add_argument(
         "--max-tokens",
@@ -110,7 +111,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print("Known chat_ids:")
         for chat_id in chat_ids:
-            print(chat_id)
+            profile = store.get_chat_profile(chat_id=chat_id)
+            display = profile.snapshot.get("identity", {}).get("display_name") if profile else None
+            name = display or str(profile.snapshot.get("identity", {}).get("username")) if profile else None
+            label = f"{chat_id}"
+            if name:
+                label += f" ({name})"
+            print(label)
         if args.chat_id is None or not args.history:
             return 0
 
@@ -125,16 +132,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = load_config()
     config.analysis_db_path = args.db
     core = ScambaiterCore(config=config, store=store)
+    if args.memory:
+        memory_state = core.ensure_memory_context(chat_id=chat_id, force_refresh=bool(args.refresh_memory))
+        summary_payload = {
+            "chat_id": chat_id,
+            "summary": memory_state.get("summary") or {},
+            "cursor_event_id": int(memory_state.get("cursor_event_id") or 0),
+            "memory_updated": bool(memory_state.get("updated")),
+        }
+        print(json.dumps(summary_payload, ensure_ascii=False))
+        return 0
+
     payload = _build_prompt_payload_with_refresh(
         core,
         chat_id,
         args.max_tokens if args.max_tokens is not None else None,
         refresh_memory=bool(args.refresh_memory),
     )
-    if args.model_view:
-        print(json.dumps(payload, ensure_ascii=False))
-    else:
-        print(json.dumps(payload, ensure_ascii=False))
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
