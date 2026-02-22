@@ -20,10 +20,16 @@ from scambaiter.bot_api import (
     _plan_forward_merge,
     _profile_lines_from_events,
     _render_prompt_card_text,
-    _render_html_semantic_conflict_card,
+    _render_result_section_message,
+    _render_result_section_error,
+    _render_result_section_response,
+    _describe_parsing_error,
+    _render_result_card_text,
+    _raw_model_output_text,
     _render_prompt_section_text,
     _render_whoami_text,
     _prompt_keyboard,
+    _result_card_keyboard,
     _render_user_card,
     _resolve_target_and_role_without_active,
     _truncate_chat_button_label,
@@ -739,27 +745,88 @@ class BotApiForwardIngestTest(unittest.TestCase):
         preview = _extract_partial_message_preview("not-json")
         self.assertEqual("", preview)
 
-    def test_render_semantic_conflict_card_contains_pivot_preview(self) -> None:
-        text = _render_html_semantic_conflict_card(
-            attempt_id=23,
-            chat_id=7069434543,
-            provider="huggingface_openai_compat",
-            model="openai/gpt-oss-20b",
-            conflict={
-                "type": "semantic_conflict",
-                "code": "policy_tension",
-                "reason": "Need a safer pivot to keep the conversation constructive.",
-                "requires_human": True,
-                "suggested_mode": "hold",
+    def test_render_result_error_section_includes_details(self) -> None:
+        state = {
+            "chat_id": 700,
+            "run_id": 1,
+            "provider": "huggingface_openai_compat",
+            "model": "openai/gpt-oss-20b",
+            "status": "error",
+            "outcome_class": "contract_invalid",
+            "result_text": '{"schema":"scambait.llm.v1","message":{},"actions":[]}',
+            "error_message": "invalid model output contract (root: invalid json)",
+            "contract_issues": [{"path": "root", "reason": "invalid json", "expected": "valid JSON object"}],
+            "response_json": {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": "erroneous", "annotations": [], "refusal": ""},
+                    }
+                ]
             },
-            pivot={
-                "recommended_text": "Could you share the exact company registration record first?",
-            },
-            result_text="",
-        )
-        self.assertIn("Semantic conflict", text)
+            "conflict": {"code": "policy_tension", "reason": "Needs operator decision"},
+            "pivot": {"recommended_text": "Ask for registration screenshot"},
+        }
+        text = _render_result_section_error(state)
+        self.assertIn("class: contract_invalid", text)
+        self.assertIn("root: invalid json", text)
+        self.assertIn("response debug", text)
+        self.assertIn("finish_reason: stop", text)
+        self.assertIn("conflict", text)
         self.assertIn("recommended pivot", text)
-        self.assertIn("policy_tension", text)
+
+    def test_render_result_response_shows_code_block(self) -> None:
+        state = {
+            "chat_id": 701,
+            "run_id": 5,
+            "provider": "huggingface_openai_compat",
+            "model": "openai/gpt-oss-20b",
+            "status": "error",
+            "outcome_class": "contract_invalid",
+            "result_text": '{"schema":"scambait.llm.v1","message":{},"actions":[],"foo":"bar"}',
+        }
+        response = _render_result_section_response(state)
+        self.assertIn("Raw model output:", response)
+        self.assertIn("```json", response)
+        self.assertIn('"foo":"bar"', response)
+
+    def test_parsing_error_description_includes_line_info(self) -> None:
+        state = {
+            "result_text": '\n\n{"foo":"bar"}',
+            "contract_issues": [{"path": "root", "reason": "invalid json"}],
+        }
+        note = _describe_parsing_error(state)
+        assert note
+        self.assertIn("line", note)
+        self.assertIn("parse error", note)
+
+    def test_raw_button_only_on_raw_tab(self) -> None:
+        kb1 = _result_card_keyboard(
+            chat_id=123,
+            active_section="response",
+            status="ok",
+            telethon_enabled=True,
+            retry_enabled=False,
+            has_raw=True,
+        )
+        labels1 = [btn.text for row in kb1.inline_keyboard for btn in row]
+        self.assertNotIn("Send raw file", labels1)
+        kb2 = _result_card_keyboard(
+            chat_id=123,
+            active_section="raw",
+            status="ok",
+            telethon_enabled=True,
+            retry_enabled=False,
+            has_raw=True,
+        )
+        labels2 = [btn.text for row in kb2.inline_keyboard for btn in row]
+        self.assertIn("Send raw file", labels2)
+
+    def test_raw_helper_prefers_result_text(self) -> None:
+        state = {"result_text": "hello", "response_json": {"choices": []}}
+        self.assertEqual("hello", _raw_model_output_text(state))
+        state = {"result_text": "", "response_json": {"choices": [{"message": {"content": "x"}}]}}
+        self.assertEqual("x", _raw_model_output_text(state))
 
     def test_dry_run_retry_keyboard_contains_callback(self) -> None:
         keyboard = _dry_run_retry_keyboard(chat_id=1234, attempt_id=77)
@@ -767,6 +834,63 @@ class BotApiForwardIngestTest(unittest.TestCase):
         first = keyboard.inline_keyboard[0][0]
         self.assertEqual("Retry", first.text)
         self.assertEqual("sc:reply_retry:1234", first.callback_data)
+
+    def test_result_card_keyboard_includes_tabs_and_send_raw_buttons(self) -> None:
+        keyboard = _result_card_keyboard(
+            chat_id=1234,
+            active_section="message",
+            status="ok",
+            telethon_enabled=True,
+            retry_enabled=False,
+            has_raw=True,
+        )
+        self.assertTrue(keyboard.inline_keyboard)
+        first_row = keyboard.inline_keyboard[0]
+        self.assertEqual("• message", first_row[0].text)
+        self.assertEqual("sc:rsec:message:1234", first_row[0].callback_data)
+        labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+        self.assertNotIn("Send raw file", labels)
+        self.assertIn("Send", labels)
+        self.assertIn("Delete", labels)
+
+    def test_render_result_card_text_message_and_actions_sections(self) -> None:
+        state = {
+            "chat_id": 222,
+            "run_id": 9,
+            "provider": "huggingface_openai_compat",
+            "model": "openai/gpt-oss-20b",
+            "status": "ok",
+            "outcome_class": "ok",
+            "parsed_output": {
+                "analysis": {"reason": "follow up"},
+                "actions": [{"type": "send_message", "message": {"text": "hi there"}}],
+                "message": {},
+            },
+            "result_text": "",
+            "response_json": {"choices": [{"message": {"content": "{\"x\":1}"}}]},
+        }
+        message_text = _render_result_card_text(state, section="message")
+        self.assertIn("Result Card", message_text)
+        self.assertIn("section: message", message_text)
+        self.assertIn("hi there", message_text)
+        actions_text = _render_result_card_text(state, section="actions")
+        self.assertIn("section: actions", actions_text)
+        self.assertIn("send_message", actions_text)
+
+    def test_result_section_message_returns_empty_placeholder_when_missing(self) -> None:
+        state = {
+            "chat_id": 222,
+            "run_id": 9,
+            "provider": "huggingface_openai_compat",
+            "model": "openai/gpt-oss-20b",
+            "status": "error",
+            "outcome_class": "contract_invalid",
+            "parsed_output": {},
+            "result_text": "",
+            "response_json": {},
+        }
+        output = _render_result_section_message(state)
+        self.assertEqual("(empty)", output)
 
 
 if __name__ == "__main__":

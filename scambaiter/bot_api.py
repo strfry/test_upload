@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import io
 import json
 from datetime import datetime, timezone
 from typing import Any
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -131,6 +132,15 @@ def _set_reply_card_state(
     parsed_output: dict[str, Any] | None,
     result_text: str,
     retry_context: dict[str, Any] | None,
+    run_id: int | None = None,
+    status: str | None = None,
+    outcome_class: str | None = None,
+    error_message: str | None = None,
+    contract_issues: list[dict[str, Any]] | None = None,
+    response_json: dict[str, Any] | None = None,
+    conflict: dict[str, Any] | None = None,
+    pivot: dict[str, Any] | None = None,
+    active_section: str = "message",
 ) -> None:
     _reply_card_states(application)[int(message_id)] = {
         "chat_id": int(chat_id),
@@ -139,6 +149,15 @@ def _set_reply_card_state(
         "parsed_output": parsed_output if isinstance(parsed_output, dict) else None,
         "result_text": str(result_text or ""),
         "retry_context": retry_context if isinstance(retry_context, dict) else None,
+        "run_id": int(run_id) if isinstance(run_id, int) else None,
+        "status": str(status or "").strip() or "unknown",
+        "outcome_class": str(outcome_class or "").strip() or "unknown",
+        "error_message": str(error_message or "").strip() or "",
+        "contract_issues": [item for item in (contract_issues or []) if isinstance(item, dict)],
+        "response_json": response_json if isinstance(response_json, dict) else {},
+        "conflict": conflict if isinstance(conflict, dict) else None,
+        "pivot": pivot if isinstance(pivot, dict) else None,
+        "active_section": str(active_section or "message"),
     }
 
 
@@ -149,6 +168,243 @@ def _get_reply_card_state(application: Application, message_id: int) -> dict[str
 
 def _drop_reply_card_state(application: Application, message_id: int) -> None:
     _reply_card_states(application).pop(int(message_id), None)
+
+
+RESULT_SECTION_LABELS: dict[str, str] = {
+    "message": "message",
+    "actions": "actions",
+    "analysis": "analysis",
+    "error": "error",
+    "response": "response",
+    "raw": "raw",
+}
+
+
+def _truncate_for_card(text: str, max_len: int = 2200) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _render_result_section_message(state: dict[str, Any]) -> str:
+    parsed_output = state.get("parsed_output")
+    message_text = _extract_action_message_text(parsed_output if isinstance(parsed_output, dict) else None)
+    if not message_text and isinstance(parsed_output, dict):
+        message_obj = parsed_output.get("message")
+        if isinstance(message_obj, dict):
+            raw = message_obj.get("text")
+            if isinstance(raw, str):
+                message_text = raw.strip()
+    if not message_text:
+        message_text = _extract_partial_message_preview(str(state.get("result_text") or ""))
+    return message_text or "(empty)"
+
+
+def _render_result_section_actions(state: dict[str, Any]) -> str:
+    parsed_output = state.get("parsed_output")
+    actions = parsed_output.get("actions") if isinstance(parsed_output, dict) and isinstance(parsed_output.get("actions"), list) else []
+    if not actions:
+        return "(none)"
+    lines: list[str] = []
+    for idx, action in enumerate(actions, start=1):
+        if not isinstance(action, dict):
+            lines.append(f"{idx}. <invalid>")
+            continue
+        action_type = str(action.get("type") or "unknown")
+        compact = json.dumps(action, ensure_ascii=True, separators=(",", ":"))
+        if len(compact) > 200:
+            compact = compact[:197] + "..."
+        lines.append(f"{idx}. {action_type}  {compact}")
+    return "\n".join(lines)
+
+
+def _render_result_section_analysis(state: dict[str, Any]) -> str:
+    parsed_output = state.get("parsed_output")
+    analysis = parsed_output.get("analysis") if isinstance(parsed_output, dict) else None
+    if not isinstance(analysis, dict) or not analysis:
+        return "(none)"
+    raw = json.dumps(analysis, ensure_ascii=True, indent=2)
+    return _truncate_for_card(raw, max_len=2400)
+
+
+def _render_result_section_error(state: dict[str, Any]) -> str:
+    lines = [
+        f"class: {state.get('outcome_class') or 'unknown'}",
+        f"status: {state.get('status') or 'unknown'}",
+    ]
+    error_message = str(state.get("error_message") or "").strip()
+    if error_message:
+        lines.extend(["", "error", error_message])
+    result_text = str(state.get("result_text") or "").strip()
+    if result_text:
+        snippet = result_text if len(result_text) <= 300 else result_text[:297] + "..."
+        lines.extend(["", "result_text", snippet])
+    contract_issues = state.get("contract_issues")
+    if isinstance(contract_issues, list) and contract_issues:
+        lines.extend(["", "contract issues"])
+        for item in contract_issues[:8]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "unknown")
+            reason = str(item.get("reason") or "unknown")
+            lines.append(f"- {path}: {reason}")
+    response_json = state.get("response_json")
+    if isinstance(response_json, dict) and response_json:
+        debug_meta = _extract_response_debug_meta(response_json)
+        lines.extend(
+            [
+                "",
+                "response debug",
+                f"- finish_reason: {debug_meta.get('finish_reason', 'unknown')}",
+                f"- content_type: {debug_meta.get('content_type', 'unknown')}",
+                f"- message_keys: {debug_meta.get('message_keys', '-')}",
+            ]
+        )
+    conflict = state.get("conflict")
+    if isinstance(conflict, dict):
+        lines.extend(["", "conflict"])
+        lines.append(f"- code: {conflict.get('code') or 'unknown'}")
+        reason = conflict.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            lines.append(f"- reason: {reason.strip()}")
+    pivot = state.get("pivot")
+    if isinstance(pivot, dict):
+        recommended = pivot.get("recommended_text")
+        if isinstance(recommended, str) and recommended.strip():
+            lines.extend(
+                [
+                    "",
+                    "recommended pivot",
+                    recommended.strip(),
+                ]
+            )
+    return "\n".join(lines)
+
+
+def _render_result_section_response(state: dict[str, Any]) -> str:
+    result_text = str(state.get("result_text") or "").strip()
+    if not result_text:
+        response_json = state.get("response_json")
+        if not isinstance(response_json, dict) or not response_json:
+            return "(no raw output available)"
+        result_text = _extract_textual_response_fallback(response_json)
+        if not result_text:
+            result_text = _compact_response_excerpt(response_json, max_len=2000)
+    snippet = _format_raw_result_snippet(result_text)
+    error_note = _describe_parsing_error(state)
+    lines = ["Raw model output:", "```json", snippet, "```"]
+    if error_note:
+        lines.extend(["", error_note])
+    return "\n".join(lines)
+
+
+def _format_raw_result_snippet(raw: str, max_chars: int = 600) -> str:
+    cleaned = raw.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3] + "..."
+
+
+def _extract_error_note_from_contracts(issues: object) -> str | None:
+    if not isinstance(issues, list):
+        return None
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        path = str(issue.get("path") or "").lower()
+        reason = str(issue.get("reason") or "").strip()
+        if path == "root" and "invalid json" in reason.lower():
+            return reason
+    return None
+
+
+def _describe_parsing_error(state: dict[str, Any]) -> str | None:
+    issues = state.get("contract_issues")
+    reason = _extract_error_note_from_contracts(issues)
+    if not reason:
+        if isinstance(issues, list):
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                r = str(issue.get("reason") or "").strip()
+                if r:
+                    reason = r
+                    break
+    if not reason:
+        return None
+    result_text = str(state.get("result_text") or "")
+    if not result_text:
+        return f"parse error: {reason}"
+    cursor = _find_error_context(result_text)
+    return f"parse error near line {cursor[0]}, col {cursor[1]}: {reason}"
+
+
+def _find_error_context(text: str) -> tuple[int, int]:
+    snippet = text.strip()
+    if not snippet:
+        return 0, 0
+    idx = snippet.find("{")
+    if idx < 0:
+        idx = 0
+    line = snippet[:idx].count("\n") + 1
+    last_newline = snippet[:idx].rfind("\n")
+    col = idx - (last_newline + 1) + 1
+    return line, col
+
+
+def _raw_model_output_text(state: dict[str, Any]) -> str:
+    text = str(state.get("result_text") or "").strip()
+    if text:
+        return text
+    response_json = state.get("response_json")
+    if isinstance(response_json, dict) and response_json:
+        extracted = _extract_textual_response_fallback(response_json)
+        if extracted:
+            return extracted
+        return json.dumps(response_json, ensure_ascii=True, indent=2)
+    return ""
+
+
+def _render_result_section_raw(state: dict[str, Any]) -> str:
+    response_json = state.get("response_json")
+    has_raw = isinstance(response_json, dict) and bool(response_json)
+    if has_raw:
+        return "Raw output export available.\nUse 'Send raw file' to download the full JSON."
+    return "Raw output unavailable."
+
+
+def _render_result_card_text(state: dict[str, Any], section: str) -> str:
+    chat_id = int(state.get("chat_id") or -1)
+    run_id = state.get("run_id")
+    provider = str(state.get("provider") or "unknown")
+    model = str(state.get("model") or "unknown")
+    status = str(state.get("status") or "unknown")
+    outcome_class = str(state.get("outcome_class") or "unknown")
+    lines = [
+        "Result Card",
+        f"chat_id: /{chat_id}",
+        f"run_id: {run_id if isinstance(run_id, int) else '-'}",
+        f"status: {status}",
+        f"outcome_class: {outcome_class}",
+        f"provider: {provider}",
+        f"model: {model}",
+        f"section: {section}",
+        "---",
+    ]
+    if section == "message":
+        body = _render_result_section_message(state)
+    elif section == "actions":
+        body = _render_result_section_actions(state)
+    elif section == "analysis":
+        body = _render_result_section_analysis(state)
+    elif section == "error":
+        body = _render_result_section_error(state)
+    elif section == "response":
+        body = _render_result_section_response(state)
+    else:
+        body = _render_result_section_raw(state)
+    lines.append(body)
+    return _trim_block("\n".join(lines))
 
 
 def _last_sent_by_chat(application: Application) -> dict[int, dict[str, int]]:
@@ -194,155 +450,90 @@ def _classify_dry_run_error(error_message: str) -> tuple[str, str]:
     )
 
 
-def _render_html_error_block(
-    *,
-    attempt_id: int,
-    chat_id: int,
-    provider: str,
-    model: str,
-    error_message: str | None,
-    result_text: str | None,
-) -> str:
-    title, hint = _classify_dry_run_error(error_message or "")
-    reason = html.escape((error_message or "unknown error").strip())
-    if len(reason) > 1200:
-        reason = reason[:1197] + "..."
-
-    excerpt = html.escape((result_text or "").strip())
-    if len(excerpt) > 1400:
-        excerpt = excerpt[:1397] + "..."
-
-    lines = [
-        f"<b>Dry run failed</b> (attempt #{attempt_id} for /{chat_id})",
-        f"<b>provider:</b> <code>{html.escape(provider or 'unknown')}</code>",
-        f"<b>model:</b> <code>{html.escape(model or 'unknown')}</code>",
-        f"<b>class:</b> {html.escape(title)}",
-        "",
-        "<b>error</b>",
-        f"<pre>{reason}</pre>",
-    ]
-    if excerpt:
-        lines.extend([
-            "<b>result excerpt</b>",
-            f"<pre>{excerpt}</pre>",
-        ])
-    lines.extend([
-        "<b>hint</b>",
-        html.escape(hint),
-    ])
-    partial_preview = _extract_partial_message_preview(result_text or "")
-    if partial_preview:
-        lines.extend(
-            [
-                "<b>partial message preview</b>",
-                f"<pre>{html.escape(partial_preview)}</pre>",
-            ]
-        )
-    return "\n".join(lines)
+def _extract_response_debug_meta(response_json: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(response_json, dict):
+        return {}
+    finish_reason = "unknown"
+    content_type = "missing"
+    message_keys = "-"
+    choices = response_json.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            finish_value = first.get("finish_reason")
+            if isinstance(finish_value, str) and finish_value.strip():
+                finish_reason = finish_value.strip()
+            message = first.get("message")
+            if isinstance(message, dict):
+                message_keys = ",".join(sorted(str(key) for key in message.keys())) or "-"
+                content = message.get("content")
+                if content is None:
+                    content_type = "none"
+                elif isinstance(content, str):
+                    content_type = "string"
+                elif isinstance(content, list):
+                    content_type = "list"
+                else:
+                    content_type = type(content).__name__
+            else:
+                message_keys = "(non-dict)"
+                content_type = "(no-message)"
+    return {
+        "finish_reason": finish_reason,
+        "content_type": content_type,
+        "message_keys": message_keys,
+    }
 
 
-def _render_html_error_card(
-    *,
-    attempt_id: int,
-    chat_id: int,
-    provider: str,
-    model: str,
-    error_message: str | None,
-    result_text: str | None,
-    contract_issues: list[dict[str, Any]] | None = None,
-) -> str:
-    base = _render_html_error_block(
-        attempt_id=attempt_id,
-        chat_id=chat_id,
-        provider=provider,
-        model=model,
-        error_message=error_message,
-        result_text=result_text,
-    )
-    if not contract_issues:
-        return base
-    lines = [base, "<b>contract issues</b>"]
-    shown = 0
-    for item in contract_issues:
-        if not isinstance(item, dict):
-            continue
-        path = html.escape(str(item.get("path") or "").strip() or "unknown")
-        reason = html.escape(str(item.get("reason") or "").strip() or "unknown")
-        expected = str(item.get("expected") or "").strip()
-        actual = str(item.get("actual") or "").strip()
-        row = f"- <code>{path}</code>: {reason}"
-        if expected:
-            row += f" (expected: <code>{html.escape(expected)}</code>)"
-        if actual:
-            row += f" (actual: <code>{html.escape(actual)}</code>)"
-        lines.append(row)
-        shown += 1
-        if shown >= 5:
-            break
-    if len(contract_issues) > shown:
-        lines.append(f"... and {len(contract_issues) - shown} more")
-    return "\n".join(lines)
+def _extract_textual_response_fallback(response_json: dict[str, Any] | None) -> str:
+    if not isinstance(response_json, dict):
+        return ""
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+                continue
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+        if parts:
+            return "\n".join(parts)
+    refusal = message.get("refusal")
+    if isinstance(refusal, str) and refusal.strip():
+        return refusal.strip()
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        first_call = tool_calls[0]
+        if isinstance(first_call, dict):
+            function_obj = first_call.get("function")
+            if isinstance(function_obj, dict):
+                arguments = function_obj.get("arguments")
+                if isinstance(arguments, str) and arguments.strip():
+                    return arguments.strip()
+    return ""
 
 
-def _render_html_semantic_conflict_card(
-    *,
-    attempt_id: int,
-    chat_id: int,
-    provider: str,
-    model: str,
-    conflict: dict[str, Any] | None,
-    pivot: dict[str, Any] | None,
-    result_text: str | None,
-) -> str:
-    code = str((conflict or {}).get("code") or "operator_required")
-    reason = str((conflict or {}).get("reason") or "Model signaled a semantic conflict.").strip()
-    requires_human = bool((conflict or {}).get("requires_human", True))
-    mode = str((conflict or {}).get("suggested_mode") or "hold")
-    reason_escaped = html.escape(reason)
-    if len(reason_escaped) > 1400:
-        reason_escaped = reason_escaped[:1397] + "..."
-    lines = [
-        f"<b>Semantic conflict</b> (attempt #{attempt_id} for /{chat_id})",
-        f"<b>provider:</b> <code>{html.escape(provider or 'unknown')}</code>",
-        f"<b>model:</b> <code>{html.escape(model or 'unknown')}</code>",
-        "<b>class:</b> Operator decision required",
-        "",
-        "<b>conflict</b>",
-        f"- type: <code>semantic_conflict</code>",
-        f"- code: <code>{html.escape(code)}</code>",
-        f"- requires_human: <code>{'true' if requires_human else 'false'}</code>",
-        f"- suggested_mode: <code>{html.escape(mode)}</code>",
-        f"<pre>{reason_escaped}</pre>",
-    ]
-    recommended_text = ""
-    if isinstance(pivot, dict):
-        candidate = pivot.get("recommended_text")
-        if isinstance(candidate, str) and candidate.strip():
-            recommended_text = candidate.strip()
-        pivot_error = pivot.get("error")
-        if isinstance(pivot_error, str) and pivot_error.strip():
-            lines.extend(
-                [
-                    "<b>pivot generation</b>",
-                    f"<pre>{html.escape(pivot_error.strip())}</pre>",
-                ]
-            )
-    if recommended_text:
-        lines.extend(
-            [
-                "<b>recommended pivot</b>",
-                f"<pre>{html.escape(recommended_text)}</pre>",
-            ]
-        )
-    partial_preview = _extract_partial_message_preview(result_text or "")
-    if partial_preview:
-        lines.extend(
-            [
-                "<b>model message preview</b>",
-                f"<pre>{html.escape(partial_preview)}</pre>",
-            ]
-        )
-    return "\n".join(lines)
+def _compact_response_excerpt(response_json: dict[str, Any] | None, max_len: int = 1400) -> str:
+    if not isinstance(response_json, dict) or not response_json:
+        return ""
+    raw = json.dumps(response_json, ensure_ascii=True)
+    if len(raw) <= max_len:
+        return raw
+    return raw[: max_len - 3] + "..."
 
 
 def _dry_run_retry_keyboard(chat_id: int, attempt_id: int) -> InlineKeyboardMarkup:
@@ -352,6 +543,38 @@ def _dry_run_retry_keyboard(chat_id: int, attempt_id: int) -> InlineKeyboardMark
             [InlineKeyboardButton("Delete", callback_data=f"sc:reply_delete:{chat_id}")],
         ]
     )
+
+
+def _result_card_keyboard(
+    *,
+    chat_id: int,
+    active_section: str,
+    status: str,
+    telethon_enabled: bool,
+    retry_enabled: bool,
+    has_raw: bool,
+) -> InlineKeyboardMarkup:
+    def _tab(code: str) -> InlineKeyboardButton:
+        label = RESULT_SECTION_LABELS.get(code, code)
+        if code == active_section:
+            label = f"• {label}"
+        return InlineKeyboardButton(label, callback_data=f"sc:rsec:{code}:{chat_id}")
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [_tab("message"), _tab("actions"), _tab("analysis")],
+        [_tab("error"), _tab("response"), _tab("raw")],
+    ]
+    if has_raw and active_section == "raw":
+        rows.append([InlineKeyboardButton("Send raw file", callback_data=f"sc:rawfile:{chat_id}")])
+
+    if status == "ok":
+        action_label = "Send" if telethon_enabled else "Mark as Sent"
+        action_code = "reply_send" if telethon_enabled else "reply_mark"
+        rows.append([InlineKeyboardButton(action_label, callback_data=f"sc:{action_code}:{chat_id}")])
+    elif retry_enabled:
+        rows.append([InlineKeyboardButton("Retry", callback_data=f"sc:reply_retry:{chat_id}")])
+    rows.append([InlineKeyboardButton("Delete", callback_data=f"sc:reply_delete:{chat_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _reply_action_keyboard(chat_id: int, telethon_enabled: bool) -> InlineKeyboardMarkup:
@@ -1638,6 +1861,7 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
     provider = "huggingface_openai_compat"
     model = str((getattr(core.config, "hf_model", None) or "").strip())
     parsed_output: dict[str, Any] | None = None
+    response_json: dict[str, Any] | None = None
     result_text = ""
     status = "ok"
     error_message: str | None = None
@@ -1651,6 +1875,9 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
         dry_run_result = core.run_hf_dry_run(chat_id)
         provider = str(dry_run_result.get("provider") or provider)
         model = str(dry_run_result.get("model") or model)
+        raw_response = dry_run_result.get("response_json")
+        if isinstance(raw_response, dict):
+            response_json = raw_response
         parsed_output = dry_run_result.get("parsed_output") if isinstance(dry_run_result.get("parsed_output"), dict) else None
         result_text = str(dry_run_result.get("result_text") or "")
         raw_issues = dry_run_result.get("contract_issues")
@@ -1683,116 +1910,91 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
         error_message = str(exc)
 
     if status == "ok":
-        if isinstance(parsed_output, dict):
-            message_text = _extract_action_message_text(parsed_output)
-            if not message_text:
-                message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
-                message_text = str(message_obj.get("text") or "").strip()
-            actions = parsed_output.get("actions") if isinstance(parsed_output.get("actions"), list) else []
-            analysis = parsed_output.get("analysis") if isinstance(parsed_output.get("analysis"), dict) else {}
-
-            action_labels: list[str] = []
-            for idx, action in enumerate(actions, start=1):
-                if isinstance(action, dict):
-                    action_type = str(action.get("type") or "unknown")
-                    action_labels.append(f"{idx}. {action_type}")
-            action_block = "\n".join(action_labels) if action_labels else "(none)"
-
-            analysis_keys = sorted(str(key) for key in analysis.keys())
-            analysis_preview = ", ".join(analysis_keys[:8]) if analysis_keys else "(none)"
-            if len(analysis_keys) > 8:
-                analysis_preview += ", ..."
-
-            summary_lines = [
-                f"Dry run #{run_id} for /{chat_id}",
-                f"schema: {parsed_output.get('metadata', {}).get('schema', 'unknown')}",
-                f"actions: {len(actions)}",
-                f"analysis_keys: {analysis_preview}",
-            ]
-            summary_lines.extend(
-                [
-                "",
-                "Action queue:",
-                action_block,
-                ]
-            )
-            await _send_control_text(
-                application=app,
-                message=message,
-                text="\n".join(summary_lines),
-            )
-
-            if message_text:
-                copy_block = _render_html_copy_block(message_text)
-                sent_copy = await _send_control_text(
-                    application=app,
-                    message=message,
-                    text=copy_block,
-                    replace_previous_status=False,
-                    reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=app.bot_data.get("telethon_executor") is not None),
-                )
-                _set_reply_card_state(
-                    app,
-                    int(sent_copy.message_id),
-                    chat_id=chat_id,
-                    provider=provider,
-                    model=model or "unknown",
-                    parsed_output=parsed_output,
-                    result_text=result_text,
-                    retry_context=None,
-                )
-        else:
-            preview = (result_text or "<empty-result>").strip()
-            if len(preview) > 500:
-                preview = preview[:497] + "..."
-            await _send_control_text(
-                application=app,
-                message=message,
-                text=f"Dry run #{run_id} for /{chat_id}\n{preview}",
-            )
-    elif status == "semantic_conflict":
-        conflict_block = _render_html_semantic_conflict_card(
-            attempt_id=run_id,
+        state_payload = {
+            "chat_id": chat_id,
+            "provider": provider,
+            "model": model or "unknown",
+            "parsed_output": parsed_output if isinstance(parsed_output, dict) else None,
+            "result_text": result_text,
+            "retry_context": None,
+            "run_id": run_id,
+            "status": status,
+            "outcome_class": outcome_class,
+            "error_message": error_message or "",
+            "contract_issues": contract_issues,
+            "response_json": response_json if isinstance(response_json, dict) else {},
+            "conflict": conflict_payload,
+            "pivot": pivot_payload,
+            "active_section": "message",
+        }
+        card_text = _render_result_card_text(state_payload, section="message")
+        card_markup = _result_card_keyboard(
+            chat_id=chat_id,
+            active_section="message",
+            status=status,
+            telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+            retry_enabled=False,
+            has_raw=bool(response_json),
+        )
+        sent_card = await _send_control_text(
+            application=app,
+            message=message,
+            text=card_text,
+            replace_previous_status=False,
+            reply_markup=card_markup,
+        )
+        _set_reply_card_state(
+            app,
+            int(sent_card.message_id),
             chat_id=chat_id,
             provider=provider,
             model=model or "unknown",
+            parsed_output=parsed_output if isinstance(parsed_output, dict) else None,
+            result_text=result_text,
+            retry_context=None,
+            run_id=run_id,
+            status=status,
+            outcome_class=outcome_class,
+            error_message=error_message,
+            contract_issues=contract_issues,
+            response_json=response_json if isinstance(response_json, dict) else {},
             conflict=conflict_payload,
             pivot=pivot_payload,
-            result_text=result_text,
-        )
-        sent = await _send_control_text(
-            application=app,
-            message=message,
-            text=conflict_block,
-            parse_mode=ParseMode.HTML,
-            reply_markup=_reply_error_keyboard(chat_id, retry_enabled=repair_available),
-        )
-        _set_reply_card_state(
-            app,
-            int(sent.message_id),
-            chat_id=chat_id,
-            provider=provider,
-            model=model or "unknown",
-            parsed_output=parsed_output,
-            result_text=result_text,
-            retry_context=retry_context,
+            active_section="message",
         )
     else:
-        error_block = _render_html_error_card(
-            attempt_id=run_id,
+        state_payload = {
+            "chat_id": chat_id,
+            "provider": provider,
+            "model": model or "unknown",
+            "parsed_output": parsed_output if isinstance(parsed_output, dict) else None,
+            "result_text": result_text,
+            "retry_context": retry_context,
+            "run_id": run_id,
+            "status": status,
+            "outcome_class": outcome_class,
+            "error_message": error_message or "",
+            "contract_issues": contract_issues,
+            "response_json": response_json if isinstance(response_json, dict) else {},
+            "conflict": conflict_payload,
+            "pivot": pivot_payload,
+            "active_section": "error",
+        }
+        card_text = _render_result_card_text(state_payload, section="error")
+        card_markup = _result_card_keyboard(
             chat_id=chat_id,
-            provider=provider,
-            model=model or "unknown",
-            error_message=error_message,
-            result_text=result_text,
-            contract_issues=contract_issues,
+            active_section="error",
+            status=status,
+            telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+            retry_enabled=repair_available,
+            has_raw=bool(response_json),
         )
         sent = await _send_control_text(
             application=app,
             message=message,
-            text=error_block,
-            parse_mode=ParseMode.HTML,
-            reply_markup=_reply_error_keyboard(chat_id, retry_enabled=repair_available),
+            text=card_text,
+            replace_previous_status=False,
+            reply_markup=card_markup,
         )
         _set_reply_card_state(
             app,
@@ -1803,6 +2005,15 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
             parsed_output=parsed_output,
             result_text=result_text,
             retry_context=retry_context,
+            run_id=run_id,
+            status=status,
+            outcome_class=outcome_class,
+            error_message=error_message,
+            contract_issues=contract_issues,
+            response_json=response_json if isinstance(response_json, dict) else {},
+            conflict=conflict_payload,
+            pivot=pivot_payload,
+            active_section="error",
         )
 
 
@@ -1851,6 +2062,7 @@ async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEF
     provider = "huggingface_openai_compat"
     model = str((getattr(core.config, "hf_model", None) or "").strip())
     parsed_output: dict[str, Any] | None = None
+    response_json: dict[str, Any] | None = None
     result_text = ""
     status = "ok"
     error_message: str | None = None
@@ -1868,6 +2080,9 @@ async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEF
         )
         provider = str(dry_run_result.get("provider") or provider)
         model = str(dry_run_result.get("model") or model)
+        raw_response = dry_run_result.get("response_json")
+        if isinstance(raw_response, dict):
+            response_json = raw_response
         parsed_output = dry_run_result.get("parsed_output") if isinstance(dry_run_result.get("parsed_output"), dict) else None
         result_text = str(dry_run_result.get("result_text") or "")
         raw_issues = dry_run_result.get("contract_issues")
@@ -1899,21 +2114,43 @@ async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEF
         status = "error"
         error_message = str(exc)
 
+    run_id = _next_reply_run_id(app)
     if status == "ok" and isinstance(parsed_output, dict):
-        message_text = _extract_action_message_text(parsed_output)
-        if not message_text:
-            message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
-            message_text = str(message_obj.get("text") or "").strip()
-        text = _render_html_copy_block(message_text)
+        state_payload = {
+            "chat_id": chat_id,
+            "provider": provider,
+            "model": model or "unknown",
+            "parsed_output": parsed_output,
+            "result_text": result_text,
+            "retry_context": None,
+            "run_id": run_id,
+            "status": status,
+            "outcome_class": outcome_class,
+            "error_message": error_message or "",
+            "contract_issues": contract_issues,
+            "response_json": response_json if isinstance(response_json, dict) else {},
+            "conflict": conflict_payload,
+            "pivot": pivot_payload,
+            "active_section": "message",
+        }
+        text = _render_result_card_text(state_payload, section="message")
+        card_markup = _result_card_keyboard(
+            chat_id=chat_id,
+            active_section="message",
+            status=status,
+            telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+            retry_enabled=False,
+            has_raw=bool(response_json),
+        )
         try:
             await query.edit_message_text(
                 text,
-                reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=app.bot_data.get("telethon_executor") is not None),
+                reply_markup=card_markup,
             )
         except Exception:
             await message.reply_text(
                 text,
-                reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=app.bot_data.get("telethon_executor") is not None),
+                reply_markup=card_markup,
             )
         _set_reply_card_state(
             app,
@@ -1924,35 +2161,48 @@ async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEF
             parsed_output=parsed_output,
             result_text=result_text,
             retry_context=None,
+            run_id=run_id,
+            status=status,
+            outcome_class=outcome_class,
+            error_message=error_message,
+            contract_issues=contract_issues,
+            response_json=response_json if isinstance(response_json, dict) else {},
+            conflict=conflict_payload,
+            pivot=pivot_payload,
+            active_section="message",
         )
         return
 
-    run_id = _next_reply_run_id(app)
-    if status == "semantic_conflict":
-        block = _render_html_semantic_conflict_card(
-            attempt_id=run_id,
-            chat_id=chat_id,
-            provider=provider,
-            model=model or "unknown",
-            conflict=conflict_payload,
-            pivot=pivot_payload,
-            result_text=result_text,
-        )
-    else:
-        block = _render_html_error_card(
-            attempt_id=run_id,
-            chat_id=chat_id,
-            provider=provider,
-            model=model or "unknown",
-            error_message=error_message,
-            result_text=result_text,
-            contract_issues=contract_issues,
-        )
-    retry_markup = _reply_error_keyboard(chat_id, retry_enabled=repair_available)
+    state_payload = {
+        "chat_id": chat_id,
+        "provider": provider,
+        "model": model or "unknown",
+        "parsed_output": parsed_output if isinstance(parsed_output, dict) else None,
+        "result_text": result_text,
+        "retry_context": next_retry_context,
+        "run_id": run_id,
+        "status": status,
+        "outcome_class": outcome_class,
+        "error_message": error_message or "",
+        "contract_issues": contract_issues,
+        "response_json": response_json if isinstance(response_json, dict) else {},
+        "conflict": conflict_payload,
+        "pivot": pivot_payload,
+        "active_section": "error",
+    }
+    section_text = _render_result_card_text(state_payload, section="error")
+    card_markup = _result_card_keyboard(
+        chat_id=chat_id,
+        active_section="error",
+        status=status,
+        telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+        retry_enabled=repair_available,
+        has_raw=bool(response_json),
+    )
     try:
-        await query.edit_message_text(block, parse_mode=ParseMode.HTML, reply_markup=retry_markup)
+        await query.edit_message_text(section_text, reply_markup=card_markup)
     except Exception:
-        await message.reply_text(block, parse_mode=ParseMode.HTML, reply_markup=retry_markup)
+        await message.reply_text(section_text, reply_markup=card_markup)
     _set_reply_card_state(
         app,
         int(message.message_id),
@@ -1962,7 +2212,150 @@ async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEF
         parsed_output=parsed_output,
         result_text=result_text,
         retry_context=next_retry_context,
+        run_id=run_id,
+        status=status,
+        outcome_class=outcome_class,
+        error_message=error_message,
+        contract_issues=contract_issues,
+        response_json=response_json if isinstance(response_json, dict) else {},
+        conflict=conflict_payload,
+        pivot=pivot_payload,
+        active_section="error",
     )
+
+
+def _build_raw_result_payload_from_state(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "scambait.result.card.v1",
+        "chat_id": int(state.get("chat_id") or -1),
+        "run_id": state.get("run_id"),
+        "provider": state.get("provider"),
+        "model": state.get("model"),
+        "status": state.get("status"),
+        "outcome_class": state.get("outcome_class"),
+        "error_message": state.get("error_message"),
+        "contract_issues": state.get("contract_issues") if isinstance(state.get("contract_issues"), list) else [],
+        "parsed_output": state.get("parsed_output") if isinstance(state.get("parsed_output"), dict) else None,
+        "result_text": str(state.get("result_text") or ""),
+        "response_json": state.get("response_json") if isinstance(state.get("response_json"), dict) else {},
+        "conflict": state.get("conflict") if isinstance(state.get("conflict"), dict) else None,
+        "pivot": state.get("pivot") if isinstance(state.get("pivot"), dict) else None,
+    }
+
+
+async def _handle_result_section_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await query.answer("Invalid section")
+        return
+    _, _, section, chat_raw = parts
+    if section not in RESULT_SECTION_LABELS:
+        await query.answer("Invalid section")
+        return
+    try:
+        chat_id = int(chat_raw)
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    state = _get_reply_card_state(app, int(message.message_id))
+    if not isinstance(state, dict):
+        await query.answer("Card state missing")
+        return
+    if int(state.get("chat_id", -1)) != chat_id:
+        await query.answer("Card chat mismatch")
+        return
+    status = str(state.get("status") or "unknown")
+    retry_enabled = isinstance(state.get("retry_context"), dict)
+    has_raw = bool(state.get("response_json"))
+    text = _render_result_card_text(state, section=section)
+    keyboard = _result_card_keyboard(
+        chat_id=chat_id,
+        active_section=section,
+        status=status,
+        telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+        retry_enabled=retry_enabled,
+        has_raw=has_raw,
+    )
+    target_message_id = int(message.message_id)
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        sent = await message.reply_text(text, reply_markup=keyboard)
+        target_message_id = int(sent.message_id)
+    _set_reply_card_state(
+        app,
+        target_message_id,
+        chat_id=chat_id,
+        provider=str(state.get("provider") or "unknown"),
+        model=str(state.get("model") or "unknown"),
+        parsed_output=state.get("parsed_output") if isinstance(state.get("parsed_output"), dict) else None,
+        result_text=str(state.get("result_text") or ""),
+        retry_context=state.get("retry_context") if isinstance(state.get("retry_context"), dict) else None,
+        run_id=state.get("run_id") if isinstance(state.get("run_id"), int) else None,
+        status=status,
+        outcome_class=str(state.get("outcome_class") or "unknown"),
+        error_message=str(state.get("error_message") or ""),
+        contract_issues=state.get("contract_issues") if isinstance(state.get("contract_issues"), list) else [],
+        response_json=state.get("response_json") if isinstance(state.get("response_json"), dict) else {},
+        conflict=state.get("conflict") if isinstance(state.get("conflict"), dict) else None,
+        pivot=state.get("pivot") if isinstance(state.get("pivot"), dict) else None,
+        active_section=section,
+    )
+    await query.answer(f"Section: {section}")
+
+
+async def _handle_result_rawfile_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Invalid action")
+        return
+    try:
+        chat_id = int(parts[2])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    state = _get_reply_card_state(app, int(message.message_id))
+    if not isinstance(state, dict):
+        await query.answer("Card state missing")
+        return
+    if int(state.get("chat_id", -1)) != chat_id:
+        await query.answer("Card chat mismatch")
+        return
+    raw_output = _raw_model_output_text(state)
+    if not raw_output:
+        await query.answer("Raw output unavailable")
+        return
+    run_id = state.get("run_id")
+    filename = f"dry_run_chat_{chat_id}_run_{run_id if isinstance(run_id, int) else 'unknown'}.txt"
+    await message.reply_document(
+        document=InputFile(io.BytesIO(raw_output.encode("utf-8")), filename=filename)
+    )
+    await query.answer("Raw file sent")
+
 
 
 async def _handle_reply_send_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3210,6 +3603,10 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_undo_send_button, pattern=r"^sc:undo_send:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dry_run_retry_button, pattern=r"^sc:reply_retry:[0-9]+$"))
+    app.add_handler(
+        CallbackQueryHandler(_handle_result_section_button, pattern=r"^sc:rsec:(?:message|actions|analysis|error|response|raw):[0-9]+$")
+    )
+    app.add_handler(CallbackQueryHandler(_handle_result_rawfile_button, pattern=r"^sc:rawfile:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_forward_insert_button, pattern=r"^sc:fwd_insert:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_forward_discard_button, pattern=r"^sc:fwd_discard:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_forward_select_chat_button, pattern=r"^sc:fwd_selchat:[0-9]+$"))
