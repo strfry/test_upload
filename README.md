@@ -200,3 +200,23 @@ Direkt ins Tool bis EOF (Ctrl+D):
 ```bash
 python scripts/loop_analyzer.py --transcript-stdin --assistant-sender "Me"
 ```
+
+## Interactive ScamBaiter REPL
+
+Für schnelle Experimente oder manuelle Overrides gibt es jetzt eine REPL, die denselben HF-Prompt-Flow wie der Control-Chat nutzt:
+
+```bash
+python scripts/chat_repl.py
+```
+
+Jede Zeile, die du eintippst (mit Enter abgeschickt), wird als neue Scammer-Nachricht gespeichert; die REPL baut prompt/builds, ruft `HF_TOKEN`/`HF_MODEL` auf und zeigt nur ScamBaiters vorgeschlagene Antwort. Die Eingabe wird erst dann abgeschickt, wenn du eine ganze Zeile bestätigt hast, und `Ctrl+C`/EOF beendet die Session.
+
+Konfigurierbare Flags:
+
+- `--db PATH`: Persistiere die Konversation im angegebenen SQLite-File (Standard `:memory:` bleibt flüchtig).
+- `--chat-id ID`: Nutze eine bekannte Chat-ID oder gib eine negative Test-ID vor.
+- `--max-tokens N`: Begrenze Prompt + Generation.
+- `--include-memory`: Lasse den Memory-Summary in die Prompt-Kette einfließen, ähnlich wie in der Control-Card.
+- `--prompt-path FILE`: Schreibe das erzeugte Prompt-JSON in eine Datei, um den Payload mit der Control-Prompt-Card vergleichen zu können.
+
+Diese REPL ergänzt die neuen manuellen Override-Features (Control-Card, Prompt-Ansicht etc.), weil sie dieselbe Prompt-, Memory- und Analysis-Pipeline nutzt. So können Operator:innen neue Dialogstränge erproben oder ungültige Responses reproduzieren, ohne die Telegram-UI zu benutzen.
