@@ -20,12 +20,13 @@ async def _run() -> None:
     allowed = os.getenv("SCAMBAITER_CONTROL_CHAT_ID")
     allowed_chat_id = int(allowed) if allowed else None
     telethon_executor = None
-    api_id = os.getenv("TELETHON_API_ID")
-    api_hash = os.getenv("TELETHON_API_HASH")
-    session_name = os.getenv("TELETHON_SESSION", "scambaiter.session")
-    if api_id and api_hash:
+    if config.telethon_api_id and config.telethon_api_hash:
         try:
-            telethon_executor = TelethonExecutor(api_id=int(api_id), api_hash=api_hash, session=session_name)
+            telethon_executor = TelethonExecutor(
+                api_id=config.telethon_api_id,
+                api_hash=config.telethon_api_hash,
+                session=config.telethon_session,
+            )
             await telethon_executor.start()
         except Exception:
             telethon_executor = None

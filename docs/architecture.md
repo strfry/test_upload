@@ -35,6 +35,40 @@ Die zentrale Architekturentscheidung ist:
 - Externe Systeme koennen UI-Muster oder Workflows inspirieren.
 - Sie duerfen keine finale Versandrolle fuer Scambaiting-Nachrichten uebernehmen.
 
+## Betriebsmodi
+
+Scambaiter kennt zwei Betriebsmodi, die beim Start durch die vorhandene Konfiguration festgelegt werden. Ein Wechsel zur Laufzeit ist nicht vorgesehen.
+
+### Live-Modus *(Telethon verbunden)*
+
+Erfordert vollen Telegram-Kontozugang per Telethon. Nur ein Operator gleichzeitig.
+
+- Eingehende Scammer-Nachrichten werden **automatisch** empfangen und gespeichert; der Backend-Pipeline wird **sofort** getriggert.
+- Tipp-Events des Scammers werden überwacht, was das realistische „Tippen und Pausieren" ermöglicht.
+- Eingehende Nachrichten können sofort als gelesen markiert werden, um Ungelesene-Badges im Telegram-Client zu unterdrücken.
+- Antworten werden per Telethon **direkt** vom Konto des Operators gesendet.
+- Profilmetadaten (Fotos, Bio, Username) werden aus Telegram abgerufen und gespeichert.
+- Kein manuelles Weiterleiten oder Kopieren erforderlich.
+
+**Voraussetzungen:** `TELETHON_API_ID`, `TELETHON_API_HASH` und `SCAMBAITER_BOT_TOKEN` müssen gesetzt sein.
+
+### Relay-Modus *(nur Bot-API)*
+
+Erfordert nur ein Telegram-Bot-Token. Kann von beliebig vielen unabhängigen Operatoren genutzt werden.
+
+- Eingehende Scammer-Nachrichten werden durch **Weiterleiten** an den Control-Bot ingested.
+- Antworten werden im Control-Bot präsentiert; der Operator **kopiert und sendet** sie manuell aus dem eigenen Telegram-Client.
+- Profilmetadaten beschränken sich auf das, was Telegram in Bot-API-Forward-Origins ausgibt (keine Fotos, keine Bio).
+- Die Forward-Ingestion nutzt sequenzbewusste Merge-Logik für Deduplizierung und Reihenfolge-Rekonstruktion.
+
+**Voraussetzung:** Nur `SCAMBAITER_BOT_TOKEN` muss gesetzt sein.
+
+### Moduserkennung
+
+Der Modus ergibt sich beim Start automatisch: Sind `TELETHON_API_ID` und `TELETHON_API_HASH` gesetzt, läuft das System im Live-Modus; andernfalls im Relay-Modus. Core und Store sind modusunabhängig – sie lesen immer aus dem Event-Store, unabhängig davon, wie Ereignisse dort hineinkamen.
+
+---
+
 ## Hauptkomponenten
 
 ### `ScambaiterCore`

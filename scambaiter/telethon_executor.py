@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from telethon import TelegramClient
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -132,3 +135,149 @@ class TelethonExecutor:
                 break
 
         return report
+
+    async def start_listener(
+        self,
+        store: Any,
+        service: Any,
+        folder_name: str = "Scammers",
+    ) -> None:
+        """Register Live Mode event handlers for auto-receive and typing monitoring.
+
+        Incoming messages from chats in *folder_name* are stored immediately and
+        trigger response generation.  If the folder cannot be resolved, all
+        incoming messages are accepted.
+        """
+        from telethon import events
+        from telethon.tl.functions.messages import GetDialogFiltersRequest
+        from telethon.tl.types import DialogFilter
+
+        folder_chat_ids: list[int] = []
+        if folder_name:
+            try:
+                filters_result = await self._client(GetDialogFiltersRequest())
+                for item in getattr(filters_result, "filters", filters_result):
+                    if not isinstance(item, DialogFilter):
+                        continue
+                    title = getattr(item, "title", None)
+                    if isinstance(title, str):
+                        name = title
+                    else:
+                        # TextWithEntities or similar — fall back to str()
+                        name = str(title) if title is not None else ""
+                    if name != folder_name:
+                        continue
+                    folder_id = int(item.id)
+                    try:
+                        async for dialog in self._client.iter_dialogs(limit=None, folder=folder_id):
+                            folder_chat_ids.append(int(dialog.id))
+                    except Exception:
+                        # Fall back to include_peers list
+                        include_peers = getattr(item, "include_peers", None) or []
+                        from telethon import utils as tl_utils
+                        for peer in include_peers:
+                            try:
+                                folder_chat_ids.append(int(tl_utils.get_peer_id(peer)))
+                            except Exception:
+                                pass
+                    break
+            except Exception as exc:
+                _log.warning("start_listener: could not resolve folder %r: %s", folder_name, exc)
+
+        _folder_set: set[int] = set(folder_chat_ids)
+        _log.info(
+            "start_listener: Live Mode active, folder=%r, %d chats tracked",
+            folder_name,
+            len(_folder_set),
+        )
+
+        @self._client.on(events.NewMessage(incoming=True))
+        async def _on_new_message(event: Any) -> None:
+            chat_id = int(event.chat_id)
+            if _folder_set and chat_id not in _folder_set:
+                return
+            msg = event.message
+            ts = (
+                msg.date.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+                if msg.date
+                else None
+            )
+            if getattr(msg, "sticker", None):
+                event_type = "sticker"
+                text: str | None = None
+            elif getattr(msg, "photo", None):
+                event_type = "photo"
+                text = msg.message or None
+            else:
+                event_type = "message"
+                text = msg.message or None
+            try:
+                store.ingest_event(
+                    chat_id=chat_id,
+                    event_type=event_type,
+                    role="scammer",
+                    text=text,
+                    ts_utc=ts,
+                    source_message_id=str(msg.id),
+                )
+            except Exception as exc:
+                _log.debug("start_listener: ingest_event skipped for %d/%d: %s", chat_id, msg.id, exc)
+                return
+            asyncio.create_task(service.trigger_for_chat(chat_id, trigger="live_message"))
+
+        @self._client.on(events.UserUpdate())
+        async def _on_user_update(event: Any) -> None:
+            if not getattr(event, "typing", False):
+                return
+            try:
+                chat_id = int(event.chat_id)
+            except Exception:
+                return
+            if _folder_set and chat_id not in _folder_set:
+                return
+            ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            try:
+                store.ingest_event(
+                    chat_id=chat_id,
+                    event_type="typing_interval",
+                    role="scammer",
+                    ts_utc=ts,
+                )
+            except Exception as exc:
+                _log.debug("start_listener: typing ingest skipped for %d: %s", chat_id, exc)
+
+    async def fetch_profile(self, chat_id: int, store: Any) -> None:
+        """Fetch profile metadata from Telegram and persist it to the store.
+
+        Stores username, first/last name, bio and profile photo presence in
+        ``chat_profiles`` via ``store.upsert_chat_profile()``.
+        """
+        try:
+            entity = await self._client.get_entity(chat_id)
+        except Exception as exc:
+            _log.warning("fetch_profile: get_entity failed for %d: %s", chat_id, exc)
+            return
+
+        identity: dict[str, Any] = {}
+        for attr in ("first_name", "last_name", "username"):
+            val = getattr(entity, attr, None)
+            if val:
+                identity[attr] = str(val)
+        bio = getattr(entity, "about", None)
+        if bio:
+            identity["bio"] = str(bio)
+
+        patch: dict[str, Any] = {}
+        if identity:
+            patch["identity"] = identity
+
+        try:
+            photos = await self._client.get_profile_photos(entity, limit=1)
+            patch["profile_media"] = {"has_profile_photo": bool(photos)}
+            if photos:
+                patch["profile_media"]["current_photo_telegram_id"] = int(photos[0].id)
+        except Exception as exc:
+            _log.debug("fetch_profile: photo fetch failed for %d: %s", chat_id, exc)
+
+        if patch:
+            store.upsert_chat_profile(chat_id=chat_id, patch=patch, source="telethon")

@@ -17,6 +17,34 @@ Scambaiter wird aktuell von der Dokumentation aus neu implementiert. Die Archite
 - `docs/snippets/prompt_konkretheit.txt` – Kürzere Richtlinie zur gewünschten Prompt-Konkretheit.
 - `docs/skills.md` – Sammlung nützlicher Codex-Skills für dieses Projekt.
 
+## Betriebsmodi
+
+Scambaiter kennt zwei Betriebsmodi, die beim Start automatisch durch die vorhandene Konfiguration bestimmt werden.
+
+### Live-Modus *(Telethon + Bot-Token)*
+
+Erfordert vollen Telegram-Kontozugang per Telethon sowie einen Bot-Token.
+
+- Nachrichten vom Scammer werden **automatisch** empfangen und in der Pipeline verarbeitet.
+- Tipp-Events des Scammers werden überwacht (realistisches Timing).
+- Antworten werden **direkt** per Telethon vom Operator-Konto gesendet.
+- Profilmetadaten (Bio, Fotos, Username) werden aus Telegram abgerufen.
+- Kein manuelles Weiterleiten erforderlich.
+
+Benötigt: `TELETHON_API_ID`, `TELETHON_API_HASH` und `SCAMBAITER_BOT_TOKEN`.
+
+### Relay-Modus *(nur Bot-Token)*
+
+Erfordert nur einen Bot-Token. Mehrere Operatoren parallel möglich.
+
+- Nachrichten werden durch **Weiterleiten** an den Control-Bot ingested.
+- Antworten werden im Control-Bot angezeigt; der Operator **kopiert und sendet** manuell.
+- Profilmetadaten auf Forward-Metadaten der Bot-API beschränkt (keine Fotos, keine Bio).
+
+Benötigt: nur `SCAMBAITER_BOT_TOKEN`.
+
+---
+
 ## Setup
 
 ```bash

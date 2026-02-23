@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
+from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -2002,7 +2002,7 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
             chat_id=chat_id,
             active_section="message",
             status=status,
-            telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+            telethon_enabled=app.bot_data.get("mode") == "live",
             retry_enabled=False,
             has_raw=bool(response_json),
         )
@@ -2055,7 +2055,7 @@ async def _handle_dry_run_button(update: Update, context: ContextTypes.DEFAULT_T
             chat_id=chat_id,
             active_section="error",
             status=status,
-            telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+            telethon_enabled=app.bot_data.get("mode") == "live",
             retry_enabled=repair_available,
             has_raw=bool(response_json),
         )
@@ -2208,7 +2208,7 @@ async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEF
             chat_id=chat_id,
             active_section="message",
             status=status,
-            telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+            telethon_enabled=app.bot_data.get("mode") == "live",
             retry_enabled=False,
             has_raw=bool(response_json),
         )
@@ -2265,7 +2265,7 @@ async def _handle_dry_run_retry_button(update: Update, context: ContextTypes.DEF
         chat_id=chat_id,
         active_section="error",
         status=status,
-        telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+        telethon_enabled=app.bot_data.get("mode") == "live",
         retry_enabled=repair_available,
         has_raw=bool(response_json),
     )
@@ -2354,7 +2354,7 @@ async def _handle_result_section_button(update: Update, context: ContextTypes.DE
         chat_id=chat_id,
         active_section=section,
         status=status,
-        telethon_enabled=app.bot_data.get("telethon_executor") is not None,
+        telethon_enabled=app.bot_data.get("mode") == "live",
         retry_enabled=retry_enabled,
         has_raw=has_raw,
     )
@@ -2626,6 +2626,36 @@ async def _handle_forward_select_chat_button(update: Update, context: ContextTyp
     await query.answer(f"Target /{target_chat_id} selected")
 
 
+async def _handle_forward_manual_override_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    query = update.callback_query
+    if query is None:
+        return
+    message = query.message
+    if message is None:
+        await query.answer()
+        return
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    control_chat_id = int(message.chat_id)
+    manual_requests = _manual_override_requests(app)
+    if control_chat_id in manual_requests:
+        await query.answer("Manual override already pending")
+        return
+    manual_labels = _manual_override_labels(app)
+    if manual_labels.get(control_chat_id):
+        await query.answer("Manual alias already set for this chat")
+        return
+    prompt = await message.reply_text(
+        "Manual override: reply with a unique alias (e.g. 'scammer_alpha'). This label will be hashed into a placeholder chat id for the bot to keep using for this source.",
+        reply_markup=ForceReply(selective=True),
+    )
+    manual_requests[control_chat_id] = int(prompt.message_id)
+    await query.answer("Awaiting alias reply")
+
+
 async def _handle_forward_discard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     allowed_chat_id = app.bot_data.get("allowed_chat_id")
@@ -2680,7 +2710,8 @@ async def _handle_forward_insert_button(update: Update, context: ContextTypes.DE
     if not isinstance(target_chat_id, int) or target_chat_id <= 0:
         await query.answer("No target chat selected")
         return
-    merge = _plan_forward_merge(store, target_chat_id, pending)
+    allow_placeholder = target_chat_id < 0
+    merge = _plan_forward_merge(store, target_chat_id, pending, allow_placeholder=allow_placeholder)
     mode = str(merge.get("mode") or "")
     insert_payloads = merge.get("insert_payloads")
     if mode not in {"append", "backfill"} or not isinstance(insert_payloads, list) or not insert_payloads:
@@ -2720,6 +2751,44 @@ async def _handle_forward_insert_button(update: Update, context: ContextTypes.DE
         target_chat_id=target_chat_id,
     )
     await query.answer("Inserted")
+
+
+async def _handle_manual_override_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    message = update.effective_message
+    if message is None:
+        return
+    if message.reply_to_message is None:
+        return
+    if not isinstance(message.text, str) or not message.text.strip():
+        await message.reply_text("Alias cannot be empty. Try again.")
+        return
+    control_chat_id = int(message.chat_id)
+    manual_requests = _manual_override_requests(app)
+    prompt_id = manual_requests.get(control_chat_id)
+    if not isinstance(prompt_id, int) or int(message.reply_to_message.message_id) != prompt_id:
+        return
+    manual_requests.pop(control_chat_id, None)
+    label = message.text.strip()
+    placeholder = _manual_alias_placeholder(label)
+    _manual_override_labels(app)[control_chat_id] = label
+    _forward_card_targets(app)[control_chat_id] = placeholder
+    _active_targets(app)[control_chat_id] = placeholder
+    _auto_targets(app)[control_chat_id] = placeholder
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    await _update_forward_card(
+        application=app,
+        message=None,
+        store=store,
+        control_chat_id=control_chat_id,
+    )
+    await _show_user_card(
+        application=app,
+        control_chat_id=control_chat_id,
+        store=store,
+        target_chat_id=placeholder,
+    )
 
 
 def _is_forward_message(message: Message) -> bool:
@@ -3143,8 +3212,14 @@ def _build_existing_identity_index(events: list[Any]) -> dict[str, list[Any]]:
     return out
 
 
-def _plan_forward_merge(store: Any, target_chat_id: int, payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    if target_chat_id <= 0:
+def _plan_forward_merge(
+    store: Any,
+    target_chat_id: int,
+    payloads: list[dict[str, Any]],
+    *,
+    allow_placeholder: bool = False,
+) -> dict[str, Any]:
+    if target_chat_id <= 0 and not allow_placeholder:
         return {"mode": "unresolved", "insert_payloads": [], "reason": "target chat unresolved"}
     if not payloads:
         return {"mode": "blocked", "insert_payloads": [], "reason": "batch empty"}
@@ -3230,15 +3305,47 @@ def _plan_forward_merge(store: Any, target_chat_id: int, payloads: list[dict[str
     return {"mode": "backfill", "insert_payloads": insert_payloads, "reason": f"backfill {len(insert_payloads)} item(s)"}
 
 
+def _manual_override_requests(application: Application) -> dict[int, int]:
+    state = application.bot_data.setdefault("manual_override_request_by_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["manual_override_request_by_chat"] = state
+    return state
+
+
+def _manual_override_labels(application: Application) -> dict[int, str]:
+    state = application.bot_data.setdefault("manual_override_label_by_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["manual_override_label_by_chat"] = state
+    return state
+
+
+def _manual_alias_placeholder(alias: str) -> int:
+    normalized = alias.strip()
+    if not normalized:
+        raise ValueError("alias cannot be empty")
+    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big", signed=False)
+    placeholder_base = (1 << 62) - 1
+    placeholder_value = value % placeholder_base
+    return -1 - placeholder_value
+
+
 def _forward_card_keyboard(
     *,
     control_chat_id: int,
     target_chat_id: int | None,
     mode: str,
     known_chat_ids: list[int],
+    manual_alias_label: str | None,
+    manual_pending: bool,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    if isinstance(target_chat_id, int) and target_chat_id > 0:
+    has_resolved_target = isinstance(target_chat_id, int) and target_chat_id > 0
+    if manual_alias_label is not None:
+        has_resolved_target = True
+    if has_resolved_target:
         if mode == "append":
             rows.append([InlineKeyboardButton(f"Append to /{target_chat_id}", callback_data=f"sc:fwd_insert:{control_chat_id}")])
         elif mode == "backfill":
@@ -3246,6 +3353,10 @@ def _forward_card_keyboard(
         else:
             rows.append([InlineKeyboardButton("Insert blocked", callback_data="sc:nop")])
     else:
+        if manual_pending:
+            rows.append([InlineKeyboardButton("Manual override pending (enter alias)", callback_data="sc:nop")])
+        else:
+            rows.append([InlineKeyboardButton("Manual override alias", callback_data=f"sc:fwd_manual:{control_chat_id}")])
         for chat_id in known_chat_ids[:8]:
             rows.append([InlineKeyboardButton(f"/{chat_id}", callback_data=f"sc:fwd_selchat:{chat_id}")])
     rows.append([InlineKeyboardButton("Discard", callback_data=f"sc:fwd_discard:{control_chat_id}")])
@@ -3258,6 +3369,8 @@ def _render_forward_card_text(
     target_chat_id: int | None,
     payloads: list[dict[str, Any]],
     merge: dict[str, Any],
+    manual_alias_label: str | None,
+    manual_pending: bool,
 ) -> str:
     total = len(payloads)
     scammer = sum(1 for p in payloads if str(p.get("role") or "") == "scammer")
@@ -3266,10 +3379,13 @@ def _render_forward_card_text(
     mode = str(merge.get("mode") or "unresolved")
     reason = str(merge.get("reason") or "-")
     target_text = f"/{target_chat_id}" if isinstance(target_chat_id, int) and target_chat_id > 0 else "(unresolved)"
+    alias_label = manual_alias_label or "(none)"
+    pending_note = " (waiting for entry)" if manual_pending else ""
     return (
         "Forward/Insert Card\n"
         f"control_chat: {control_chat_id}\n"
         f"target_chat: {target_text}\n"
+        f"manual_alias: {alias_label}{pending_note}\n"
         f"batch_items: {total}\n"
         f"scammer_items: {scammer}\n"
         f"manual_items: {manual}\n"
@@ -3282,7 +3398,7 @@ def _render_forward_card_text(
 async def _update_forward_card(
     *,
     application: Application,
-    message: Message,
+    message: Message | None,
     store: Any,
     control_chat_id: int,
 ) -> None:
@@ -3290,19 +3406,32 @@ async def _update_forward_card(
     payloads = pending.get(control_chat_id, [])
     target_map = _forward_card_targets(application)
     target_chat_id = target_map.get(control_chat_id)
-    merge = _plan_forward_merge(store, target_chat_id if isinstance(target_chat_id, int) else -1, payloads)
+    allow_placeholder = isinstance(target_chat_id, int) and target_chat_id < 0
+    merge = _plan_forward_merge(
+        store,
+        target_chat_id if isinstance(target_chat_id, int) else -1,
+        payloads,
+        allow_placeholder=allow_placeholder,
+    )
     known_chat_ids = store.list_chat_ids(limit=30)
+    manual_requests = _manual_override_requests(application)
+    manual_alias_label = _manual_override_labels(application).get(control_chat_id)
+    manual_pending = control_chat_id in manual_requests
     text = _render_forward_card_text(
         control_chat_id=control_chat_id,
         target_chat_id=target_chat_id,
         payloads=payloads,
         merge=merge,
+        manual_alias_label=manual_alias_label,
+        manual_pending=manual_pending,
     )
     keyboard = _forward_card_keyboard(
         control_chat_id=control_chat_id,
         target_chat_id=target_chat_id,
         mode=str(merge.get("mode") or "unresolved"),
         known_chat_ids=known_chat_ids,
+        manual_alias_label=manual_alias_label,
+        manual_pending=manual_pending,
     )
     message_ids = _forward_card_messages(application)
     current_id = message_ids.get(control_chat_id)
@@ -3317,13 +3446,18 @@ async def _update_forward_card(
             return
         except Exception:
             pass
-    sent = await message.reply_text(text, reply_markup=keyboard)
-    message_ids[control_chat_id] = int(sent.message_id)
+    if message is not None:
+        sent = await message.reply_text(text, reply_markup=keyboard)
+    else:
+        sent = await application.bot.send_message(chat_id=control_chat_id, text=text, reply_markup=keyboard)
+    message_ids[control_chat_id] = int(getattr(sent, "message_id", None) or getattr(sent, "id", None) or 0)
 
 
 def _clear_forward_session(application: Application, control_chat_id: int) -> None:
     _pending_forwards(application)[control_chat_id] = []
     _forward_card_targets(application).pop(control_chat_id, None)
+    _manual_override_requests(application).pop(control_chat_id, None)
+    _manual_override_labels(application).pop(control_chat_id, None)
 
 
 def _flush_pending_forwards(
@@ -3680,6 +3814,7 @@ def create_bot_app(
     app.bot_data["service"] = service
     app.bot_data["allowed_chat_id"] = allowed_chat_id
     app.bot_data["telethon_executor"] = telethon_executor
+    app.bot_data["mode"] = "live" if telethon_executor is not None else "relay"
     app.bot_data["register_command_menu"] = lambda: _register_command_menu(app)
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("whoami", _cmd_whoami))
@@ -3712,8 +3847,10 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_forward_insert_button, pattern=r"^sc:fwd_insert:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_forward_discard_button, pattern=r"^sc:fwd_discard:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_forward_select_chat_button, pattern=r"^sc:fwd_selchat:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_manual_override_button, pattern=r"^sc:fwd_manual:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_reply_delete_button, pattern=r"^sc:reply_delete:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
     app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:nop$"))
+    app.add_handler(MessageHandler(filters.REPLY, _handle_manual_override_response))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
     return app

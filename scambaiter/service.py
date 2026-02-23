@@ -57,6 +57,13 @@ class BackgroundService:
     def get_pending_message(self, chat_id: int) -> PendingMessage | None:
         return self._pending_messages.get(chat_id)
 
+    async def trigger_for_chat(self, chat_id: int, trigger: str = "live_message") -> None:
+        """Generate a response for a single chat immediately (Live Mode auto-receive)."""
+        context = await self.core.build_chat_context(chat_id)
+        if context is None:
+            return
+        await self._generate_for_contexts([context], on_warning=None, trigger=trigger)
+
     async def run_dry_run_once(self, chat_id: int, trigger: str) -> ModelOutput | None:
         context = await self.core.build_chat_context(chat_id)
         if context is None:

@@ -7,6 +7,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import asyncio
+from unittest.mock import patch
 
 from scambaiter.bot_api import (
     _build_forward_payload,
@@ -16,10 +18,16 @@ from scambaiter.bot_api import (
     _event_ts_utc_for_store,
     _extract_partial_message_preview,
     _extract_forward_profile_info,
+    _forward_card_keyboard,
+    _forward_card_messages,
+    _forward_card_targets,
+    _pending_forwards,
     _infer_role_without_target,
     _infer_target_chat_id_from_forward,
+    _manual_alias_placeholder,
     _ingest_forward_payload,
     _plan_forward_merge,
+    _update_forward_card,
     _profile_lines_from_events,
     _render_prompt_card_text,
     _render_result_section_message,
@@ -683,6 +691,79 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertEqual("sc:psec:messages:999", prompt_row[0].callback_data)
         self.assertEqual("memory", prompt_row[1].text)
         self.assertEqual("system", prompt_row[2].text)
+
+    def test_manual_alias_placeholder_is_consistent_and_negative(self) -> None:
+        first = _manual_alias_placeholder("scammer_alias")
+        second = _manual_alias_placeholder("scammer_alias")
+        other = _manual_alias_placeholder("different_alias")
+        self.assertEqual(first, second)
+        self.assertLess(first, 0)
+        self.assertNotEqual(first, other)
+
+    def test_forward_card_keyboard_shows_manual_override_button_when_unresolved(self) -> None:
+        keyboard = _forward_card_keyboard(
+            control_chat_id=5,
+            target_chat_id=None,
+            mode="unresolved",
+            known_chat_ids=[11, 22],
+            manual_alias_label=None,
+            manual_pending=False,
+        )
+        rows = keyboard.inline_keyboard
+        self.assertEqual("Manual override alias", rows[0][0].text)
+        self.assertEqual("sc:fwd_manual:5", rows[0][0].callback_data)
+        self.assertEqual("/11", rows[1][0].text)
+
+    def test_forward_card_keyboard_shows_pending_row_when_alias_requested(self) -> None:
+        keyboard = _forward_card_keyboard(
+            control_chat_id=5,
+            target_chat_id=None,
+            mode="unresolved",
+            known_chat_ids=[11],
+            manual_alias_label=None,
+            manual_pending=True,
+        )
+        rows = keyboard.inline_keyboard
+        self.assertIn("Manual override pending", rows[0][0].text)
+        self.assertEqual("sc:nop", rows[0][0].callback_data)
+
+    def test_update_forward_card_edits_stored_message_when_no_message_arg(self) -> None:
+        class DummyBot:
+            def __init__(self) -> None:
+                self.edits: list[tuple[int, int, str]] = []
+                self.sent: list[tuple[int, str]] = []
+
+            async def edit_message_text(
+                self,
+                *,
+                chat_id: int,
+                message_id: int,
+                text: str,
+                reply_markup: object | None = None,
+            ) -> None:
+                self.edits.append((chat_id, message_id, text))
+
+            async def send_message(self, chat_id: int, text: str, reply_markup: object | None = None) -> SimpleNamespace:
+                self.sent.append((chat_id, text))
+                return SimpleNamespace(message_id=1111)
+
+        app = SimpleNamespace(bot_data={})
+        app.bot = DummyBot()
+        control_chat_id = 42
+        _forward_card_messages(app)[control_chat_id] = 999
+        _pending_forwards(app)[control_chat_id] = []
+        _forward_card_targets(app)[control_chat_id] = 123
+        store = SimpleNamespace(list_chat_ids=lambda limit: [], list_events=lambda chat_id, limit: [])
+        with patch("scambaiter.bot_api._plan_forward_merge", return_value={"mode": "blocked", "insert_payloads": [], "reason": "ok"}):
+            asyncio.run(
+                _update_forward_card(
+                    application=app,
+                    message=None,
+                    store=store,
+                    control_chat_id=control_chat_id,
+                )
+            )
+        self.assertEqual([(control_chat_id, 999, unittest.mock.ANY)], app.bot.edits)  # type: ignore[attr-defined]
 
     def test_render_whoami_text_reports_authorization_state(self) -> None:
         message = type("Msg", (), {"chat_id": 1234})()
