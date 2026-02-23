@@ -43,6 +43,14 @@ async def _run() -> None:
     )
     await app.initialize()
     await app.start()
+    folder_name = os.getenv("SCAMBAITER_FOLDER_NAME", "Scammers")
+    if telethon_executor is not None:
+        await telethon_executor.start_listener(
+            store=store,
+            service=service,
+            folder_name=folder_name,
+        )
+        asyncio.create_task(telethon_executor.startup_backfill(store=store, folder_name=folder_name))
     register_command_menu = app.bot_data.get("register_command_menu")
     if callable(register_command_menu):
         await register_command_menu()

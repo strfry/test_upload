@@ -136,6 +136,38 @@ class TelethonExecutor:
 
         return report
 
+    async def _resolve_folder_ids(self, folder_name: str) -> set[int]:
+        """Return the set of chat IDs in the named Telegram folder, or empty set on failure."""
+        from telethon.tl.functions.messages import GetDialogFiltersRequest
+        from telethon.tl.types import DialogFilter
+
+        folder_chat_ids: list[int] = []
+        try:
+            filters_result = await self._client(GetDialogFiltersRequest())
+            for item in getattr(filters_result, "filters", filters_result):
+                if not isinstance(item, DialogFilter):
+                    continue
+                title = getattr(item, "title", None)
+                name = title if isinstance(title, str) else (str(title) if title is not None else "")
+                if name != folder_name:
+                    continue
+                folder_id = int(item.id)
+                try:
+                    async for dialog in self._client.iter_dialogs(limit=None, folder=folder_id):
+                        folder_chat_ids.append(int(dialog.id))
+                except Exception:
+                    include_peers = getattr(item, "include_peers", None) or []
+                    from telethon import utils as tl_utils
+                    for peer in include_peers:
+                        try:
+                            folder_chat_ids.append(int(tl_utils.get_peer_id(peer)))
+                        except Exception:
+                            pass
+                break
+        except Exception as exc:
+            _log.warning("_resolve_folder_ids: could not resolve folder %r: %s", folder_name, exc)
+        return set(folder_chat_ids)
+
     async def start_listener(
         self,
         store: Any,
@@ -149,42 +181,8 @@ class TelethonExecutor:
         incoming messages are accepted.
         """
         from telethon import events
-        from telethon.tl.functions.messages import GetDialogFiltersRequest
-        from telethon.tl.types import DialogFilter
 
-        folder_chat_ids: list[int] = []
-        if folder_name:
-            try:
-                filters_result = await self._client(GetDialogFiltersRequest())
-                for item in getattr(filters_result, "filters", filters_result):
-                    if not isinstance(item, DialogFilter):
-                        continue
-                    title = getattr(item, "title", None)
-                    if isinstance(title, str):
-                        name = title
-                    else:
-                        # TextWithEntities or similar — fall back to str()
-                        name = str(title) if title is not None else ""
-                    if name != folder_name:
-                        continue
-                    folder_id = int(item.id)
-                    try:
-                        async for dialog in self._client.iter_dialogs(limit=None, folder=folder_id):
-                            folder_chat_ids.append(int(dialog.id))
-                    except Exception:
-                        # Fall back to include_peers list
-                        include_peers = getattr(item, "include_peers", None) or []
-                        from telethon import utils as tl_utils
-                        for peer in include_peers:
-                            try:
-                                folder_chat_ids.append(int(tl_utils.get_peer_id(peer)))
-                            except Exception:
-                                pass
-                    break
-            except Exception as exc:
-                _log.warning("start_listener: could not resolve folder %r: %s", folder_name, exc)
-
-        _folder_set: set[int] = set(folder_chat_ids)
+        _folder_set = await self._resolve_folder_ids(folder_name) if folder_name else set()
         _log.info(
             "start_listener: Live Mode active, folder=%r, %d chats tracked",
             folder_name,
@@ -224,6 +222,8 @@ class TelethonExecutor:
                 _log.debug("start_listener: ingest_event skipped for %d/%d: %s", chat_id, msg.id, exc)
                 return
             asyncio.create_task(service.trigger_for_chat(chat_id, trigger="live_message"))
+            if store.get_chat_profile(chat_id) is None:
+                asyncio.create_task(self.fetch_profile(chat_id, store))
 
         @self._client.on(events.UserUpdate())
         async def _on_user_update(event: Any) -> None:
@@ -245,6 +245,34 @@ class TelethonExecutor:
                 )
             except Exception as exc:
                 _log.debug("start_listener: typing ingest skipped for %d: %s", chat_id, exc)
+
+    async def startup_backfill(
+        self,
+        store: Any,
+        folder_name: str = "Scammers",
+        history_limit: int = 200,
+    ) -> None:
+        """Fetch history and profile for all chats in the folder on startup.
+
+        Runs as a background task (non-blocking). Skips chats where history is
+        already present (deduplication handled by store's unique index).
+        """
+        _log.info("startup_backfill: resolving folder %r", folder_name)
+        folder_ids = await self._resolve_folder_ids(folder_name)
+        if not folder_ids:
+            _log.info("startup_backfill: no chats found in folder %r, skipping", folder_name)
+            return
+        _log.info("startup_backfill: backfilling %d chats", len(folder_ids))
+        for chat_id in folder_ids:
+            try:
+                count = await self.fetch_history(chat_id, store, limit=history_limit)
+                _log.info("startup_backfill: chat %d — %d new events", chat_id, count)
+            except Exception as exc:
+                _log.warning("startup_backfill: fetch_history failed for %d: %s", chat_id, exc)
+            try:
+                await self.fetch_profile(chat_id, store)
+            except Exception as exc:
+                _log.warning("startup_backfill: fetch_profile failed for %d: %s", chat_id, exc)
 
     async def fetch_profile(self, chat_id: int, store: Any) -> None:
         """Fetch profile metadata from Telegram and persist it to the store.
@@ -281,3 +309,41 @@ class TelethonExecutor:
 
         if patch:
             store.upsert_chat_profile(chat_id=chat_id, patch=patch, source="telethon")
+
+    async def fetch_history(self, chat_id: int, store: Any, limit: int | None = 200) -> int:
+        """Fetch the most recent messages from a Telegram chat and ingest into the store.
+
+        Uses msg.out to determine role: outgoing → "scambaiter", incoming → "scammer".
+        Deduplication is handled by the store's unique index on (chat_id, source_message_id).
+        Returns the count of newly ingested events.
+        """
+        entity = await self._client.get_entity(chat_id)
+        count = 0
+        async for msg in self._client.iter_messages(entity, limit=limit):
+            role = "scambaiter" if msg.out else "scammer"
+            if getattr(msg, "sticker", None):
+                event_type = "sticker"
+                text = None
+            elif getattr(msg, "photo", None):
+                event_type = "photo"
+                text = msg.message or None
+            else:
+                event_type = "message"
+                text = msg.message or None
+            ts = (
+                msg.date.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+                if msg.date else None
+            )
+            try:
+                store.ingest_event(
+                    chat_id=chat_id,
+                    event_type=event_type,
+                    role=role,
+                    text=text,
+                    ts_utc=ts,
+                    source_message_id=str(msg.id),
+                )
+                count += 1
+            except Exception:
+                pass  # duplicate or invalid — skip silently
+        return count

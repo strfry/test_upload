@@ -202,6 +202,7 @@ class AnalysisStore:
             )
             """
         )
+        self._ensure_analyses_columns()
         self._ensure_generation_attempt_columns()
         # Legacy cleanup: older builds embedded source labels in profile_update text.
         # Normalize persisted rows so views stay clean without data loss.
@@ -422,6 +423,41 @@ class AnalysisStore:
             for row in rows
         ]
 
+    def count_events(self, chat_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM events WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def repair_timestamps_from_meta(self, chat_id: int | None = None) -> int:
+        """Fill ts_utc = '' from meta_json forward_profile.origin_date_utc where available."""
+        if chat_id is not None:
+            rows = self._conn.execute(
+                "SELECT id, meta_json FROM events WHERE chat_id = ? AND ts_utc = ''",
+                (chat_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, meta_json FROM events WHERE ts_utc = ''"
+            ).fetchall()
+        updated = 0
+        for row in rows:
+            try:
+                meta = json.loads(row["meta_json"])
+                fp = meta.get("forward_profile") if isinstance(meta, dict) else None
+                ts = fp.get("origin_date_utc") if isinstance(fp, dict) else None
+                if not isinstance(ts, str) or not ts:
+                    continue
+                self._conn.execute(
+                    "UPDATE events SET ts_utc = ? WHERE id = ?", (ts, row["id"])
+                )
+                updated += 1
+            except Exception:
+                continue
+        if updated:
+            self._conn.commit()
+        return updated
+
     def clear_chat_history(self, chat_id: int) -> int:
         cur = self._conn.execute("DELETE FROM events WHERE chat_id = ?", (chat_id,))
         self._conn.commit()
@@ -429,6 +465,30 @@ class AnalysisStore:
         if deleted is None or deleted < 0:
             return 0
         return int(deleted)
+
+    def delete_events_by_ids(self, event_ids: list[int]) -> int:
+        """Delete specific events by row id. Returns count of deleted rows."""
+        if not event_ids:
+            return 0
+        placeholders = ",".join("?" * len(event_ids))
+        cur = self._conn.execute(
+            f"DELETE FROM events WHERE id IN ({placeholders})",
+            event_ids,
+        )
+        self._conn.commit()
+        return int(cur.rowcount) if cur.rowcount and cur.rowcount > 0 else 0
+
+    def move_events_to_chat(self, event_ids: list[int], new_chat_id: int) -> int:
+        """Reassign events to a different chat_id. Returns count of updated rows."""
+        if not event_ids:
+            return 0
+        placeholders = ",".join("?" * len(event_ids))
+        cur = self._conn.execute(
+            f"UPDATE events SET chat_id = ? WHERE id IN ({placeholders})",
+            [new_chat_id, *event_ids],
+        )
+        self._conn.commit()
+        return int(cur.rowcount) if cur.rowcount and cur.rowcount > 0 else 0
 
     def clear_chat_context(self, chat_id: int) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -667,6 +727,16 @@ class AnalysisStore:
                 }
             )
         return messages
+
+    def _ensure_analyses_columns(self) -> None:
+        rows = self._conn.execute("PRAGMA table_info(analyses)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "analysis_json" not in columns:
+            self._conn.execute("ALTER TABLE analyses ADD COLUMN analysis_json TEXT NOT NULL DEFAULT '{}'")
+        if "actions_json" not in columns:
+            self._conn.execute("ALTER TABLE analyses ADD COLUMN actions_json TEXT NOT NULL DEFAULT '[]'")
+        if "metadata_json" not in columns:
+            self._conn.execute("ALTER TABLE analyses ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
 
     def _ensure_generation_attempt_columns(self) -> None:
         rows = self._conn.execute("PRAGMA table_info(generation_attempts)").fetchall()

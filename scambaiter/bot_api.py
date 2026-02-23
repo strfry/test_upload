@@ -694,13 +694,17 @@ def _render_user_card(
     )
 
 
-def _chat_card_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
-            [InlineKeyboardButton("Close", callback_data=f"sc:chat_close:{target_chat_id}")],
-        ]
-    )
+def _chat_card_keyboard(target_chat_id: int, live_mode: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
+    ]
+    if live_mode:
+        rows.append([
+            InlineKeyboardButton("Fetch Profile", callback_data=f"sc:fetch_profile:{target_chat_id}"),
+            InlineKeyboardButton("Fetch History", callback_data=f"sc:fetch_history:{target_chat_id}"),
+        ])
+    rows.append([InlineKeyboardButton("Close", callback_data=f"sc:chat_close:{target_chat_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _truncate_chat_button_label(base: str, chat_id: int, max_len: int = 56) -> str:
@@ -860,6 +864,24 @@ def _profile_lines_from_events(events: list[Any]) -> list[str]:
     return lines
 
 
+def _profile_lines_from_stored_profile(snapshot: dict[str, Any]) -> list[str]:
+    identity = snapshot.get("identity") or {}
+    first = identity.get("first_name", "")
+    last = identity.get("last_name", "")
+    display_name = " ".join(p for p in [first, last] if p).strip() or None
+    username = identity.get("username")
+    bio = identity.get("bio")
+    profile_media = snapshot.get("profile_media") or {}
+    has_photo = profile_media.get("has_profile_photo")
+    return [
+        f"display_name: {display_name or 'unknown'}",
+        f"username: {'@' + username if username else 'unknown'}",
+        f"bio: {bio if bio else 'unknown'}",
+        f"profile_photo: {'yes' if has_photo else ('no' if has_photo is False else 'unknown')}",
+        "source: telethon",
+    ]
+
+
 async def _show_user_card(
     application: Application,
     control_chat_id: int,
@@ -882,11 +904,16 @@ async def _show_user_card(
         if isinstance(text, str) and text.strip():
             compact = " ".join(text.split())
             last_preview = compact[:100] + ("..." if len(compact) > 100 else "")
-    profile_lines = _profile_lines_from_events(events)
+    stored_profile = store.get_chat_profile(target_chat_id)
+    if stored_profile is not None and getattr(stored_profile, "last_source", None) == "telethon":
+        profile_lines = _profile_lines_from_stored_profile(stored_profile.snapshot)
+    else:
+        profile_lines = _profile_lines_from_events(events)
+    live_mode = application.bot_data.get("mode") == "live"
     sent = await application.bot.send_message(
         chat_id=chat_id,
         text=_render_user_card(target_chat_id, len(events), last_preview, profile_lines),
-        reply_markup=_chat_card_keyboard(target_chat_id),
+        reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode),
     )
     sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
     sent_messages.append(int(sent.message_id))
@@ -3006,9 +3033,7 @@ def _resolve_target_and_role_without_active(
 ) -> tuple[int | None, str]:
     sender_id = _infer_target_chat_id_from_forward(message)
     if sender_id is None:
-        if auto_target_chat_id is None:
-            return None, "manual"
-        return auto_target_chat_id, "manual"
+        return None, "manual"   # hidden sender — always require manual override
     if control_user_id is not None and sender_id == control_user_id:
         if auto_target_chat_id is None:
             return None, "manual"
@@ -3792,6 +3817,59 @@ async def _handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _delete_control_message(message)
 
 
+async def _handle_fetch_profile_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    query = update.callback_query
+    if query is None:
+        return
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    try:
+        chat_id = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat id")
+        return
+    executor = app.bot_data.get("telethon_executor")
+    if executor is None:
+        await query.answer("Live Mode not active")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    await query.answer("Fetching profile...")
+    await executor.fetch_profile(chat_id, store)
+    control_chat_id = int(query.message.chat_id)
+    _schedule_user_card_update(app, control_chat_id, store, chat_id, delay_seconds=0.5)
+
+
+async def _handle_fetch_history_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    query = update.callback_query
+    if query is None:
+        return
+    allowed_chat_id = app.bot_data.get("allowed_chat_id")
+    if not await _require_allowed_chat(app, update, allowed_chat_id):
+        await query.answer("Unauthorized")
+        return
+    try:
+        chat_id = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat id")
+        return
+    executor = app.bot_data.get("telethon_executor")
+    if executor is None:
+        await query.answer("Live Mode not active")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    await query.answer("Fetching history...")
+    count = await executor.fetch_history(chat_id, store, limit=200)
+    message = query.message
+    if message is not None:
+        await message.reply_text(f"History fetch complete: {count} new events for /{chat_id}.")
+
+
 async def _register_command_menu(application: Application) -> None:
     await application.bot.set_my_commands(
         [
@@ -3851,6 +3929,8 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_reply_delete_button, pattern=r"^sc:reply_delete:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
     app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:nop$"))
+    app.add_handler(CallbackQueryHandler(_handle_fetch_profile_button, pattern=r"^sc:fetch_profile:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:[0-9]+$"))
     app.add_handler(MessageHandler(filters.REPLY, _handle_manual_override_response))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
     return app
