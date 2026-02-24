@@ -919,21 +919,22 @@ class ScambaiterCore:
     def _trim_prompt_events(cls, events: list[dict[str, Any]], token_limit: int) -> list[dict[str, Any]]:
         if token_limit <= 0:
             return []
-        kept_rev: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
         running = 0
-        # Keep newest events and drop from conversation start when limit is hit.
+        # Events come in chronological order (oldest→newest, from list_events ORDER BY id ASC).
+        # Keep newest events by walking backwards, then reverse to maintain chronological order.
         for event in reversed(events):
             estimated = cls._estimate_tokens(event)
-            if kept_rev and running + estimated > token_limit:
+            if kept and running + estimated > token_limit:
                 break
-            if not kept_rev and estimated > token_limit:
+            if not kept and estimated > token_limit:
                 # Ensure we keep at least one newest event.
-                kept_rev.append(event)
+                kept.append(event)
                 break
-            kept_rev.append(event)
+            kept.append(event)
             running += estimated
-        kept_rev.reverse()
-        return kept_rev
+        kept.reverse()  # Reverse to chronological order (oldest → newest)
+        return kept
 
     @staticmethod
     def _estimate_tokens(event: dict[str, Any]) -> int:

@@ -424,7 +424,7 @@ class AnalysisStore:
             SELECT id, chat_id, event_type, role, text, ts_utc, source_message_id, meta_json
             FROM events
             WHERE chat_id = ?
-            ORDER BY id ASC
+            ORDER BY ts_utc ASC
             LIMIT ?
             """,
             (chat_id, limit),

@@ -336,7 +336,12 @@ class TelethonExecutor:
         """
         entity = await self._client.get_entity(chat_id)
         count = 0
+        # Collect all messages first to insert them in chronological order (oldest→newest)
+        messages = []
         async for msg in self._client.iter_messages(entity, limit=limit):
+            messages.append(msg)
+        # Reverse to insert oldest first (so IDs increase chronologically)
+        for msg in reversed(messages):
             role = "scambaiter" if msg.out else "scammer"
             if getattr(msg, "sticker", None):
                 event_type = "sticker"
