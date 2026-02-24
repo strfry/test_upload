@@ -144,28 +144,37 @@ class TelethonExecutor:
         folder_chat_ids: list[int] = []
         try:
             filters_result = await self._client(GetDialogFiltersRequest())
-            for item in getattr(filters_result, "filters", filters_result):
+            filters_list = getattr(filters_result, "filters", filters_result)
+
+            for item in filters_list:
                 if not isinstance(item, DialogFilter):
                     continue
                 title = getattr(item, "title", None)
-                name = title if isinstance(title, str) else (str(title) if title is not None else "")
+                # Handle TextWithEntities (Telegram returns title as TextWithEntities, not plain string)
+                if hasattr(title, "text"):
+                    name = title.text
+                elif isinstance(title, str):
+                    name = title
+                else:
+                    name = ""
                 if name != folder_name:
                     continue
                 folder_id = int(item.id)
+                # Load all dialogs and filter by folder_id attribute
                 try:
-                    async for dialog in self._client.iter_dialogs(limit=None, folder=folder_id):
-                        folder_chat_ids.append(int(dialog.id))
-                except Exception:
-                    include_peers = getattr(item, "include_peers", None) or []
-                    from telethon import utils as tl_utils
-                    for peer in include_peers:
-                        try:
-                            folder_chat_ids.append(int(tl_utils.get_peer_id(peer)))
-                        except Exception:
-                            pass
+                    all_dialogs = await self._client.get_dialogs(limit=None)
+                    for dialog in all_dialogs:
+                        # Check if dialog belongs to this folder
+                        dialog_folder = getattr(dialog, "pinned_folder", None)
+                        if dialog_folder == folder_id:
+                            folder_chat_ids.append(int(dialog.id))
+                    _log.info("_resolve_folder_ids: found %d chats in folder %d", len(folder_chat_ids), folder_id)
+                except Exception as exc:
+                    _log.error("_resolve_folder_ids: failed to load dialogs: %s", exc)
                 break
         except Exception as exc:
-            _log.warning("_resolve_folder_ids: could not resolve folder %r: %s", folder_name, exc)
+            _log.error("_resolve_folder_ids: GetDialogFiltersRequest failed: %s", exc)
+
         return set(folder_chat_ids)
 
     async def start_listener(
@@ -177,12 +186,17 @@ class TelethonExecutor:
         """Register Live Mode event handlers for auto-receive and typing monitoring.
 
         Incoming messages from chats in *folder_name* are stored immediately and
-        trigger response generation.  If the folder cannot be resolved, all
-        incoming messages are accepted.
+        trigger response generation. If the folder cannot be resolved or is empty,
+        raises RuntimeError and stops the bot.
         """
         from telethon import events
 
         _folder_set = await self._resolve_folder_ids(folder_name) if folder_name else set()
+        if folder_name and not _folder_set:
+            raise RuntimeError(
+                f"Folder '{folder_name}' not found or contains no chats. "
+                "Cannot start Live Mode without valid scammer folder."
+            )
         _log.info(
             "start_listener: Live Mode active, folder=%r, %d chats tracked",
             folder_name,
@@ -256,12 +270,15 @@ class TelethonExecutor:
 
         Runs as a background task (non-blocking). Skips chats where history is
         already present (deduplication handled by store's unique index).
+
+        Raises RuntimeError if folder cannot be resolved or contains no chats.
         """
-        _log.info("startup_backfill: resolving folder %r", folder_name)
         folder_ids = await self._resolve_folder_ids(folder_name)
         if not folder_ids:
-            _log.info("startup_backfill: no chats found in folder %r, skipping", folder_name)
-            return
+            raise RuntimeError(
+                f"Folder '{folder_name}' not found or contains no chats. "
+                "Cannot backfill history without valid scammer folder."
+            )
         _log.info("startup_backfill: backfilling %d chats", len(folder_ids))
         for chat_id in folder_ids:
             try:

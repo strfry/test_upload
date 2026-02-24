@@ -50,7 +50,10 @@ async def _run() -> None:
             service=service,
             folder_name=folder_name,
         )
-        asyncio.create_task(telethon_executor.startup_backfill(store=store, folder_name=folder_name))
+        try:
+            await telethon_executor.startup_backfill(store=store, folder_name=folder_name)
+        except Exception as exc:
+            raise RuntimeError(f"startup_backfill failed: {exc}") from exc
     register_command_menu = app.bot_data.get("register_command_menu")
     if callable(register_command_menu):
         await register_command_menu()

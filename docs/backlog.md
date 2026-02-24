@@ -16,25 +16,6 @@ Die wichtigsten offenen Guardrail-/Promptverbesserungen und ihre aktuellen Zust�
 2. Parser/Validator auf `analysis.missing_facts` + `analysis.suggested_analysis_keys` prüfen und ggf. neue Felder erzwingen.
 3. Bot-API: zusätzliche Inline-Aktionen oder `/analysisset`-Hilfe anbieten, um vorgeschlagene Keys zu übernehmen.
 
-## Allgemeine Anti-Loop-Regel *(Actionable)*
-
-- Pro Turn die letzte Assistant-Intention in `analysis.last_assistant_intent` dokumentieren.
-- Wenn die neue Intention mit den letzten zwei Assistant-Intents identisch ist:
-  - Wiederholung als Hauptfrage verbieten.
-  - Stattdessen Fokus auf die jüngste User-Aussage und einen klaren Fortschrittsschritt liefern.
-- Bei Loop-Trigger:
-  - `loop_guard_active=true`
-  - `repeated_intent=<intent>`
-  - `next_intent=<new_intent>`
-  - `blocked_intents_next_turns=[<intent>]` für zwei Turns.
-- Spezialfall: Wenn der User signalisiert, dass ein gewünschter Beleg fehlt, darf er nicht erneut als Hauptfrage kommen; stattdessen alternative überprüfbare Details anfordern.
-
-### Nächste Schritte
-
-1. Prompt/Validator: Tracking-Felder für `last_assistant_intent` + Guard-Logik einbauen und in der Response-Policy dokumentieren.
-2. Bot-API/Dry-Run: Wiederholungserkennung bestätigen (z. B. mit Tests gegen `docs/prompt_cases/no_repeat_validator_contact.json`).
-3. Report-Mechanismus: Wenn Guard triggern soll, kann `analysis` das explizit melden und die UI entsprechende Hinweise liefern.
-
 ## Rollenkonsistenz *(Actionable)*
 
 - Sender vs. Empfänger eindeutig trennen. Keine Formulierungen wie "den Link, den du mir geschickt hast", wenn der Link vom User stammt.
@@ -62,6 +43,34 @@ Die wichtigsten offenen Guardrail-/Promptverbesserungen und ihre aktuellen Zust�
 2. Sequenzvergleich gegen vorhandene Scam-Nachrichten implementieren (ordered subsequence / suffix match).
 3. Append nur bei neuer Sequenz; ansonsten Import überspringen und im Control-Text transparent melden.
 4. Tests ergänzen: identischer Batch doppelt forwarded -> kein zweites Append; Reihenfolgeabweichung -> neues Append erlaubt.
+
+## Timing-Orchestration & Pacing-Logik *(Deferred)*
+
+- Neue orchestrated Prompt (`rag_prompt.txt`) erwartet ein strukturiertes `timing`-Objekt mit:
+  - `now_ts` (current timestamp)
+  - `secs_since_last_inbound` (latency from scammer)
+  - `secs_since_last_outbound` (our response latency)
+  - `inbound_burst_count_120s` (activity burst in 120s window)
+  - `avg_inbound_latency_s` (average response time)
+- Detaillierte Pacing-Regeln in `docs/snippets/prompt_timing.txt`:
+  - Immediate inbound (<10s): prefer wait/typing, no send
+  - Burst detection (≥3 in 120s): hold with wait
+  - Long silence (>600s): respond normally
+  - Urgency signals: introduce artificial delay
+  - Rapport phase: minimal delay
+- Latency-Klasse-Mapping: `"short"` = 30s, `"medium"` = 3min, `"long"` = 15min.
+- Fehlende Komponenten:
+  - Timing-Collector im Service (berechnet die Statistiken)
+  - Timing-Injector in Core (fügt `timing` zum Prompt hinzu)
+  - Wait-Executor in Telethon (führt Verzögerungen aus)
+
+### Nächste Schritte
+
+1. Architektur-Entscheidung: Timing als Service-Layer oder Core-responsibility?
+2. Proto-Datenmodell: `timing_stats` in Store oder ephemeral im Service?
+3. Integration mit `rag_prompt.txt` und bestehender `SYSTEM_PROMPT_CONTRACT`.
+
+---
 
 ## Archivierte/deferrierte Ideen
 

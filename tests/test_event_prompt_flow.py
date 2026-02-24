@@ -96,21 +96,21 @@ class EventAndPromptFlowTest(unittest.TestCase):
             self.assertEqual("system", messages[0]["role"])
             self.assertEqual("system", messages[1]["role"])
             self.assertIn("Memory summary for chat_id=2010", messages[1]["content"])
-            memory = store.get_memory_context(chat_id=2010)
+            memory = store.get_summary(chat_id=2010)
             self.assertIsNotNone(memory)
 
     def test_memory_context_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
             store = AnalysisStore(str(db_path))
-            saved = store.upsert_memory_context(
+            saved = store.upsert_summary(
                 chat_id=2020,
                 summary={"schema": "scambait.memory.v1", "current_intent": {}},
                 cursor_event_id=17,
                 model="openai/gpt-oss-120b",
             )
             self.assertEqual(2020, saved.chat_id)
-            loaded = store.get_memory_context(chat_id=2020)
+            loaded = store.get_summary(chat_id=2020)
             self.assertIsNotNone(loaded)
             assert loaded is not None
             self.assertEqual(17, loaded.cursor_event_id)
@@ -122,7 +122,7 @@ class EventAndPromptFlowTest(unittest.TestCase):
             db_path = Path(tmpdir) / "analysis.sqlite3"
             store = AnalysisStore(str(db_path))
             store.ingest_event(chat_id=2050, event_type="message", role="scammer", text="hello")
-            store.upsert_memory_context(
+            store.upsert_summary(
                 chat_id=2050,
                 summary={"schema": "scambait.memory.v1", "current_intent": {}},
                 cursor_event_id=1,
@@ -143,7 +143,7 @@ class EventAndPromptFlowTest(unittest.TestCase):
             db_path = Path(tmpdir) / "analysis.sqlite3"
             store = AnalysisStore(str(db_path))
             store.ingest_event(chat_id=2060, event_type="message", role="scammer", text="first")
-            store.upsert_memory_context(
+            store.upsert_summary(
                 chat_id=2060,
                 summary={"schema": "scambait.memory.v1", "current_intent": {"latest_topic": "first"}},
                 cursor_event_id=1,
@@ -226,7 +226,7 @@ class EventAndPromptFlowTest(unittest.TestCase):
                 source="botapi_forward",
                 changed_at="2026-02-21T20:20:00Z",
             )
-            store.upsert_memory_context(
+            store.upsert_summary(
                 chat_id=4001,
                 summary={"schema": "scambait.memory.v1"},
                 cursor_event_id=1,
@@ -244,7 +244,7 @@ class EventAndPromptFlowTest(unittest.TestCase):
             self.assertGreaterEqual(deleted.get("generation_attempts", 0), 1)
             self.assertGreaterEqual(deleted.get("profile_changes", 0), 1)
             self.assertGreaterEqual(deleted.get("chat_profile", 0), 1)
-            self.assertGreaterEqual(deleted.get("memory_context", 0), 1)
+            self.assertGreaterEqual(deleted.get("summary", 0), 1)
             self.assertGreaterEqual(deleted.get("total", 0), 7)
 
             self.assertEqual(0, len(store.list_events(chat_id=4001, limit=10)))
@@ -252,7 +252,7 @@ class EventAndPromptFlowTest(unittest.TestCase):
             self.assertEqual(0, len(store.list_directives(chat_id=4001, active_only=False, limit=10)))
             self.assertEqual(0, len(store.list_generation_attempts(chat_id=4001, limit=10)))
             self.assertIsNone(store.get_chat_profile(chat_id=4001))
-            self.assertIsNone(store.get_memory_context(chat_id=4001))
+            self.assertIsNone(store.get_summary(chat_id=4001))
 
             self.assertEqual(1, len(store.list_events(chat_id=4002, limit=10)))
 

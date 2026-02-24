@@ -4,11 +4,6 @@ import json
 from typing import Any
 
 
-def _is_json_validate_failed(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "json_validate_failed" in text or "failed to validate json" in text
-
-
 def call_hf_openai_chat(
     *,
     token: str,
@@ -17,6 +12,8 @@ def call_hf_openai_chat(
     max_tokens: int,
     base_url: str | None = None,
     timeout_seconds: float = 45.0,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
 ) -> dict[str, Any]:
     try:
         from openai import OpenAI
@@ -29,28 +26,20 @@ def call_hf_openai_chat(
         timeout=timeout_seconds,
     )
 
-    # First attempt: provider-side JSON mode.
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if tools is not None:
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+
     try:
-        response = client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            messages=messages,
-        )
+        response = client.chat.completions.create(**kwargs)
     except Exception as exc:  # pragma: no cover - network/provider edge
-        # Some HF-backed models intermittently fail provider JSON validation.
-        # Fallback: retry once without response_format and let our local parser validate.
-        if _is_json_validate_failed(exc):
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    messages=messages,
-                )
-            except Exception as retry_exc:  # pragma: no cover - network/provider edge
-                raise RuntimeError(str(retry_exc)) from retry_exc
-        else:
-            raise RuntimeError(str(exc)) from exc
+        raise RuntimeError(str(exc)) from exc
 
     value = json.loads(response.model_dump_json())
     return value if isinstance(value, dict) else {}
@@ -70,6 +59,26 @@ def extract_result_text(response_json: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content.strip()
     return ""
+
+
+def extract_tool_calls(response_json: dict[str, Any]) -> list[dict[str, Any]]:
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return []
+    first = choices[0]
+    if not isinstance(first, dict):
+        return []
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return []
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        if isinstance(tc, dict):
+            result.append(tc)
+    return result
 
 
 def extract_reasoning_details(response_json: dict[str, Any]) -> tuple[int, str]:
