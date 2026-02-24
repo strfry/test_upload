@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .forward_meta import baiter_name_from_meta, scammer_name_from_meta
-from .model_client import call_hf_openai_chat, extract_reasoning_details, extract_result_text
+from .model_client import call_hf_openai_chat, extract_reasoning_details, extract_result_text, extract_tool_calls
 
 EventType = str
 RoleType = str
@@ -21,25 +21,14 @@ Conversation style rules:
 - Prefer specific follow-up questions tied to the latest counterparty claim.
 - Keep momentum; avoid moralizing disclaimers and avoid ending the thread early.
 - Never make real commitments to send money, reveal credentials, or perform real financial actions.
-Return exactly one valid JSON object with top-level keys: schema, analysis, message, actions.
-Rules:
-- schema must be exactly \"scambait.llm.v1\".
-- analysis must be an object.
-- message must be an object (reserved for metadata/compat).
-- conflict is optional; if present it must describe a semantic_conflict object.
-- actions must be a non-empty array (max 10 actions).
-- send_message action must include message.text (string, <= 4000 chars).
-- If there is a semantic conflict, do not break schema; set conflict and keep actions valid.
-- No markdown, no prose outside JSON, no function-call wrappers.
-Allowed action types:
-- mark_read
-- simulate_typing (duration_seconds 0..60)
-- wait (value >=0, unit in seconds|minutes; max 86400 seconds / 10080 minutes)
-- send_message (message.text required; optional reply_to, optional send_at_utc)
-- edit_message (message_id, new_text)
-- delete_message (message_id)
-- noop
-- escalate_to_human (reason)
+You operate strictly through the act() tool. Never output free text.
+Per turn, call act() exactly once with an actions array containing:
+- set_memory and add_note entries as needed (before the message action).
+- At most one send_message OR one wait, never both.
+- send_typing is optional, use sparingly.
+- If the situation requires human review, include a decide_handoff action with a reason.
+- If no message should be sent, omit send_message entirely.
+Safety: Never send real name, address, phone, email, financial data, or admit you are a bot.
 """
 
 MEMORY_SUMMARY_PROMPT_CONTRACT = """You are ScamBaiter memory summarizer.
@@ -87,6 +76,84 @@ ALLOWED_CONFLICT_CODES = {
     "uncertain_target",
 }
 ALLOWED_CONFLICT_MODES = {"pivot", "escalate", "hold"}
+TOOL_DEFINITIONS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "act",
+            "description": (
+                "Execute one or more actions for this turn. "
+                "Include set_memory/add_note before send_message. "
+                "At most one send_message OR one wait per turn."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "items": {
+                            "type": "object",
+                            "anyOf": [
+                                {
+                                    "properties": {
+                                        "type": {"const": "set_memory"},
+                                        "key": {"type": "string"},
+                                        "value": {"type": "string"},
+                                    },
+                                    "required": ["type", "key", "value"],
+                                },
+                                {
+                                    "properties": {
+                                        "type": {"const": "add_note"},
+                                        "text": {"type": "string"},
+                                    },
+                                    "required": ["type", "text"],
+                                },
+                                {
+                                    "properties": {
+                                        "type": {"const": "send_message"},
+                                        "text": {"type": "string", "maxLength": 4000},
+                                        "reply_to": {"type": "integer"},
+                                    },
+                                    "required": ["type", "text"],
+                                },
+                                {
+                                    "properties": {
+                                        "type": {"const": "send_typing"},
+                                        "duration_seconds": {"type": "number", "minimum": 0, "maximum": 60},
+                                    },
+                                    "required": ["type", "duration_seconds"],
+                                },
+                                {
+                                    "properties": {
+                                        "type": {"const": "wait"},
+                                        "latency_class": {"type": "string", "enum": ["short", "medium", "long"]},
+                                    },
+                                    "required": ["type", "latency_class"],
+                                },
+                                {
+                                    "properties": {
+                                        "type": {"const": "decide_handoff"},
+                                        "reason": {"type": "string"},
+                                    },
+                                    "required": ["type", "reason"],
+                                },
+                            ],
+                        },
+                    },
+                },
+                "required": ["actions"],
+            },
+        },
+    },
+]
+_WAIT_LATENCY_MAP: dict[str, tuple[int, str]] = {
+    "short": (30, "seconds"),
+    "medium": (3, "minutes"),
+    "long": (15, "minutes"),
+}
 SEMANTIC_CONFLICT_REASON_HINTS = (
     "cannot",
     "can't",
@@ -611,6 +678,154 @@ def parse_structured_model_output(text: str) -> ModelOutput | None:
     return parsed.output
 
 
+def parse_tool_calls_to_model_output(
+    tool_calls: list[dict[str, Any]],
+    raw_response: str = "",
+) -> tuple[ParseResult, list[tuple[str, str]]]:
+    issues: list[ValidationIssue] = []
+
+    if not tool_calls:
+        issues.append(ValidationIssue(
+            path="tool_calls",
+            reason="no tool calls returned",
+            expected="at least one tool call",
+        ))
+        return ParseResult(output=None, issues=issues), []
+
+    # Find the act() tool call
+    act_call = None
+    for call in tool_calls:
+        func = call.get("function") if isinstance(call, dict) else None
+        if isinstance(func, dict) and str(func.get("name") or "").strip() == "act":
+            act_call = func
+            break
+
+    if act_call is None:
+        issues.append(ValidationIssue(
+            path="tool_calls",
+            reason="no act() tool call",
+            expected="act() tool call",
+        ))
+        return ParseResult(output=None, issues=issues), []
+
+    raw_args = act_call.get("arguments") or "{}"
+    if isinstance(raw_args, str):
+        try:
+            act_args: dict[str, Any] = json.loads(raw_args)
+        except json.JSONDecodeError:
+            issues.append(ValidationIssue(path="act.arguments", reason="invalid JSON in act() arguments"))
+            return ParseResult(output=None, issues=issues), []
+    elif isinstance(raw_args, dict):
+        act_args = raw_args
+    else:
+        act_args = {}
+
+    action_list = act_args.get("actions")
+    if not isinstance(action_list, list) or not action_list:
+        issues.append(ValidationIssue(
+            path="act.actions",
+            reason="actions must be a non-empty array",
+            expected="non-empty array",
+        ))
+        return ParseResult(output=None, issues=issues), []
+
+    actions: list[dict[str, Any]] = []
+    analysis: dict[str, Any] = {}
+    suggestion: str = ""
+    memory_pairs: list[tuple[str, str]] = []
+    send_message_count = 0
+    wait_count = 0
+
+    for action_item in action_list:
+        if not isinstance(action_item, dict):
+            continue
+        action_type = str(action_item.get("type") or "").strip()
+
+        if action_type == "set_memory":
+            key = str(action_item.get("key") or "").strip()
+            value = str(action_item.get("value") or "").strip()
+            if key:
+                memory_pairs.append((key, value))
+                analysis[key] = value
+        elif action_type == "add_note":
+            text = str(action_item.get("text") or "").strip()
+            if text:
+                notes = analysis.setdefault("notes", [])
+                if isinstance(notes, list):
+                    notes.append(text)
+        elif action_type == "send_message":
+            if send_message_count >= 1:
+                issues.append(ValidationIssue(
+                    path="act.actions",
+                    reason="duplicate send_message action skipped",
+                    expected="at most one send_message per turn",
+                ))
+                continue
+            msg_text = str(action_item.get("text") or "").strip()
+            if not msg_text:
+                issues.append(ValidationIssue(
+                    path="act.actions.send_message.text",
+                    reason="text must be non-empty",
+                ))
+                continue
+            if len(msg_text) > 4000:
+                msg_text = msg_text[:4000]
+            action: dict[str, Any] = {"type": "send_message", "message": {"text": msg_text}}
+            reply_to = action_item.get("reply_to")
+            if reply_to is not None:
+                try:
+                    action["reply_to"] = int(reply_to)
+                except (TypeError, ValueError):
+                    pass
+            actions.append(action)
+            suggestion = msg_text
+            send_message_count += 1
+        elif action_type == "send_typing":
+            raw_dur = action_item.get("duration_seconds", 5)
+            try:
+                duration = float(raw_dur)
+            except (TypeError, ValueError):
+                duration = 5.0
+            duration = max(0.0, min(60.0, duration))
+            actions.append({"type": "simulate_typing", "duration_seconds": duration})
+        elif action_type == "wait":
+            if wait_count >= 1:
+                issues.append(ValidationIssue(
+                    path="act.actions",
+                    reason="duplicate wait action skipped",
+                    expected="at most one wait per turn",
+                ))
+                continue
+            latency_class = str(action_item.get("latency_class") or "short").strip()
+            value_unit = _WAIT_LATENCY_MAP.get(latency_class, _WAIT_LATENCY_MAP["short"])
+            actions.append({"type": "wait", "value": value_unit[0], "unit": value_unit[1]})
+            wait_count += 1
+        elif action_type == "decide_handoff":
+            reason = str(action_item.get("reason") or "").strip()
+            if not reason:
+                reason = "Handoff requested."
+            actions.append({"type": "escalate_to_human", "reason": reason})
+        else:
+            issues.append(ValidationIssue(
+                path=f"act.actions.{action_type}",
+                reason=f"unknown action type: {action_type}",
+            ))
+
+    # If only set_memory/add_note were called (no executable actions) → noop
+    if not actions:
+        actions.append({"type": "noop"})
+
+    output = ModelOutput(
+        raw=raw_response,
+        suggestion=suggestion,
+        analysis=analysis,
+        metadata={"schema": "scambait.llm.v1"},
+        actions=actions,
+        conflict=None,
+    )
+    return ParseResult(output=output, issues=issues), memory_pairs
+
+
 def violates_scambait_style_policy(reply_text: str) -> bool:
     text = reply_text.strip().lower()
     if not text:
@@ -761,7 +976,7 @@ class ScambaiterCore:
         return value
 
     def ensure_memory_context(self, chat_id: int, force_refresh: bool = False) -> dict[str, Any]:
-        current = self.store.get_memory_context(chat_id=chat_id)
+        current = self.store.get_summary(chat_id=chat_id)
         latest_events = self.store.list_events(chat_id=chat_id, limit=5000)
         latest_id = int(latest_events[-1].id) if latest_events else 0
 
@@ -790,7 +1005,7 @@ class ScambaiterCore:
                 "next_focus": [],
             }
             if current is None or force_refresh or int(current.cursor_event_id) < latest_id:
-                saved = self.store.upsert_memory_context(
+                saved = self.store.upsert_summary(
                     chat_id=chat_id,
                     summary=fallback_summary,
                     cursor_event_id=latest_id,
@@ -813,7 +1028,7 @@ class ScambaiterCore:
                 "open_questions": [],
                 "next_focus": [],
             }
-            saved = self.store.upsert_memory_context(
+            saved = self.store.upsert_summary(
                 chat_id=chat_id,
                 summary=empty_summary,
                 cursor_event_id=0,
@@ -839,7 +1054,7 @@ class ScambaiterCore:
         if parsed is None:
             raise RuntimeError("invalid memory summary contract (expected scambait.memory.v1)")
         latest_cursor = int(events[-1]["event_id"])
-        saved = self.store.upsert_memory_context(
+        saved = self.store.upsert_summary(
             chat_id=chat_id,
             summary=parsed,
             cursor_event_id=latest_cursor,
@@ -998,7 +1213,7 @@ class ScambaiterCore:
             return None
         max_tokens = int(getattr(self.config, "hf_memory_max_tokens", 150000))
         prompt_events = self.build_prompt_events(chat_id=chat_id, token_limit=int(getattr(self.config, "hf_max_tokens", 1500)))
-        memory_state = self.store.get_memory_context(chat_id=chat_id)
+        memory_state = self.store.get_summary(chat_id=chat_id)
         payload = {
             "schema": "scambait.meta.turn.input.v1",
             "chat_id": chat_id,
@@ -1045,8 +1260,13 @@ class ScambaiterCore:
                 max_tokens=max_tokens,
                 # Dry run is pinned to HF router to avoid accidental provider drift via HF_BASE_URL.
                 base_url=None,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
             )
             initial_text = extract_result_text(initial_response)
+            initial_tool_calls = extract_tool_calls(initial_response)
+            if not initial_text and initial_tool_calls:
+                initial_text = json.dumps(initial_tool_calls, ensure_ascii=True)
             reasoning_cycles, reasoning_snippet = extract_reasoning_details(initial_response)
         except Exception as exc:
             attempts.append(
@@ -1081,14 +1301,17 @@ class ScambaiterCore:
                 "reasoning_snippet": reasoning_snippet,
             }
 
-        parsed_result = parse_structured_model_output_detailed(initial_text)
+        parsed_result, memory_pairs = parse_tool_calls_to_model_output(initial_tool_calls, raw_response=initial_text)
         parsed = parsed_result.output
         initial_reject_reason: str | None = None
         if parsed is None:
-            initial_reject_reason = "contract_validation_failed"
+            initial_reject_reason = "no_tool_calls"
         elif violates_scambait_style_policy(parsed.suggestion):
             initial_reject_reason = "style_policy_violation"
             parsed = None
+        else:
+            for k, v in memory_pairs:
+                self.store.set_memory_kv(chat_id, k, v)
         attempts.append(
             {
                 "phase": "initial",
@@ -1109,16 +1332,9 @@ class ScambaiterCore:
         final_response = initial_response
         final_text = initial_text
 
-        if parsed is None and reasoning_cycles > 0:
-            retry_prompt_message = (
-                "I only received your reasoning. "
-                "Continue the thought above and return a valid scambait.llm.v1 payload "
-                "(analysis/message/actions)."
-            )
-            if reasoning_snippet:
-                retry_prompt_message += f"\nReasoning snippet:\n{reasoning_snippet}"
+        if parsed is None and not initial_tool_calls:
             follow_messages = initial_messages + [
-                {"role": "user", "content": retry_prompt_message}
+                {"role": "user", "content": "Please use the available tools to respond."}
             ]
             follow_prompt = {"messages": follow_messages, "max_tokens": max_tokens}
             try:
@@ -1128,12 +1344,17 @@ class ScambaiterCore:
                     messages=follow_messages,
                     max_tokens=max_tokens,
                     base_url=None,
+                    tools=TOOL_DEFINITIONS,
+                    tool_choice="required",
                 )
                 follow_text = extract_result_text(follow_response)
+                follow_tool_calls = extract_tool_calls(follow_response)
+                if not follow_text and follow_tool_calls:
+                    follow_text = json.dumps(follow_tool_calls, ensure_ascii=True)
             except Exception as exc:
                 attempts.append(
                     {
-                        "phase": "reasoning_retry",
+                        "phase": "tool_retry",
                         "status": "error",
                         "accepted": False,
                         "reject_reason": "provider_error",
@@ -1163,12 +1384,18 @@ class ScambaiterCore:
                     "reasoning_cycles": final_reasoning_cycles,
                     "reasoning_snippet": final_reasoning_snippet,
                 }
-            follow_result = parse_structured_model_output_detailed(follow_text)
+            follow_result, follow_memory_pairs = parse_tool_calls_to_model_output(follow_tool_calls, raw_response=follow_text)
             parsed = follow_result.output
             parsed_result = follow_result
+            if parsed is not None and not violates_scambait_style_policy(parsed.suggestion):
+                for k, v in follow_memory_pairs:
+                    self.store.set_memory_kv(chat_id, k, v)
+            else:
+                if parsed is not None:
+                    parsed = None
             attempts.append(
                 {
-                    "phase": "reasoning_retry",
+                    "phase": "tool_retry",
                     "status": "ok" if parsed is not None else "invalid",
                     "accepted": parsed is not None,
                     "reject_reason": None,
@@ -1245,7 +1472,7 @@ class ScambaiterCore:
             "repair_context": (
                 {
                     "chat_id": chat_id,
-                    "reject_reason": initial_reject_reason or "contract_validation_failed",
+                    "reject_reason": initial_reject_reason or "no_tool_calls",
                     "failed_generation_excerpt": final_text[:2000],
                 }
                 if parsed is None
@@ -1258,10 +1485,10 @@ class ScambaiterCore:
                     "semantic conflict detected (operator decision required)"
                     if semantic_conflict
                     else (
-                    "model output violates scambait style policy"
-                    if any(str(item.get("reject_reason") or "") == "style_policy_violation" for item in attempts)
-                    else "invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)"
-                    + first_issue_str
+                        "model output violates scambait style policy"
+                        if any(str(item.get("reject_reason") or "") == "style_policy_violation" for item in attempts)
+                        else "no tool calls in model output"
+                        + first_issue_str
                     )
                 )
             ),
@@ -1276,15 +1503,15 @@ class ScambaiterCore:
         failed_generation: str,
         reject_reason: str = "contract_validation_failed",
     ) -> dict[str, Any]:
+        # `failed_generation` and `reject_reason` are kept for API compatibility but no longer
+        # embedded in the prompt — the repair simply forces tool use on a fresh context rebuild.
+        _ = (failed_generation, reject_reason)
         token = (getattr(self.config, "hf_token", None) or "").strip()
         model = (getattr(self.config, "hf_model", None) or "").strip()
         if not token or not model:
             raise RuntimeError("HF_TOKEN/HF_MODEL missing")
         max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))
-        repair_messages = _build_repair_messages(
-            failed_generation,
-            reject_reason=reject_reason or "contract_validation_failed",
-        )
+        repair_messages = self.build_model_messages(chat_id=chat_id, include_memory=False)
         repair_prompt = {"messages": repair_messages, "max_tokens": max_tokens}
         attempts: list[dict[str, Any]] = []
         try:
@@ -1294,8 +1521,13 @@ class ScambaiterCore:
                 messages=repair_messages,
                 max_tokens=max_tokens,
                 base_url=None,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="required",
             )
             repair_text = extract_result_text(repair_response)
+            repair_tool_calls = extract_tool_calls(repair_response)
+            if not repair_text and repair_tool_calls:
+                repair_text = json.dumps(repair_tool_calls, ensure_ascii=True)
         except Exception as exc:
             attempts.append(
                 {
@@ -1327,14 +1559,17 @@ class ScambaiterCore:
                 "attempts": attempts,
             }
 
-        repaired_result = parse_structured_model_output_detailed(repair_text)
+        repaired_result, repair_memory_pairs = parse_tool_calls_to_model_output(repair_tool_calls, raw_response=repair_text)
         repaired = repaired_result.output
         repair_reject_reason: str | None = None
         if repaired is None:
-            repair_reject_reason = "contract_validation_failed"
+            repair_reject_reason = "no_tool_calls"
         elif violates_scambait_style_policy(repaired.suggestion):
             repair_reject_reason = "style_policy_violation"
             repaired = None
+        else:
+            for k, v in repair_memory_pairs:
+                self.store.set_memory_kv(chat_id, k, v)
         attempts.append(
             {
                 "phase": "repair",
@@ -1405,7 +1640,7 @@ class ScambaiterCore:
             "repair_context": (
                 {
                     "chat_id": chat_id,
-                    "reject_reason": repair_reject_reason or "contract_validation_failed",
+                    "reject_reason": repair_reject_reason or "no_tool_calls",
                     "failed_generation_excerpt": repair_text[:2000],
                 }
                 if repaired is None
@@ -1420,7 +1655,7 @@ class ScambaiterCore:
                     else (
                         "model output violates scambait style policy"
                         if repair_reject_reason == "style_policy_violation"
-                        else "invalid model output contract (expected scambait.llm.v1 with analysis/message/actions)"
+                        else "no tool calls in repair output"
                         + first_issue_str
                     )
                 )

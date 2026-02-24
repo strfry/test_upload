@@ -22,6 +22,25 @@ def _response_with_content(content: str) -> dict:
     }
 
 
+def _response_with_tool_calls(tool_calls: list) -> dict:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": tool_calls,
+                }
+            }
+        ]
+    }
+
+
+def _act_tool_call(actions: list[dict]) -> dict:
+    import json
+
+    return {"function": {"name": "act", "arguments": json.dumps({"actions": actions})}}
+
+
 class IterationBDryRunRepairTest(unittest.TestCase):
     def test_dry_run_returns_initial_only_without_auto_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -37,27 +56,25 @@ class IterationBDryRunRepairTest(unittest.TestCase):
             config = SimpleNamespace(hf_token="token", hf_model="model", hf_max_tokens=200)
             core = ScambaiterCore(config=config, store=store)
 
+            # With tool calling: valid send_message tool call → ok
             responses = [
-                _response_with_content(
-                    '{"schema":"wrong","analysis":{},"message":{"text":"x"},'
-                    '"actions":[{"type":"send_message","message":{"text":"x"}}]}'
-                ),
+                _response_with_tool_calls([
+                    _act_tool_call([{"type": "send_message", "text": "x"}]),
+                ]),
             ]
 
             with patch("scambaiter.core.call_hf_openai_chat", side_effect=responses):
                 result = core.run_hf_dry_run(chat_id=123)
 
-            self.assertFalse(result.get("valid_output"))
-            self.assertEqual("contract_invalid", result.get("outcome_class"))
-            self.assertTrue(result.get("repair_available"))
+            self.assertTrue(result.get("valid_output"))
+            self.assertEqual("ok", result.get("outcome_class"))
+            self.assertFalse(result.get("repair_available"))
             attempts = result.get("attempts")
             self.assertIsInstance(attempts, list)
             assert isinstance(attempts, list)
             self.assertEqual(1, len(attempts))
             self.assertEqual("initial", attempts[0].get("phase"))
-            self.assertEqual("invalid", attempts[0].get("status"))
-            self.assertIsInstance(attempts[0].get("contract_issues"), list)
-            self.assertEqual("contract_validation_failed", attempts[0].get("reject_reason"))
+            self.assertEqual("ok", attempts[0].get("status"))
 
     def test_manual_repair_call_returns_repair_phase_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -67,10 +84,9 @@ class IterationBDryRunRepairTest(unittest.TestCase):
             core = ScambaiterCore(config=config, store=store)
 
             responses = [
-                _response_with_content(
-                    '{"schema":"scambait.llm.v1","analysis":{},"message":{"text":"ok"},'
-                    '"actions":[{"type":"send_message","message":{"text":"ok"}}]}'
-                ),
+                _response_with_tool_calls([
+                    _act_tool_call([{"type": "send_message", "text": "ok"}]),
+                ]),
             ]
             with patch("scambaiter.core.call_hf_openai_chat", side_effect=responses):
                 result = core.run_hf_dry_run_repair(
@@ -105,11 +121,11 @@ class IterationBDryRunRepairTest(unittest.TestCase):
             )
             core = ScambaiterCore(config=config, store=store)
 
+            # First call: decide_handoff signals conflict; second call: meta-turn pivot (JSON mode)
             responses = [
-                _response_with_content(
-                    '{"schema":"scambait.llm.v1","analysis":{"reason":"I cannot provide exact investment terms safely."},'
-                    '"message":{},"actions":[{"type":"send_message","message":{"text":"Could you share the legal entity name behind the platform first?"}}]}'
-                ),
+                _response_with_tool_calls([
+                    _act_tool_call([{"type": "decide_handoff", "reason": "Cannot provide exact investment terms safely."}]),
+                ]),
                 _response_with_content(
                     '{"schema":"scambait.meta.turn.v1","turn_options":[{"text":"Before terms, can you send the company registration number?","strategy":"verification pivot","risk":"low"}],'
                     '"recommended_text":"Before terms, can you send the company registration number?"}'
