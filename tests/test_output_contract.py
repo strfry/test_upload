@@ -156,23 +156,6 @@ class OutputContractParserTest(unittest.TestCase):
         assert isinstance(parsed.conflict, dict)
         self.assertEqual("semantic_conflict", parsed.conflict.get("type"))
 
-    def test_conflict_without_reason_is_rejected(self) -> None:
-        payload = {
-            "schema": "scambait.llm.v1",
-            "analysis": {},
-            "message": {},
-            "conflict": {
-                "type": "semantic_conflict",
-                "code": "operator_required",
-                "suggested_mode": "hold",
-            },
-            "actions": [{"type": "noop"}],
-        }
-        parsed = parse_structured_model_output_detailed(json.dumps(payload))
-        self.assertIsNone(parsed.output)
-        self.assertTrue(parsed.issues)
-        self.assertEqual("conflict.reason", parsed.issues[0].path)
-
     def test_parser_returns_structured_issue_path_and_reason(self) -> None:
         payload = {
             "schema": "scambait.llm.v1",

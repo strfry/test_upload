@@ -10,8 +10,6 @@ from .model_client import call_hf_openai_chat, extract_reasoning_details, extrac
 # Re-export everything from core_schema so existing ``from scambaiter.core import X`` keeps working.
 from .core_schema import (  # noqa: F401 — re-exports
     ALLOWED_ACTION_TYPES,
-    ALLOWED_CONFLICT_CODES,
-    ALLOWED_CONFLICT_MODES,
     ALLOWED_TOP_LEVEL_KEYS,
     DISALLOWED_STYLE_PHRASES,
     MEMORY_SUMMARY_PROMPT_CONTRACT,
@@ -29,7 +27,6 @@ from .core_schema import (  # noqa: F401 — re-exports
     _WAIT_LATENCY_MAP,
     _build_repair_messages,
     _validate_actions,
-    _validate_conflict,
     normalize_action_shape,
     normalize_iso_utc,
     parse_structured_model_output,

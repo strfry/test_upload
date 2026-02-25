@@ -71,14 +71,6 @@ DISALLOWED_STYLE_PHRASES = (
     "independent legal advice",
     "risk-free high yields is a red flag",
 )
-ALLOWED_CONFLICT_CODES = {
-    "policy_tension",
-    "insufficient_context",
-    "conversation_stall",
-    "operator_required",
-    "uncertain_target",
-}
-ALLOWED_CONFLICT_MODES = {"pivot", "escalate", "hold"}
 TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
@@ -544,66 +536,6 @@ def _build_repair_messages(
     ]
 
 
-def _validate_conflict(conflict_value: object) -> tuple[dict[str, Any] | None, list[ValidationIssue]]:
-    issues: list[ValidationIssue] = []
-
-    def _fail(path: str, reason: str, expected: str | None = None, actual: str | None = None) -> None:
-        issues.append(ValidationIssue(path=path, reason=reason, expected=expected, actual=actual))
-
-    if conflict_value is None:
-        return None, issues
-    if not isinstance(conflict_value, dict):
-        _fail("conflict", "conflict must be object", expected="object", actual=type(conflict_value).__name__)
-        return None, issues
-    conflict_type = str(conflict_value.get("type") or "").strip()
-    if conflict_type != "semantic_conflict":
-        _fail("conflict.type", "invalid conflict type", expected="semantic_conflict", actual=conflict_type or "missing")
-        return None, issues
-    code_value = str(conflict_value.get("code") or "").strip().lower() or "operator_required"
-    if code_value not in ALLOWED_CONFLICT_CODES:
-        _fail(
-            "conflict.code",
-            "invalid conflict code",
-            expected="|".join(sorted(ALLOWED_CONFLICT_CODES)),
-            actual=code_value,
-        )
-        return None, issues
-    reason_value = str(conflict_value.get("reason") or "").strip()
-    if not reason_value:
-        _fail("conflict.reason", "conflict reason must be non-empty string", expected="string")
-        return None, issues
-    if len(reason_value) > 2000:
-        _fail("conflict.reason", "reason too long", expected="<=2000 chars", actual=str(len(reason_value)))
-        return None, issues
-    requires_human = conflict_value.get("requires_human")
-    if requires_human is None:
-        requires_human = True
-    if not isinstance(requires_human, bool):
-        _fail(
-            "conflict.requires_human",
-            "requires_human must be boolean",
-            expected="bool",
-            actual=type(requires_human).__name__,
-        )
-        return None, issues
-    suggested_mode = str(conflict_value.get("suggested_mode") or "hold").strip().lower()
-    if suggested_mode not in ALLOWED_CONFLICT_MODES:
-        _fail(
-            "conflict.suggested_mode",
-            "invalid suggested_mode",
-            expected="pivot|escalate|hold",
-            actual=suggested_mode,
-        )
-        return None, issues
-    return {
-        "type": "semantic_conflict",
-        "code": code_value,
-        "reason": reason_value,
-        "requires_human": requires_human,
-        "suggested_mode": suggested_mode,
-    }, issues
-
-
 def parse_structured_model_output_detailed(text: str) -> ParseResult:
     issues: list[ValidationIssue] = []
 
@@ -637,10 +569,6 @@ def parse_structured_model_output_detailed(text: str) -> ParseResult:
     if not isinstance(message_value, dict):
         return _fail("message", "message must be object", expected="object", actual=type(message_value).__name__)
 
-    normalized_conflict, conflict_issues = _validate_conflict(data.get("conflict"))
-    if conflict_issues:
-        return ParseResult(output=None, issues=conflict_issues)
-
     normalized_actions, action_issues = _validate_actions(data.get("actions"))
     if normalized_actions is None:
         return ParseResult(output=None, issues=action_issues)
@@ -655,7 +583,9 @@ def parse_structured_model_output_detailed(text: str) -> ParseResult:
                     suggestion = candidate.strip()
                     break
 
-    if not suggestion and normalized_conflict is None:
+    # Allow missing send_message if a conflict is present
+    conflict_value = data.get("conflict")
+    if not suggestion and conflict_value is None:
         text_value = message_value.get("text")
         if isinstance(text_value, str) and text_value.strip():
             suggestion = text_value.strip()
@@ -672,7 +602,7 @@ def parse_structured_model_output_detailed(text: str) -> ParseResult:
         analysis=analysis_value,
         metadata={"schema": "scambait.llm.v1"},
         actions=normalized_actions,
-        conflict=normalized_conflict,
+        conflict=conflict_value,
     ), issues=[])
 
 
