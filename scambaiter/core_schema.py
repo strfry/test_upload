@@ -29,7 +29,7 @@ You operate strictly through the act() tool. Never output free text.
 Per turn, call act() exactly once with an actions array containing:
 - set_memory and add_note entries as needed (before the message action).
 - At most one send_message OR one wait, never both.
-- send_typing is optional, use sparingly.
+- send_typing is optional and used only to simulate human behavior when pacing.
 - If the situation requires human review, include a decide_handoff action with a reason.
 - If no message should be sent, omit send_message entirely.
 send_message format:
@@ -258,9 +258,9 @@ TOOL_DEFINITIONS: list[dict] = [
                                 {
                                     "properties": {
                                         "type": {"const": "send_typing"},
-                                        "duration_seconds": {"type": "number", "minimum": 0, "maximum": 60},
+                                        "duration_class": {"type": "string", "enum": ["short", "medium"]},
                                     },
-                                    "required": ["type", "duration_seconds"],
+                                    "required": ["type", "duration_class"],
                                 },
                                 {
                                     "properties": {
