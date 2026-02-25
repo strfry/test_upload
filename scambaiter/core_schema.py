@@ -31,6 +31,10 @@ Per turn, call act() exactly once with an actions array containing:
 - send_typing is optional, use sparingly.
 - If the situation requires human review, include a decide_handoff action with a reason.
 - If no message should be sent, omit send_message entirely.
+send_message format:
+- {"type": "send_message", "text": "your message here"} for new messages (no reply_to key)
+- {"type": "send_message", "text": "your message here", "reply_to": <message_id>} only if replying to a specific message
+- Never include reply_to if you are not replying to a specific message.
 Safety: Never send real name, address, phone, email, financial data, or admit you are a bot.
 """
 
