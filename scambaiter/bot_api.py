@@ -17,7 +17,9 @@ from scambaiter.bot_state import (  # noqa: F401 — re-exports
     _active_targets,
     _auto_send_control_chat,
     _auto_send_enabled,
+    _auto_send_skip_events,
     _auto_send_tasks,
+    _auto_send_waiting_phase,
     _auto_targets,
     _drop_reply_card_state,
     _forward_card_messages,
@@ -2035,6 +2037,59 @@ def _cancel_and_restart_auto_send(application: Application, target_chat_id: int)
     _start_auto_send_task(application, target_chat_id)
 
 
+async def _skippable_sleep(seconds: float, skip_event: asyncio.Event) -> None:
+    """Schläft für 'seconds' Sekunden, abbrechbar durch skip_event."""
+    try:
+        await asyncio.wait_for(asyncio.shield(skip_event.wait()), timeout=seconds)
+        skip_event.clear()
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _set_auto_send_phase(
+    application: Application, target_chat_id: int, phase: str | None
+) -> None:
+    """Setzt die aktuelle Warte-Phase und aktualisiert die Chat-Card-Tastatur."""
+    _auto_send_waiting_phase(application)[target_chat_id] = phase
+    control_chat_id = _auto_send_control_chat(application).get(target_chat_id)
+    if control_chat_id is None:
+        return
+    card_msg_id = _last_user_card_message(application).get(control_chat_id)
+    if card_msg_id is None:
+        return
+    mode = application.bot_data.get("mode")
+    auto_on = _auto_send_enabled(application).get(target_chat_id, False)
+    new_kb = _chat_card_keyboard(
+        target_chat_id,
+        live_mode=(mode == "live"),
+        auto_send_on=auto_on,
+        waiting_phase=phase,
+    )
+    try:
+        await application.bot.edit_message_reply_markup(
+            chat_id=control_chat_id, message_id=card_msg_id, reply_markup=new_kb
+        )
+    except Exception:
+        pass
+
+
+async def _handle_autosend_skip_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        target_chat_id = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer()
+        return
+    skip_events = _auto_send_skip_events(app)
+    event = skip_events.get(target_chat_id)
+    if event is not None:
+        event.set()
+    await query.answer("Warte-Schritt übersprungen")
+
+
 async def _handle_autosend_toggle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     query = update.callback_query
@@ -2095,6 +2150,28 @@ async def _run_auto_send_loop(
 
     result_card_msg: Any = None
     result_card_msg_id: int | None = None
+
+    # Phase 0: Eingehende Nachricht als gelesen markieren
+    try:
+        await executor.mark_read(target_chat_id)
+    except Exception as exc:
+        _log = __import__("logging").getLogger(__name__)
+        _log.debug("_run_auto_send_loop: mark_read fehlgeschlagen für %d: %s", target_chat_id, exc)
+
+    # Phase 1: Lesezeit (200 Zeichen/Min = 3.33 Zeichen/Sek)
+    incoming_text = getattr(events[-1], "text", None) or ""
+    READ_CHARS_PER_SEC = 200.0 / 60.0
+    read_seconds = max(2.0, min(len(incoming_text) / READ_CHARS_PER_SEC, 120.0))
+    skip_events_map = _auto_send_skip_events(application)
+    if target_chat_id not in skip_events_map:
+        skip_events_map[target_chat_id] = asyncio.Event()
+    skip_event = skip_events_map[target_chat_id]
+    skip_event.clear()
+    await _set_auto_send_phase(application, target_chat_id, "reading")
+    try:
+        await _skippable_sleep(read_seconds, skip_event)
+    finally:
+        await _set_auto_send_phase(application, target_chat_id, None)
 
     for attempt_no in range(1, max_retries + 1):
         try:
@@ -2160,6 +2237,16 @@ async def _run_auto_send_loop(
                 if attempt_no < max_retries:
                     await asyncio.sleep(2.0)
                 continue
+
+            # Phase 2: Tippzeit (150 Zeichen/Min = 2.5 Zeichen/Sek)
+            TYPING_CHARS_PER_SEC = 150.0 / 60.0
+            typing_seconds = max(1.0, min(len(message_text) / TYPING_CHARS_PER_SEC, 60.0))
+            skip_event.clear()
+            await _set_auto_send_phase(application, target_chat_id, "typing")
+            try:
+                await executor.simulate_typing_for(target_chat_id, typing_seconds, skip_event)
+            finally:
+                await _set_auto_send_phase(application, target_chat_id, None)
 
             report = await executor.execute_actions(
                 chat_id=target_chat_id,
@@ -2303,6 +2390,7 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_fetch_profile_button, pattern=r"^sc:fetch_profile:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_button, pattern=r"^sc:autosend_toggle:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_autosend_skip_button, pattern=r"^sc:autosend_skip:[0-9]+$"))
     app.add_handler(MessageHandler(filters.REPLY, _handle_manual_override_response))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
 

@@ -29,6 +29,7 @@ def _chat_card_keyboard(
     target_chat_id: int,
     live_mode: bool = False,
     auto_send_on: bool = False,
+    waiting_phase: str | None = None,
 ) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
@@ -42,6 +43,12 @@ def _chat_card_keyboard(
         rows.append([
             InlineKeyboardButton(auto_label, callback_data=f"sc:autosend_toggle:{target_chat_id}")
         ])
+        if waiting_phase is not None:
+            phase_label = "Lesen" if waiting_phase == "reading" else "Tippen"
+            rows.append([InlineKeyboardButton(
+                f"⏭ Überspringen ({phase_label})",
+                callback_data=f"sc:autosend_skip:{target_chat_id}"
+            )])
     rows.append([InlineKeyboardButton("Close", callback_data=f"sc:chat_close:{target_chat_id}")])
     return InlineKeyboardMarkup(rows)
 

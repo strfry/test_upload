@@ -208,3 +208,21 @@ def _auto_send_control_chat(application: Application) -> dict[int, int]:
         state = {}
         application.bot_data["auto_send_control_chat_by_target_chat"] = state
     return state
+
+
+def _auto_send_skip_events(application: Application) -> dict[int, asyncio.Event]:
+    """asyncio.Event pro target_chat_id — wird gesetzt um aktuellen Warte-Schritt zu überspringen."""
+    state = application.bot_data.setdefault("auto_send_skip_event_by_target_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["auto_send_skip_event_by_target_chat"] = state
+    return state
+
+
+def _auto_send_waiting_phase(application: Application) -> dict[int, str | None]:
+    """Aktuelle Warte-Phase pro target_chat_id: 'reading', 'typing' oder None."""
+    state = application.bot_data.setdefault("auto_send_waiting_phase_by_target_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["auto_send_waiting_phase_by_target_chat"] = state
+    return state

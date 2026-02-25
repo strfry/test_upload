@@ -37,6 +37,24 @@ class TelethonExecutor:
         await self._client.disconnect()
         self._started = False
 
+    async def mark_read(self, chat_id: int) -> None:
+        entity = await self._client.get_entity(chat_id)
+        await self._client.send_read_acknowledge(entity)
+
+    async def simulate_typing_for(
+        self, chat_id: int, duration: float, skip_event: asyncio.Event | None = None
+    ) -> None:
+        entity = await self._client.get_entity(chat_id)
+        async with self._client.action(entity, "typing"):
+            if skip_event is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(skip_event.wait()), timeout=duration)
+                    skip_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(duration)
+
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         entity = await self._client.get_entity(chat_id)
         await self._client.delete_messages(entity, message_ids=[message_id])
