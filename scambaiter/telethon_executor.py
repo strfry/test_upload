@@ -11,6 +11,18 @@ from telethon import TelegramClient
 _log = logging.getLogger(__name__)
 
 
+async def _wait_or_skip(duration: float, skip_event: asyncio.Event | None) -> None:
+    """Wait for duration or until skip_event is set, whichever comes first."""
+    if skip_event is None:
+        await asyncio.sleep(duration)
+    else:
+        try:
+            await asyncio.wait_for(asyncio.shield(skip_event.wait()), timeout=duration)
+            skip_event.clear()
+        except asyncio.TimeoutError:
+            pass
+
+
 @dataclass(slots=True)
 class ExecutionReport:
     ok: bool
@@ -59,7 +71,9 @@ class TelethonExecutor:
         entity = await self._client.get_entity(chat_id)
         await self._client.delete_messages(entity, message_ids=[message_id])
 
-    async def execute_actions(self, chat_id: int, parsed_output: dict[str, Any]) -> ExecutionReport:
+    async def execute_actions(
+        self, chat_id: int, parsed_output: dict[str, Any], skip_event: asyncio.Event | None = None
+    ) -> ExecutionReport:
         report = ExecutionReport(ok=True)
         message_obj = parsed_output.get("message") if isinstance(parsed_output.get("message"), dict) else {}
         fallback_text = str(message_obj.get("text") or "").strip()
@@ -90,7 +104,7 @@ class TelethonExecutor:
                     else:
                         seconds = value
                     seconds = max(0.0, seconds)
-                    await asyncio.sleep(seconds)
+                    await _wait_or_skip(seconds, skip_event)
                     report.executed_actions.append(f"{idx}. wait({seconds:.1f}s)")
                     continue
 

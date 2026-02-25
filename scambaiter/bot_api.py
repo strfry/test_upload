@@ -2251,6 +2251,7 @@ async def _run_auto_send_loop(
             report = await executor.execute_actions(
                 chat_id=target_chat_id,
                 parsed_output={"message": {"text": message_text}, "actions": actions},
+                skip_event=skip_event,
             )
 
             if not report.ok:

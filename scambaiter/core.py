@@ -16,6 +16,7 @@ from .core_schema import (  # noqa: F401 — re-exports
     META_TURN_PROMPT_CONTRACT,
     SEMANTIC_CONFLICT_REASON_HINTS,
     SYSTEM_PROMPT_CONTRACT,
+    TIMING_PROMPT_RULES,
     TOOL_DEFINITIONS,
     ChatContext,
     ChatEvent,
@@ -96,6 +97,97 @@ class ScambaiterCore:
                 }
             )
         return self._trim_prompt_events(prompt_events, token_budget)
+
+    def compute_timing_stats(self, chat_id: int) -> dict[str, Any]:
+        """Compute timing statistics for pacing decisions.
+
+        Returns:
+        {
+            "now_ts": int,              # Current UTC timestamp (seconds since epoch)
+            "secs_since_last_inbound": int | None,    # Seconds since last scammer message
+            "secs_since_last_outbound": int | None,   # Seconds since last scambaiter message
+            "inbound_burst_count_120s": int,          # Number of scammer messages in last 120s
+            "avg_inbound_latency_s": float | None,    # Average response latency (scammer->scambaiter)
+        }
+        """
+        events = self.store.list_events(chat_id=chat_id, limit=200)
+        if not events:
+            return {
+                "now_ts": int(datetime.now(timezone.utc).timestamp()),
+                "secs_since_last_inbound": None,
+                "secs_since_last_outbound": None,
+                "inbound_burst_count_120s": 0,
+                "avg_inbound_latency_s": None,
+            }
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+
+        # Parse all events with valid timestamps
+        timestamped_events: list[tuple[int, str, str]] = []  # (ts, role, event_type)
+        for event in events:
+            ts_utc = event.ts_utc
+            if not ts_utc:
+                continue
+            try:
+                # Parse ISO 8601 timestamp to seconds since epoch
+                dt = datetime.fromisoformat(ts_utc.replace("Z", "+00:00"))
+                ts = int(dt.timestamp())
+                timestamped_events.append((ts, event.role, event.event_type))
+            except (ValueError, AttributeError):
+                continue
+
+        if not timestamped_events:
+            return {
+                "now_ts": now_ts,
+                "secs_since_last_inbound": None,
+                "secs_since_last_outbound": None,
+                "inbound_burst_count_120s": 0,
+                "avg_inbound_latency_s": None,
+            }
+
+        # Compute secs_since_last_inbound and secs_since_last_outbound
+        secs_since_last_inbound: int | None = None
+        secs_since_last_outbound: int | None = None
+
+        for ts, role, _ in reversed(timestamped_events):
+            if secs_since_last_inbound is None and role == "scammer":
+                secs_since_last_inbound = max(0, now_ts - ts)
+            if secs_since_last_outbound is None and role == "scambaiter":
+                secs_since_last_outbound = max(0, now_ts - ts)
+            if secs_since_last_inbound is not None and secs_since_last_outbound is not None:
+                break
+
+        # Count inbound messages in last 120 seconds
+        inbound_burst_count_120s = 0
+        for ts, role, _ in timestamped_events:
+            if role == "scammer" and (now_ts - ts) <= 120:
+                inbound_burst_count_120s += 1
+
+        # Calculate average inbound latency (scammer -> scambaiter response time)
+        latencies: list[float] = []
+        for i, (inbound_ts, inbound_role, _) in enumerate(timestamped_events):
+            if inbound_role != "scammer":
+                continue
+            # Find the next scambaiter response
+            for j in range(i + 1, len(timestamped_events)):
+                response_ts, response_role, _ = timestamped_events[j]
+                if response_role == "scambaiter":
+                    latency = response_ts - inbound_ts
+                    if latency > 0:
+                        latencies.append(float(latency))
+                    break
+
+        avg_inbound_latency_s: float | None = None
+        if latencies:
+            avg_inbound_latency_s = sum(latencies) / len(latencies)
+
+        return {
+            "now_ts": now_ts,
+            "secs_since_last_inbound": secs_since_last_inbound,
+            "secs_since_last_outbound": secs_since_last_outbound,
+            "inbound_burst_count_120s": inbound_burst_count_120s,
+            "avg_inbound_latency_s": avg_inbound_latency_s,
+        }
 
     def build_memory_events(self, chat_id: int, after_event_id: int = 0) -> list[dict[str, Any]]:
         events = self.store.list_events(chat_id=chat_id, limit=5000)
@@ -265,6 +357,7 @@ class ScambaiterCore:
         token_limit: int | None = None,
         force_refresh_memory: bool = False,
         include_memory: bool = True,
+        timing: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
         prompt_events = self.build_prompt_events(chat_id=chat_id, token_limit=token_limit)
         memory_state: dict[str, Any] = {"summary": {}, "cursor_event_id": 0, "updated": False}
@@ -280,6 +373,13 @@ class ScambaiterCore:
                 ),
             },
         ]
+        if timing is not None:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": TIMING_PROMPT_RULES + "\n\nTiming data:\n" + json.dumps(timing, ensure_ascii=True),
+                }
+            )
         for event in prompt_events:
             payload = {
                 "time": event.get("time"),
@@ -436,7 +536,7 @@ class ScambaiterCore:
         parsed["model"] = model
         return parsed
 
-    def run_hf_dry_run(self, chat_id: int) -> dict[str, Any]:
+    def run_hf_dry_run(self, chat_id: int, include_timing: bool = True) -> dict[str, Any]:
         token = (getattr(self.config, "hf_token", None) or "").strip()
         model = (getattr(self.config, "hf_model", None) or "").strip()
         if not token or not model:
@@ -444,7 +544,8 @@ class ScambaiterCore:
         max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))
 
         attempts: list[dict[str, Any]] = []
-        initial_messages = self.build_model_messages(chat_id=chat_id, include_memory=False)
+        timing = self.compute_timing_stats(chat_id) if include_timing else None
+        initial_messages = self.build_model_messages(chat_id=chat_id, include_memory=False, timing=timing)
         initial_prompt = {"messages": initial_messages, "max_tokens": max_tokens}
         reasoning_cycles = 0
         reasoning_snippet: str = ""
