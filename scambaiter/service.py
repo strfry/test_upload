@@ -41,6 +41,10 @@ class BackgroundService:
         self.interval_seconds = interval_seconds
         self.store = store
         self._pending_messages: dict[int, PendingMessage] = {}
+        self._on_new_message_callback: Any = None  # Callable[[int], None] | None
+
+    def set_new_message_callback(self, fn: Any) -> None:
+        self._on_new_message_callback = fn
 
     def start_startup_bootstrap(self) -> None:  # pragma: no cover - integration hook
         return
@@ -59,6 +63,11 @@ class BackgroundService:
 
     async def trigger_for_chat(self, chat_id: int, trigger: str = "live_message") -> None:
         """Generate a response for a single chat immediately (Live Mode auto-receive)."""
+        if self._on_new_message_callback is not None:
+            try:
+                self._on_new_message_callback(chat_id)
+            except Exception:
+                pass
         context = await self.core.build_chat_context(chat_id)
         if context is None:
             return

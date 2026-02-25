@@ -15,6 +15,9 @@ from scambaiter.forward_meta import baiter_name_from_meta, scammer_name_from_met
 # Re-export state accessors so existing ``from scambaiter.bot_api import _X`` keeps working.
 from scambaiter.bot_state import (  # noqa: F401 — re-exports
     _active_targets,
+    _auto_send_control_chat,
+    _auto_send_enabled,
+    _auto_send_tasks,
     _auto_targets,
     _drop_reply_card_state,
     _forward_card_messages,
@@ -209,10 +212,11 @@ async def _show_user_card(
     else:
         profile_lines = _profile_lines_from_events(events)
     live_mode = application.bot_data.get("mode") == "live"
+    auto_on = _auto_send_enabled(application).get(target_chat_id, False)
     sent = await application.bot.send_message(
         chat_id=chat_id,
         text=_render_user_card(target_chat_id, len(events), last_preview, profile_lines),
-        reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode),
+        reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode, auto_send_on=auto_on),
     )
     sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
     sent_messages.append(int(sent.message_id))
@@ -2007,6 +2011,236 @@ async def _handle_fetch_history_button(update: Update, context: ContextTypes.DEF
         await message.reply_text(f"History fetch complete: {count} new events for /{chat_id}.")
 
 
+def _cancel_auto_send_task(application: Application, target_chat_id: int) -> None:
+    tasks = _auto_send_tasks(application)
+    existing = tasks.pop(target_chat_id, None)
+    if existing is not None and not existing.done():
+        existing.cancel()
+
+
+def _start_auto_send_task(application: Application, target_chat_id: int) -> None:
+    control_chat_id = _auto_send_control_chat(application).get(target_chat_id)
+    if control_chat_id is None:
+        return
+    task = asyncio.create_task(
+        _run_auto_send_loop(application, target_chat_id, control_chat_id)
+    )
+    _auto_send_tasks(application)[target_chat_id] = task
+
+
+def _cancel_and_restart_auto_send(application: Application, target_chat_id: int) -> None:
+    if not _auto_send_enabled(application).get(target_chat_id, False):
+        return
+    _cancel_auto_send_task(application, target_chat_id)
+    _start_auto_send_task(application, target_chat_id)
+
+
+async def _handle_autosend_toggle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    if app.bot_data.get("mode") != "live":
+        await query.answer("Auto-Send nur im Live-Modus verfügbar")
+        return
+    try:
+        target_chat_id = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer()
+        return
+
+    enabled_map = _auto_send_enabled(app)
+    currently_on = enabled_map.get(target_chat_id, False)
+    new_state = not currently_on
+    enabled_map[target_chat_id] = new_state
+
+    control_chat_id = int(query.message.chat_id)
+    _auto_send_control_chat(app)[target_chat_id] = control_chat_id
+
+    if not new_state:
+        _cancel_auto_send_task(app, target_chat_id)
+        await query.answer("Auto-Send deaktiviert")
+    else:
+        await query.answer("Auto-Send aktiviert")
+        # Sofort starten falls letzter Event vom Scammer
+        _start_auto_send_task(app, target_chat_id)
+
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    # Chat Card mit neuem Toggle-Status neu rendern
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await _show_user_card(app, control_chat_id, store, target_chat_id)
+
+
+async def _run_auto_send_loop(
+    application: Application,
+    target_chat_id: int,
+    control_chat_id: int,
+    max_retries: int = 7,
+) -> None:
+    service = application.bot_data.get("service")
+    store = _resolve_store(service)
+    core = getattr(service, "core", None)
+    executor = application.bot_data.get("telethon_executor")
+    if core is None or executor is None:
+        return
+
+    # Guard: nur senden wenn letzte Nachricht vom Scammer
+    events = store.list_events(chat_id=target_chat_id, limit=5000)
+    if not events or getattr(events[-1], "role", None) != "scammer":
+        return
+
+    result_card_msg: Any = None
+    result_card_msg_id: int | None = None
+
+    for attempt_no in range(1, max_retries + 1):
+        try:
+            # -- Generierungsphase --
+            dry_run_result = core.run_hf_dry_run(target_chat_id)
+            outcome_class = str(dry_run_result.get("outcome_class") or "")
+            parsed_output = dry_run_result.get("parsed_output")
+            valid_output = bool(dry_run_result.get("valid_output")) and isinstance(parsed_output, dict)
+            error_message = str(dry_run_result.get("error_message") or "").strip()
+            status = "ok" if valid_output and not error_message else "error"
+            if outcome_class == "semantic_conflict":
+                status = "semantic_conflict"
+
+            if status != "ok":
+                # Fehler-Card anzeigen oder aktualisieren
+                run_id = _next_reply_run_id(application)
+                card_state = {
+                    "chat_id": target_chat_id,
+                    "provider": str(dry_run_result.get("provider") or "unknown"),
+                    "model": str(dry_run_result.get("model") or "unknown"),
+                    "parsed_output": parsed_output if isinstance(parsed_output, dict) else None,
+                    "result_text": str(dry_run_result.get("result_text") or ""),
+                    "retry_context": None,
+                    "run_id": run_id,
+                    "status": status,
+                    "outcome_class": outcome_class or "unknown",
+                    "error_message": f"Auto-Send Versuch {attempt_no}/{max_retries}: {error_message or 'Generierung fehlgeschlagen'}",
+                    "contract_issues": [i for i in (dry_run_result.get("contract_issues") or []) if isinstance(i, dict)],
+                    "response_json": dry_run_result.get("response_json") if isinstance(dry_run_result.get("response_json"), dict) else {},
+                    "conflict": dry_run_result.get("conflict") if isinstance(dry_run_result.get("conflict"), dict) else None,
+                    "pivot": dry_run_result.get("pivot") if isinstance(dry_run_result.get("pivot"), dict) else None,
+                    "active_section": "error",
+                }
+                card_text = _render_result_card_text(card_state, section="error")
+                has_raw = bool(card_state["response_json"])
+                card_markup = _result_card_keyboard(
+                    chat_id=target_chat_id,
+                    active_section="error",
+                    status=status,
+                    telethon_enabled=True,
+                    retry_enabled=False,
+                    has_raw=has_raw,
+                )
+                if result_card_msg is None:
+                    result_card_msg = await application.bot.send_message(
+                        chat_id=control_chat_id, text=card_text, reply_markup=card_markup
+                    )
+                    result_card_msg_id = int(result_card_msg.message_id)
+                    _set_reply_card_state(application, result_card_msg_id, **card_state)
+                else:
+                    try:
+                        await result_card_msg.edit_text(card_text, reply_markup=card_markup)
+                    except Exception:
+                        pass
+                if attempt_no < max_retries:
+                    await asyncio.sleep(2.0)
+                continue
+
+            # -- Ausführungsphase --
+            message_text = _extract_action_message_text(parsed_output)
+            actions = parsed_output.get("actions") if isinstance(parsed_output.get("actions"), list) else []
+            if not actions and not message_text:
+                if attempt_no < max_retries:
+                    await asyncio.sleep(2.0)
+                continue
+
+            report = await executor.execute_actions(
+                chat_id=target_chat_id,
+                parsed_output={"message": {"text": message_text}, "actions": actions},
+            )
+
+            if not report.ok:
+                errors = "; ".join(str(e) for e in (report.errors if hasattr(report, "errors") else []))
+                run_id = _next_reply_run_id(application)
+                err_state = {
+                    "chat_id": target_chat_id,
+                    "provider": str(dry_run_result.get("provider") or "unknown"),
+                    "model": str(dry_run_result.get("model") or "unknown"),
+                    "parsed_output": parsed_output,
+                    "result_text": "",
+                    "retry_context": None,
+                    "run_id": run_id,
+                    "status": "error",
+                    "outcome_class": "send_failed",
+                    "error_message": f"Auto-Send Versuch {attempt_no}/{max_retries}: Telethon-Fehler: {errors}",
+                    "contract_issues": [],
+                    "response_json": {},
+                    "conflict": None,
+                    "pivot": None,
+                    "active_section": "error",
+                }
+                card_text = _render_result_card_text(err_state, section="error")
+                card_markup = _result_card_keyboard(
+                    chat_id=target_chat_id, active_section="error", status="error",
+                    telethon_enabled=True, retry_enabled=False, has_raw=False,
+                )
+                if result_card_msg is None:
+                    result_card_msg = await application.bot.send_message(
+                        chat_id=control_chat_id, text=card_text, reply_markup=card_markup
+                    )
+                    result_card_msg_id = int(result_card_msg.message_id)
+                else:
+                    try:
+                        await result_card_msg.edit_text(card_text, reply_markup=card_markup)
+                    except Exception:
+                        pass
+                if attempt_no < max_retries:
+                    await asyncio.sleep(2.0)
+                continue
+
+            # -- Erfolg --
+            if message_text:
+                store.ingest_event(
+                    chat_id=target_chat_id,
+                    event_type="message",
+                    role="scambaiter",
+                    text=message_text,
+                    source_message_id=str(report.sent_message_id) if report.sent_message_id else None,
+                    meta={"origin": "auto_send"},
+                )
+            if report.sent_message_id is not None:
+                _last_sent_by_chat(application)[target_chat_id] = {
+                    "message_id": int(report.sent_message_id),
+                    "attempt_id": 0,
+                }
+            if result_card_msg is not None:
+                try:
+                    await result_card_msg.delete()
+                except Exception:
+                    pass
+                if result_card_msg_id is not None:
+                    _drop_reply_card_state(application, result_card_msg_id)
+            _auto_send_tasks(application).pop(target_chat_id, None)
+            return
+
+        except asyncio.CancelledError:
+            raise  # immer re-raisen!
+
+        except Exception:
+            if attempt_no < max_retries:
+                await asyncio.sleep(2.0)
+
+    # Alle Versuche erschöpft — Error-Card bleibt sichtbar
+    _auto_send_tasks(application).pop(target_chat_id, None)
+
+
 async def _register_command_menu(application: Application) -> None:
     await application.bot.set_my_commands(
         [
@@ -2068,6 +2302,16 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:nop$"))
     app.add_handler(CallbackQueryHandler(_handle_fetch_profile_button, pattern=r"^sc:fetch_profile:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_button, pattern=r"^sc:autosend_toggle:[0-9]+$"))
     app.add_handler(MessageHandler(filters.REPLY, _handle_manual_override_response))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
+
+    # Register service callback for auto-send (Live Mode only)
+    if app.bot_data.get("mode") == "live":
+        service = app.bot_data.get("service")
+        if service is not None and hasattr(service, "set_new_message_callback"):
+            service.set_new_message_callback(
+                lambda chat_id: _cancel_and_restart_auto_send(app, chat_id)
+            )
+
     return app

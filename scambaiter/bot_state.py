@@ -184,3 +184,27 @@ def _manual_override_labels(application: Application) -> dict[int, str]:
         state = {}
         application.bot_data["manual_override_label_by_chat"] = state
     return state
+
+
+def _auto_send_enabled(application: Application) -> dict[int, bool]:
+    state = application.bot_data.setdefault("auto_send_enabled_by_target_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["auto_send_enabled_by_target_chat"] = state
+    return state
+
+
+def _auto_send_tasks(application: Application) -> dict[int, asyncio.Task[Any]]:
+    state = application.bot_data.setdefault("auto_send_task_by_target_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["auto_send_task_by_target_chat"] = state
+    return state
+
+
+def _auto_send_control_chat(application: Application) -> dict[int, int]:
+    state = application.bot_data.setdefault("auto_send_control_chat_by_target_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["auto_send_control_chat_by_target_chat"] = state
+    return state

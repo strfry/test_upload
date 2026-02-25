@@ -25,7 +25,11 @@ def _render_user_card(
     )
 
 
-def _chat_card_keyboard(target_chat_id: int, live_mode: bool = False) -> InlineKeyboardMarkup:
+def _chat_card_keyboard(
+    target_chat_id: int,
+    live_mode: bool = False,
+    auto_send_on: bool = False,
+) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
     ]
@@ -33,6 +37,10 @@ def _chat_card_keyboard(target_chat_id: int, live_mode: bool = False) -> InlineK
         rows.append([
             InlineKeyboardButton("Fetch Profile", callback_data=f"sc:fetch_profile:{target_chat_id}"),
             InlineKeyboardButton("Fetch History", callback_data=f"sc:fetch_history:{target_chat_id}"),
+        ])
+        auto_label = "Auto-Send: ON" if auto_send_on else "Auto-Send: OFF"
+        rows.append([
+            InlineKeyboardButton(auto_label, callback_data=f"sc:autosend_toggle:{target_chat_id}")
         ])
     rows.append([InlineKeyboardButton("Close", callback_data=f"sc:chat_close:{target_chat_id}")])
     return InlineKeyboardMarkup(rows)
