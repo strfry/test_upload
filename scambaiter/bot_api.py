@@ -2083,6 +2083,11 @@ async def _handle_autosend_skip_button(update: Update, context: ContextTypes.DEF
     except ValueError:
         await query.answer()
         return
+    # Guard: nur wenn eine aktive Warte-Phase läuft
+    current_phase = _auto_send_waiting_phase(app).get(target_chat_id)
+    if current_phase is None:
+        await query.answer("Keine aktive Warte-Phase")
+        return
     skip_events = _auto_send_skip_events(app)
     event = skip_events.get(target_chat_id)
     if event is not None:
@@ -2166,8 +2171,8 @@ async def _run_auto_send_loop(
     if target_chat_id not in skip_events_map:
         skip_events_map[target_chat_id] = asyncio.Event()
     skip_event = skip_events_map[target_chat_id]
-    skip_event.clear()
     await _set_auto_send_phase(application, target_chat_id, "reading")
+    skip_event.clear()
     try:
         await _skippable_sleep(read_seconds, skip_event)
     finally:
@@ -2239,8 +2244,8 @@ async def _run_auto_send_loop(
                 continue
 
             # Phase 2: Tippzeit mit Pausen zwischen Sätzen
-            skip_event.clear()
             await _set_auto_send_phase(application, target_chat_id, "typing")
+            skip_event.clear()
             try:
                 await executor.simulate_typing_with_pauses(target_chat_id, message_text, skip_event)
             finally:
