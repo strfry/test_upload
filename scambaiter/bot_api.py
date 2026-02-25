@@ -215,10 +215,11 @@ async def _show_user_card(
         profile_lines = _profile_lines_from_events(events)
     live_mode = application.bot_data.get("mode") == "live"
     auto_on = _auto_send_enabled(application).get(target_chat_id, False)
+    current_phase = _auto_send_waiting_phase(application).get(target_chat_id)
     sent = await application.bot.send_message(
         chat_id=chat_id,
         text=_render_user_card(target_chat_id, len(events), last_preview, profile_lines),
-        reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode, auto_send_on=auto_on),
+        reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode, auto_send_on=auto_on, waiting_phase=current_phase),
     )
     sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
     sent_messages.append(int(sent.message_id))
@@ -884,6 +885,63 @@ async def _handle_send_cancel_button(update: Update, context: ContextTypes.DEFAU
         await message.reply_text("Send cancelled.")
 
 
+async def _run_send_task(
+    application: Application,
+    chat_id: int,
+    parsed_output: dict,
+    control_chat_id: int,
+    control_msg_id: int,
+    origin: str = "send",
+) -> None:
+    """Asynchrone Task zum Senden einer Nachricht und Speichern in History."""
+    executor = application.bot_data.get("telethon_executor")
+    service = application.bot_data.get("service")
+    store = _resolve_store(service)
+    if executor is None:
+        return
+
+    message_text = str((parsed_output.get("message") or {}).get("text") or "").strip()
+    report = await executor.execute_actions(chat_id=chat_id, parsed_output=parsed_output)
+
+    # Nachricht in History speichern wenn erfolgreich
+    if report.ok and message_text:
+        try:
+            store.ingest_event(
+                chat_id=chat_id, event_type="message", role="scambaiter",
+                text=message_text,
+                source_message_id=str(report.sent_message_id) if report.sent_message_id else None,
+                meta={"origin": origin},
+            )
+        except Exception:
+            pass
+
+    # Tracking aktualisieren
+    if report.ok and report.sent_message_id:
+        _last_sent_by_chat(application)[chat_id] = {
+            "message_id": int(report.sent_message_id), "attempt_id": 0,
+        }
+
+    # Antwort im Control-Chat anzeigen
+    if report.ok:
+        lines = [f"Sent via Telethon for /{chat_id}"]
+        if report.sent_message_id:
+            lines.append(f"sent_message_id: {report.sent_message_id}")
+        if report.executed_actions:
+            lines.extend(report.executed_actions[:12])
+        result_text = "\n".join(lines)
+    else:
+        errors = "\n".join(report.errors) if report.errors else "unknown error"
+        result_text = f"Telethon send failed.\nchat_id: /{chat_id}\n---\n{errors}"
+
+    try:
+        await application.bot.edit_message_text(
+            result_text, chat_id=control_chat_id, message_id=control_msg_id,
+            reply_markup=_send_result_keyboard(chat_id=chat_id),
+        )
+    except Exception:
+        pass
+
+
 async def _handle_send_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     allowed_chat_id = app.bot_data.get("allowed_chat_id")
@@ -922,48 +980,12 @@ async def _handle_send_confirm_button(update: Update, context: ContextTypes.DEFA
         return
     assert parsed is not None
     await query.answer("Sending...")
-    report = await executor.execute_actions(
-        chat_id=chat_id,
-        parsed_output={
-            "message": {"text": parsed.suggestion},
-            "actions": parsed.actions,
-        },
-    )
-    if report.ok:
-        lines = [
-            f"Sent via Telethon for /{chat_id}",
-            f"attempt_id: {attempt_id}",
-            f"actions_executed: {len(report.executed_actions)}",
-        ]
-        if report.sent_message_id is not None:
-            lines.append(f"sent_message_id: {report.sent_message_id}")
-            _last_sent_by_chat(app)[chat_id] = {
-                "message_id": int(report.sent_message_id),
-                "attempt_id": int(attempt_id),
-            }
-        if report.executed_actions:
-            lines.append("---")
-            lines.extend(report.executed_actions[:12])
-        text = "\n".join(lines)
-        try:
-            await query.edit_message_text(text, reply_markup=_send_result_keyboard(chat_id=chat_id))
-        except Exception:
-            await message.reply_text(text, reply_markup=_send_result_keyboard(chat_id=chat_id))
-        return
-
-    errors = "\n".join(report.errors) if report.errors else "unknown error"
-    fail_text = (
-        "Telethon send failed.\n"
-        f"chat_id: /{chat_id}\n"
-        f"attempt_id: {attempt_id}\n"
-        f"failed_action_index: {report.failed_action_index or '?'}\n"
-        "---\n"
-        f"{errors}"
-    )
-    try:
-        await query.edit_message_text(fail_text, reply_markup=_send_result_keyboard(chat_id=chat_id))
-    except Exception:
-        await message.reply_text(fail_text, reply_markup=_send_result_keyboard(chat_id=chat_id))
+    asyncio.create_task(_run_send_task(
+        application=app, chat_id=chat_id,
+        parsed_output={"message": {"text": parsed.suggestion}, "actions": parsed.actions},
+        control_chat_id=int(message.chat_id), control_msg_id=int(message.message_id),
+        origin="send_confirm",
+    ))
 
 
 async def _handle_undo_send_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1564,53 +1586,13 @@ async def _handle_reply_send_button(update: Update, context: ContextTypes.DEFAUL
         await query.answer("No sendable action")
         return
     await query.answer("Sending...")
-    report = await executor.execute_actions(
-        chat_id=chat_id,
+    asyncio.create_task(_run_send_task(
+        application=app, chat_id=chat_id,
         parsed_output={"message": {"text": message_text}, "actions": actions},
-    )
-    if report.ok:
-        service = app.bot_data.get("service")
-        store = _resolve_store(service)
-        if message_text:
-            store.ingest_event(
-                chat_id=chat_id,
-                event_type="message",
-                role="scambaiter",
-                text=message_text,
-                source_message_id=None,
-                meta={"origin": "telethon_send", "control_message_id": int(message.message_id)},
-            )
-        lines = [
-            f"Sent via Telethon for /{chat_id}",
-            f"actions_executed: {len(report.executed_actions)}",
-        ]
-        if report.sent_message_id is not None:
-            lines.append(f"sent_message_id: {report.sent_message_id}")
-            _last_sent_by_chat(app)[chat_id] = {"message_id": int(report.sent_message_id), "attempt_id": 0}
-        if report.executed_actions:
-            lines.append("---")
-            lines.extend(report.executed_actions[:12])
-        try:
-            await query.edit_message_text(
-                "\n".join(lines),
-                reply_markup=_send_result_keyboard(chat_id=chat_id),
-            )
-        except Exception:
-            await message.reply_text("\n".join(lines), reply_markup=_send_result_keyboard(chat_id=chat_id))
-        _drop_reply_card_state(app, int(message.message_id))
-        return
-    errors = "\n".join(report.errors) if report.errors else "unknown error"
-    fail_text = (
-        "Telethon send failed.\n"
-        f"chat_id: /{chat_id}\n"
-        f"failed_action_index: {report.failed_action_index or '?'}\n"
-        "---\n"
-        f"{errors}"
-    )
-    try:
-        await query.edit_message_text(fail_text, reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=True))
-    except Exception:
-        await message.reply_text(fail_text, reply_markup=_reply_action_keyboard(chat_id, telethon_enabled=True))
+        control_chat_id=int(message.chat_id), control_msg_id=int(message.message_id),
+        origin="telethon_send",
+    ))
+    _drop_reply_card_state(app, int(message.message_id))
 
 
 async def _handle_reply_mark_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2018,6 +2000,10 @@ def _cancel_auto_send_task(application: Application, target_chat_id: int) -> Non
     existing = tasks.pop(target_chat_id, None)
     if existing is not None and not existing.done():
         existing.cancel()
+    # Phase auf None setzen (sync, keine await nötig)
+    _auto_send_waiting_phase(application).pop(target_chat_id, None)
+    # Keyboard aktualisieren (fire-and-forget, Fehler ignorieren)
+    asyncio.create_task(_set_auto_send_phase(application, target_chat_id, None))
 
 
 def _start_auto_send_task(application: Application, target_chat_id: int) -> None:
@@ -2047,7 +2033,7 @@ async def _skippable_sleep(seconds: float, skip_event: asyncio.Event) -> None:
 
 
 async def _set_auto_send_phase(
-    application: Application, target_chat_id: int, phase: str | None
+    application: Application, target_chat_id: int, phase: str | None, attempt_no: int | None = None
 ) -> None:
     """Setzt die aktuelle Warte-Phase und aktualisiert die Chat-Card-Tastatur."""
     _auto_send_waiting_phase(application)[target_chat_id] = phase
@@ -2064,6 +2050,7 @@ async def _set_auto_send_phase(
         live_mode=(mode == "live"),
         auto_send_on=auto_on,
         waiting_phase=phase,
+        attempt_no=attempt_no,
     )
     try:
         await application.bot.edit_message_reply_markup(
@@ -2181,7 +2168,9 @@ async def _run_auto_send_loop(
     for attempt_no in range(1, max_retries + 1):
         try:
             # -- Generierungsphase --
-            dry_run_result = core.run_hf_dry_run(target_chat_id)
+            await _set_auto_send_phase(application, target_chat_id, "generating", attempt_no=attempt_no)
+            loop = asyncio.get_event_loop()
+            dry_run_result = await loop.run_in_executor(None, core.run_hf_dry_run, target_chat_id)
             outcome_class = str(dry_run_result.get("outcome_class") or "")
             parsed_output = dry_run_result.get("parsed_output")
             valid_output = bool(dry_run_result.get("valid_output")) and isinstance(parsed_output, dict)
@@ -2191,6 +2180,7 @@ async def _run_auto_send_loop(
                 status = "semantic_conflict"
 
             if status != "ok":
+                await _set_auto_send_phase(application, target_chat_id, None)
                 # Fehler-Card anzeigen oder aktualisieren
                 run_id = _next_reply_run_id(application)
                 card_state = {
@@ -2239,6 +2229,7 @@ async def _run_auto_send_loop(
             message_text = _extract_action_message_text(parsed_output)
             actions = parsed_output.get("actions") if isinstance(parsed_output.get("actions"), list) else []
             if not actions and not message_text:
+                await _set_auto_send_phase(application, target_chat_id, None)
                 if attempt_no < max_retries:
                     await asyncio.sleep(2.0)
                 continue
@@ -2249,13 +2240,19 @@ async def _run_auto_send_loop(
             try:
                 await executor.simulate_typing_with_pauses(target_chat_id, message_text, skip_event)
             finally:
-                await _set_auto_send_phase(application, target_chat_id, None)
+                # Phase wird nach dem Senden auf None gesetzt, nicht hier
+                pass
 
-            report = await executor.execute_actions(
-                chat_id=target_chat_id,
-                parsed_output={"message": {"text": message_text}, "actions": actions},
-                skip_event=skip_event,
-            )
+            # Phase 3: Sendet
+            await _set_auto_send_phase(application, target_chat_id, "sending")
+            try:
+                report = await executor.execute_actions(
+                    chat_id=target_chat_id,
+                    parsed_output={"message": {"text": message_text}, "actions": actions},
+                    skip_event=skip_event,
+                )
+            finally:
+                await _set_auto_send_phase(application, target_chat_id, None)
 
             if not report.ok:
                 errors = "; ".join(str(e) for e in (report.errors if hasattr(report, "errors") else []))
@@ -2391,6 +2388,7 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_reply_delete_button, pattern=r"^sc:reply_delete:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
     app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:nop$"))
+    app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:noop:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_fetch_profile_button, pattern=r"^sc:fetch_profile:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_button, pattern=r"^sc:autosend_toggle:[0-9]+$"))
