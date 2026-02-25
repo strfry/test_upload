@@ -248,3 +248,4 @@ Konfigurierbare Flags:
 - `--prompt-path FILE`: Schreibe das erzeugte Prompt-JSON in eine Datei, um den Payload mit der Control-Prompt-Card vergleichen zu können.
 
 Diese REPL ergänzt die neuen manuellen Override-Features (Control-Card, Prompt-Ansicht etc.), weil sie dieselbe Prompt-, Memory- und Analysis-Pipeline nutzt. So können Operator:innen neue Dialogstränge erproben oder ungültige Responses reproduzieren, ohne die Telegram-UI zu benutzen.
+
