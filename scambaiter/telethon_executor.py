@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,109 @@ async def _wait_or_skip(duration: float, skip_event: asyncio.Event | None) -> No
             skip_event.clear()
         except asyncio.TimeoutError:
             pass
+
+
+def _segment_text_for_typing(text: str) -> list[tuple[float, float]]:
+    """
+    Split text into (typing_duration, pause_after) segments for realistic typing simulation.
+
+    Segments are created at sentence boundaries (after . ! ? … or newlines).
+    Short segments (<25 chars) are merged with the next one. Max 5 segments allowed.
+    Typing duration follows 150 chars/min rate (2.5 chars/sec).
+    Pause durations vary by ending character: . → 2.5s, ! → 2.0s, ? → 2.2s, …/\n → 3.0s, else → 2.0s.
+    Last segment always has pause_after = 0.0.
+
+    Returns list of (typing_duration, pause_after) tuples.
+    """
+    if not text:
+        return []
+
+    if len(text) < 2:
+        return [(max(0.5, len(text) / 2.5), 0.0)]
+
+    # Pattern: match sentence boundaries where we split
+    # After .!?… when followed by whitespace, or after newlines
+    split_pattern = r'(?<=[.!?…])\s+|(?<=\n)'
+
+    # Find split positions to preserve ending character context
+    split_positions = [m.start() for m in re.finditer(split_pattern, text)]
+
+    if not split_positions:
+        # No sentence breaks found, treat whole text as one segment
+        return [(max(0.5, len(text) / 2.5), 0.0)]
+
+    # Build segments preserving what character ended each one
+    segments: list[tuple[str, str]] = []  # (text, ending_char)
+    prev = 0
+    for pos in split_positions:
+        segment = text[prev:pos].strip()
+        # The ending character is right before the whitespace we're splitting on
+        ending_char = text[pos - 1] if pos > 0 else ''
+        if segment:
+            segments.append((segment, ending_char))
+        prev = pos
+
+    # Add final segment
+    final = text[prev:].strip()
+    if final:
+        final_ending = final.rstrip()[-1] if final.rstrip() else ''
+        segments.append((final, final_ending))
+
+    if not segments:
+        return [(max(0.5, len(text) / 2.5), 0.0)]
+
+    # Merge short segments (<25 chars) with the next one
+    merged: list[tuple[str, str]] = []
+    i = 0
+    while i < len(segments):
+        current_text, current_end = segments[i]
+        # Keep merging with next while current is short
+        while i < len(segments) - 1 and len(current_text) < 25:
+            next_text, next_end = segments[i + 1]
+            current_text = current_text + ' ' + next_text
+            current_end = next_end
+            i += 1
+        merged.append((current_text, current_end))
+        i += 1
+
+    # Limit to max 5 segments by grouping longer texts
+    if len(merged) > 5:
+        chunk_size = len(merged) / 5.0
+        new_merged: list[tuple[str, str]] = []
+        for chunk_idx in range(5):
+            start_idx = int(chunk_idx * chunk_size)
+            end_idx = int((chunk_idx + 1) * chunk_size) if chunk_idx < 4 else len(merged)
+            combined_text = ' '.join(seg[0] for seg in merged[start_idx:end_idx])
+            combined_end = merged[end_idx - 1][1] if end_idx > 0 else ''
+            if combined_text.strip():
+                new_merged.append((combined_text, combined_end))
+        merged = new_merged
+
+    # Create final result with (typing_duration, pause_after) tuples
+    result: list[tuple[float, float]] = []
+    for i, (segment, ending_char) in enumerate(merged):
+        # Typing duration: 150 chars/min = 2.5 chars/sec
+        typing_duration = max(0.5, len(segment) / 2.5)
+
+        # Last segment never pauses
+        if i == len(merged) - 1:
+            pause_after = 0.0
+        else:
+            # Pause duration based on sentence-ending character
+            if ending_char == '.':
+                pause_after = 2.5
+            elif ending_char == '!':
+                pause_after = 2.0
+            elif ending_char == '?':
+                pause_after = 2.2
+            elif ending_char in ('…', '\n'):
+                pause_after = 3.0
+            else:
+                pause_after = 2.0
+
+        result.append((typing_duration, pause_after))
+
+    return result
 
 
 @dataclass(slots=True)
@@ -66,6 +170,19 @@ class TelethonExecutor:
                     pass
             else:
                 await asyncio.sleep(duration)
+
+    async def simulate_typing_with_pauses(
+        self, chat_id: int, message_text: str, skip_event: asyncio.Event | None = None
+    ) -> None:
+        """Simulate realistic typing with pauses between sentences."""
+        segments = _segment_text_for_typing(message_text)
+        entity = await self._client.get_entity(chat_id)
+
+        for typing_dur, pause_after in segments:
+            async with self._client.action(entity, "typing"):
+                await _wait_or_skip(typing_dur, skip_event)
+            if pause_after > 0:
+                await _wait_or_skip(pause_after, skip_event)
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         entity = await self._client.get_entity(chat_id)

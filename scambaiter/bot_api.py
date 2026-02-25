@@ -2238,13 +2238,11 @@ async def _run_auto_send_loop(
                     await asyncio.sleep(2.0)
                 continue
 
-            # Phase 2: Tippzeit (150 Zeichen/Min = 2.5 Zeichen/Sek)
-            TYPING_CHARS_PER_SEC = 150.0 / 60.0
-            typing_seconds = max(1.0, min(len(message_text) / TYPING_CHARS_PER_SEC, 60.0))
+            # Phase 2: Tippzeit mit Pausen zwischen Sätzen
             skip_event.clear()
             await _set_auto_send_phase(application, target_chat_id, "typing")
             try:
-                await executor.simulate_typing_for(target_chat_id, typing_seconds, skip_event)
+                await executor.simulate_typing_with_pauses(target_chat_id, message_text, skip_event)
             finally:
                 await _set_auto_send_phase(application, target_chat_id, None)
 
