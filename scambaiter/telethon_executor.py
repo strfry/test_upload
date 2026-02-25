@@ -157,20 +157,20 @@ class TelethonExecutor:
                     name = title
                 else:
                     name = ""
+                print(f"[DEBUG] Filter found: name={name!r}, looking for {folder_name!r}")
                 if name != folder_name:
                     continue
-                folder_id = int(item.id)
-                # Load all dialogs and filter by folder_id attribute
-                try:
-                    all_dialogs = await self._client.get_dialogs(limit=None)
-                    for dialog in all_dialogs:
-                        # Check if dialog belongs to this folder
-                        dialog_folder = getattr(dialog, "pinned_folder", None)
-                        if dialog_folder == folder_id:
-                            folder_chat_ids.append(int(dialog.id))
-                    _log.info("_resolve_folder_ids: found %d chats in folder %d", len(folder_chat_ids), folder_id)
-                except Exception as exc:
-                    _log.error("_resolve_folder_ids: failed to load dialogs: %s", exc)
+                # Extract chat IDs directly from include_peers in the filter
+                include_peers = getattr(item, "include_peers", None) or []
+                from telethon import utils as tl_utils
+                for peer in include_peers:
+                    try:
+                        chat_id = int(tl_utils.get_peer_id(peer))
+                        print("Adding chat", chat_id, "to list")
+                        folder_chat_ids.append(chat_id)
+                    except Exception as exc:
+                        _log.warning("_resolve_folder_ids: failed to extract peer: %s", exc)
+                _log.info("_resolve_folder_ids: found %d chats in folder from include_peers", len(folder_chat_ids))
                 break
         except Exception as exc:
             _log.error("_resolve_folder_ids: GetDialogFiltersRequest failed: %s", exc)
