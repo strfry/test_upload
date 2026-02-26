@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import threading
 
 
 ALLOWED_EVENT_TYPES = {"message", "photo", "forward", "sticker", "typing_interval"}
@@ -92,12 +93,31 @@ class MemorySummary:
     last_updated_at: str
 
 
+class _LockingConnection:
+    def __init__(self, raw_conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._conn = raw_conn
+        self._lock = lock
+
+    def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        with self._lock:
+            return self._conn.execute(*args, **kwargs)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
 class AnalysisStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
-        self._conn.row_factory = sqlite3.Row
+        raw_conn = sqlite3.connect(db_path, check_same_thread=False)
+        raw_conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        self._conn = _LockingConnection(raw_conn, self._lock)
         self._create_schema()
 
     def _create_schema(self) -> None:

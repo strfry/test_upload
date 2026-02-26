@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -217,6 +218,35 @@ class EventAndPromptFlowTest(unittest.TestCase):
             summary = state.get("summary")
             self.assertIsInstance(summary, dict)
             self.assertEqual("scambait.memory.v1", summary.get("schema"))
+
+    def test_analysis_store_threading_allows_concurrent_access(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+
+            def writer(tag: str) -> None:
+                for idx in range(2):
+                    store.ingest_event(
+                        chat_id=2120,
+                        event_type="message",
+                        role="scammer",
+                        text=f"thread-{tag}-{idx}",
+                    )
+
+            thread = threading.Thread(target=writer, args=("bg",))
+            thread.start()
+            store.ingest_event(
+                chat_id=2120,
+                event_type="message",
+                role="manual",
+                text="main-thread",
+            )
+            thread.join()
+
+            events = store.list_events(chat_id=2120, limit=10)
+            texts = {evt.text for evt in events if evt.text}
+            self.assertIn("main-thread", texts)
+            self.assertIn("thread-bg-0", texts)
 
     def test_clear_chat_history_deletes_events_for_target_chat_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
