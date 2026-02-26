@@ -52,11 +52,12 @@ async def _sync_one(
     chat_id: int,
     limit: int | None,
     skip_profile: bool,
+    config: object,
 ) -> None:
     limit_label = "unlimited" if limit is None else str(limit)
     try:
         before = store.count_events(chat_id)
-        count = await executor.fetch_history(chat_id, store, limit=limit)
+        count = await executor.fetch_history(chat_id, store, config, limit=limit)
         print(f"  {chat_id}: {count} new event(s), {before} already present")
     except Exception as exc:
         print(f"  {chat_id}: fetch_history failed — {exc}")
@@ -97,7 +98,7 @@ async def _run() -> None:
     try:
         if args.chat_id is not None:
             print(f"Syncing chat_id={args.chat_id} (limit={limit_label}) ...")
-            await _sync_one(executor, store, args.chat_id, limit, args.no_profile)
+            await _sync_one(executor, store, args.chat_id, limit, args.no_profile, config)
         else:
             print(f"Resolving folder {args.folder!r} ...")
             chat_ids = await executor._resolve_folder_ids(args.folder)
@@ -106,7 +107,7 @@ async def _run() -> None:
                 return
             print(f"Found {len(chat_ids)} chat(s). Syncing (limit={limit_label} each) ...")
             for chat_id in sorted(chat_ids):
-                await _sync_one(executor, store, chat_id, limit, args.no_profile)
+                await _sync_one(executor, store, chat_id, limit, args.no_profile, config)
         print("Done.")
     finally:
         await executor.close()

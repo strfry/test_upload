@@ -143,14 +143,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(summary_payload, ensure_ascii=False))
         return 0
 
-    payload = _build_prompt_payload_with_refresh(
-        core,
-        chat_id,
-        args.max_tokens if args.max_tokens is not None else None,
-        refresh_memory=bool(args.refresh_memory),
-    )
-    print(json.dumps(payload, ensure_ascii=False))
-    return 0
+    if args.model_view:
+        payload = _build_prompt_payload_with_refresh(
+            core,
+            chat_id,
+            args.max_tokens if args.max_tokens is not None else None,
+            refresh_memory=bool(args.refresh_memory),
+        )
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    print("No view flag specified. Use --history, --memory, or --model-view.", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
