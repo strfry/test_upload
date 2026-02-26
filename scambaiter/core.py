@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from .forward_meta import baiter_name_from_meta, scammer_name_from_meta
 from .model_client import call_hf_openai_chat, extract_reasoning_details, extract_result_text, extract_tool_calls
+
+_log = logging.getLogger(__name__)
 
 # Re-export everything from core_schema so existing ``from scambaiter.core import X`` keeps working.
 from .core_schema import (  # noqa: F401 — re-exports
@@ -48,6 +51,19 @@ class ScambaiterCore:
     def __init__(self, config: Any, store: Any) -> None:
         self.config = config
         self.store = store
+
+    @staticmethod
+    def _default_memory_summary() -> dict[str, Any]:
+        return {
+            "schema": "scambait.memory.v1",
+            "claimed_identity": {"name": "", "role_claim": "", "confidence": "low"},
+            "narrative": {"phase": "unknown", "short_story": "", "timeline_points": []},
+            "current_intent": {"scammer_intent": "", "baiter_intent": "", "latest_topic": ""},
+            "key_facts": {},
+            "risk_flags": [],
+            "open_questions": [],
+            "next_focus": [],
+        }
 
     async def start(self) -> None:  # pragma: no cover - lifecycle hook
         return
@@ -283,16 +299,7 @@ class ScambaiterCore:
         max_tokens = int(getattr(self.config, "hf_memory_max_tokens", 150000))
         if not token:
             # Offline-safe fallback when HF token is unavailable.
-            fallback_summary = {
-                "schema": "scambait.memory.v1",
-                "claimed_identity": {"name": "", "role_claim": "", "confidence": "low"},
-                "narrative": {"phase": "unknown", "short_story": "", "timeline_points": []},
-                "current_intent": {"scammer_intent": "", "baiter_intent": "", "latest_topic": ""},
-                "key_facts": {},
-                "risk_flags": [],
-                "open_questions": [],
-                "next_focus": [],
-            }
+            fallback_summary = self._default_memory_summary()
             if current is None or force_refresh or int(current.cursor_event_id) < latest_id:
                 saved = self.store.upsert_summary(
                     chat_id=chat_id,
@@ -307,16 +314,7 @@ class ScambaiterCore:
         if not events:
             if current is not None:
                 return {"summary": current.summary, "cursor_event_id": current.cursor_event_id, "updated": False}
-            empty_summary = {
-                "schema": "scambait.memory.v1",
-                "claimed_identity": {"name": "", "role_claim": "", "confidence": "low"},
-                "narrative": {"phase": "empty", "short_story": "", "timeline_points": []},
-                "current_intent": {"scammer_intent": "", "baiter_intent": "", "latest_topic": ""},
-                "key_facts": {},
-                "risk_flags": [],
-                "open_questions": [],
-                "next_focus": [],
-            }
+            empty_summary = self._default_memory_summary()
             saved = self.store.upsert_summary(
                 chat_id=chat_id,
                 summary=empty_summary,
@@ -325,24 +323,42 @@ class ScambaiterCore:
             )
             return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
 
+        latest_cursor = int(events[-1]["event_id"])
         messages = self._build_memory_messages(
             chat_id=chat_id,
             cursor_event_id=cursor,
             existing_memory=existing_summary,
             events=events,
         )
-        response = call_hf_openai_chat(
-            token=token,
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            base_url=(getattr(self.config, "hf_base_url", None) or None),
-        )
-        result_text = extract_result_text(response)
-        parsed = self._parse_memory_summary_output(result_text)
-        if parsed is None:
-            raise RuntimeError("invalid memory summary contract (expected scambait.memory.v1)")
-        latest_cursor = int(events[-1]["event_id"])
+        try:
+            response = call_hf_openai_chat(
+                token=token,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                base_url=(getattr(self.config, "hf_base_url", None) or None),
+            )
+            result_text = extract_result_text(response)
+            parsed = self._parse_memory_summary_output(result_text)
+            if parsed is None:
+                raise RuntimeError("invalid memory summary contract (expected scambait.memory.v1)")
+        except Exception as exc:
+            _log.warning(
+                "ensure_memory_context: memory summary failed for chat_id=%d model=%s: %s",
+                chat_id,
+                model,
+                exc,
+            )
+            if current is not None:
+                return {"summary": current.summary, "cursor_event_id": current.cursor_event_id, "updated": False}
+            fallback_summary = self._default_memory_summary()
+            saved = self.store.upsert_summary(
+                chat_id=chat_id,
+                summary=fallback_summary,
+                cursor_event_id=latest_cursor,
+                model=model,
+            )
+            return {"summary": saved.summary, "cursor_event_id": saved.cursor_event_id, "updated": True}
         saved = self.store.upsert_summary(
             chat_id=chat_id,
             summary=parsed,

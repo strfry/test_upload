@@ -180,6 +180,44 @@ class EventAndPromptFlowTest(unittest.TestCase):
             self.assertEqual(2, int(state.get("cursor_event_id") or 0))
             self.assertTrue(bool(state.get("updated")))
 
+    def test_ensure_memory_context_falls_back_when_summary_call_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.ingest_event(chat_id=2100, event_type="message", role="scammer", text="first")
+            saved = store.upsert_summary(
+                chat_id=2100,
+                summary={"schema": "scambait.memory.v1", "current_intent": {"latest_topic": "first"}},
+                cursor_event_id=1,
+                model="openai/gpt-oss-120b",
+            )
+            store.ingest_event(chat_id=2100, event_type="message", role="manual", text="second")
+            config = SimpleNamespace(hf_token="token", hf_memory_model="openai/gpt-oss-120b", hf_memory_max_tokens=150000)
+            core = ScambaiterCore(config=config, store=store)
+
+            with patch("scambaiter.core.call_hf_openai_chat", side_effect=RuntimeError("overloaded")):
+                state = core.ensure_memory_context(chat_id=2100, force_refresh=False)
+
+            self.assertFalse(bool(state.get("updated")))
+            self.assertEqual(saved.cursor_event_id, state.get("cursor_event_id"))
+            self.assertEqual(saved.summary, state.get("summary"))
+
+    def test_ensure_memory_context_falls_back_to_empty_summary_when_none_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "analysis.sqlite3"
+            store = AnalysisStore(str(db_path))
+            store.ingest_event(chat_id=2110, event_type="message", role="scammer", text="alpha")
+            config = SimpleNamespace(hf_token="token", hf_memory_model="openai/gpt-oss-120b", hf_memory_max_tokens=150000)
+            core = ScambaiterCore(config=config, store=store)
+
+            with patch("scambaiter.core.call_hf_openai_chat", side_effect=RuntimeError("overloaded")):
+                state = core.ensure_memory_context(chat_id=2110, force_refresh=False)
+
+            self.assertTrue(bool(state.get("updated")))
+            summary = state.get("summary")
+            self.assertIsInstance(summary, dict)
+            self.assertEqual("scambait.memory.v1", summary.get("schema"))
+
     def test_clear_chat_history_deletes_events_for_target_chat_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
