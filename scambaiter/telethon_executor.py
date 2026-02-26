@@ -9,7 +9,18 @@ from typing import Any
 
 from telethon import TelegramClient
 
+from .model_client import call_hf_vision
+
 _log = logging.getLogger(__name__)
+
+_VISION_PROMPT = (
+    "Describe this image/document in full detail:\n"
+    "1. Document type (passport, ID card, bank statement, certificate, personal photo, etc.)\n"
+    "2. All readable text (complete OCR): names, numbers, addresses, dates, IDs, account numbers\n"
+    "3. All facts the document is meant to prove or establish\n"
+    "4. Visual assessment: does it look authentic? Any visible signs of editing or fakery?\n"
+    "Be as thorough and specific as possible."
+)
 
 
 async def _wait_or_skip(duration: float, skip_event: asyncio.Event | None) -> None:
@@ -184,6 +195,40 @@ class TelethonExecutor:
             if pause_after > 0:
                 await _wait_or_skip(pause_after, skip_event)
 
+    async def describe_photo(self, config: Any, media: Any) -> str | None:
+        """Download and describe a photo using a vision model.
+
+        Args:
+            config: Config object with hf_vision_model, hf_token, hf_base_url
+            media: Telethon media object (msg.photo, msg.document, etc.)
+
+        Returns:
+            Vision model's description of the image, or None if disabled/failed.
+        """
+        vision_model = getattr(config, "hf_vision_model", None)
+        if not vision_model:
+            return None
+        try:
+            img_bytes: bytes = await self._client.download_media(media, bytes)
+            token = (getattr(config, "hf_token", None) or "").strip()
+            base_url = getattr(config, "hf_base_url", None)
+            loop = asyncio.get_event_loop()
+            description = await loop.run_in_executor(
+                None,
+                lambda: call_hf_vision(
+                    token=token,
+                    model=vision_model,
+                    image_bytes=img_bytes,
+                    prompt=_VISION_PROMPT,
+                    base_url=base_url,
+                    max_tokens=800,
+                ),
+            )
+            return description
+        except Exception as exc:
+            _log.warning("describe_photo failed: %s", exc)
+            return None
+
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         entity = await self._client.get_entity(chat_id)
         await self._client.delete_messages(entity, message_ids=[message_id])
@@ -330,6 +375,7 @@ class TelethonExecutor:
         self,
         store: Any,
         service: Any,
+        config: Any,
         folder_name: str = "Scammers",
     ) -> None:
         """Register Live Mode event handlers for auto-receive and typing monitoring.
@@ -366,18 +412,22 @@ class TelethonExecutor:
             if getattr(msg, "sticker", None):
                 event_type = "sticker"
                 text: str | None = None
+                description: str | None = None
             elif getattr(msg, "photo", None):
                 event_type = "photo"
                 text = msg.message or None
+                description = await self.describe_photo(config, msg.photo)
             else:
                 event_type = "message"
                 text = msg.message or None
+                description = None
             try:
                 store.ingest_event(
                     chat_id=chat_id,
                     event_type=event_type,
                     role="scammer",
                     text=text,
+                    description=description,
                     ts_utc=ts,
                     source_message_id=str(msg.id),
                 )
@@ -412,6 +462,7 @@ class TelethonExecutor:
     async def startup_backfill(
         self,
         store: Any,
+        config: Any,
         folder_name: str = "Scammers",
         history_limit: int = 200,
     ) -> None:
@@ -431,7 +482,7 @@ class TelethonExecutor:
         _log.info("startup_backfill: backfilling %d chats", len(folder_ids))
         for chat_id in folder_ids:
             try:
-                count = await self.fetch_history(chat_id, store, limit=history_limit)
+                count = await self.fetch_history(chat_id, store, config, limit=history_limit)
                 _log.info("startup_backfill: chat %d — %d new events", chat_id, count)
             except Exception as exc:
                 _log.warning("startup_backfill: fetch_history failed for %d: %s", chat_id, exc)
@@ -476,11 +527,12 @@ class TelethonExecutor:
         if patch:
             store.upsert_chat_profile(chat_id=chat_id, patch=patch, source="telethon")
 
-    async def fetch_history(self, chat_id: int, store: Any, limit: int | None = 200) -> int:
+    async def fetch_history(self, chat_id: int, store: Any, config: Any, limit: int | None = 200) -> int:
         """Fetch the most recent messages from a Telegram chat and ingest into the store.
 
         Uses msg.out to determine role: outgoing → "scambaiter", incoming → "scammer".
         Deduplication is handled by the store's unique index on (chat_id, source_message_id).
+        For photo events, calls vision model to describe images (backfill or initial).
         Returns the count of newly ingested events.
         """
         entity = await self._client.get_entity(chat_id)
@@ -491,16 +543,30 @@ class TelethonExecutor:
             messages.append(msg)
         # Reverse to insert oldest first (so IDs increase chronologically)
         for msg in reversed(messages):
+            source_message_id = str(msg.id)
             role = "scambaiter" if msg.out else "scammer"
             if getattr(msg, "sticker", None):
                 event_type = "sticker"
                 text = None
+                description = None
             elif getattr(msg, "photo", None):
                 event_type = "photo"
                 text = msg.message or None
+                # Try to look up existing event first (for backfill)
+                existing = store._get_event_by_source(chat_id, source_message_id)
+                if existing is not None:
+                    # Event already in DB — backfill description if missing
+                    if existing.description is None:
+                        desc = await self.describe_photo(config, msg.photo)
+                        if desc is not None:
+                            store.update_event_description(existing.id, desc)
+                            store.reset_summary_cursor_if_before(chat_id, existing.id)
+                    continue  # no new insert needed
+                description = await self.describe_photo(config, msg.photo)
             else:
                 event_type = "message"
                 text = msg.message or None
+                description = None
             ts = (
                 msg.date.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
                 if msg.date else None
@@ -511,8 +577,9 @@ class TelethonExecutor:
                     event_type=event_type,
                     role=role,
                     text=text,
+                    description=description,
                     ts_utc=ts,
-                    source_message_id=str(msg.id),
+                    source_message_id=source_message_id,
                 )
                 count += 1
             except Exception:

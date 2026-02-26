@@ -15,6 +15,7 @@ class Config:
     hf_base_url: str | None = None
     hf_memory_model: str | None = None
     hf_memory_max_tokens: int = 150000
+    hf_vision_model: str | None = None
     telethon_api_id: int | None = None
     telethon_api_hash: str | None = None
     telethon_session: str = "scambaiter.session"
@@ -37,6 +38,7 @@ def load_config() -> Config:
         hf_base_url=os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1"),
         hf_memory_model=os.getenv("HF_MEMORY_MODEL", "openai/gpt-oss-120b"),
         hf_memory_max_tokens=int(os.getenv("HF_MEMORY_MAX_TOKENS", "150000")),
+        hf_vision_model=os.getenv("HF_VISION_MODEL"),
         telethon_api_id=int(api_id_raw) if api_id_raw else None,
         telethon_api_hash=os.getenv("TELETHON_API_HASH"),
         telethon_session=os.getenv("TELETHON_SESSION", "scambaiter.session"),

@@ -42,6 +42,7 @@ class EventRecord:
     event_type: str
     role: str
     text: str | None
+    description: str | None
     ts_utc: str | None
     source_message_id: str | None
     meta: dict[str, Any]
@@ -155,6 +156,7 @@ class AnalysisStore:
                 event_type TEXT NOT NULL,
                 role TEXT NOT NULL,
                 text TEXT,
+                description TEXT,
                 ts_utc TEXT,
                 source_message_id TEXT,
                 meta_json TEXT NOT NULL
@@ -244,6 +246,7 @@ class AnalysisStore:
         )
         self._ensure_analyses_columns()
         self._ensure_generation_attempt_columns()
+        self._ensure_events_columns()
         # Legacy cleanup: older builds embedded source labels in profile_update text.
         # Normalize persisted rows so views stay clean without data loss.
         self._conn.execute(
@@ -373,6 +376,7 @@ class AnalysisStore:
         event_type: str,
         role: str,
         text: str | None = None,
+        description: str | None = None,
         ts_utc: str | None = None,
         source_message_id: str | None = None,
         meta: dict[str, Any] | None = None,
@@ -385,10 +389,10 @@ class AnalysisStore:
         payload = json.dumps(meta or {}, ensure_ascii=True)
         cur = self._conn.execute(
             """
-            INSERT INTO events(chat_id, event_type, role, text, ts_utc, source_message_id, meta_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events(chat_id, event_type, role, text, description, ts_utc, source_message_id, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (chat_id, event_type, role, text, timestamp, source_message_id, payload),
+            (chat_id, event_type, role, text, description, timestamp, source_message_id, payload),
         )
         self._conn.commit()
         return EventRecord(
@@ -397,6 +401,7 @@ class AnalysisStore:
             event_type=event_type,
             role=role,
             text=text,
+            description=description,
             ts_utc=timestamp,
             source_message_id=source_message_id,
             meta=meta or {},
@@ -413,7 +418,7 @@ class AnalysisStore:
         meta: dict[str, Any] | None = None,
     ) -> EventRecord:
         row = self._conn.execute(
-            "SELECT id, chat_id, event_type, role, text, ts_utc, source_message_id, meta_json FROM events WHERE chat_id = ? AND source_message_id = ?",
+            "SELECT id, chat_id, event_type, role, text, description, ts_utc, source_message_id, meta_json FROM events WHERE chat_id = ? AND source_message_id = ?",
             (chat_id, source_message_id),
         ).fetchone()
         if row:
@@ -423,6 +428,7 @@ class AnalysisStore:
                 event_type=str(row["event_type"]),
                 role=str(row["role"]),
                 text=row["text"],
+                description=row["description"],
                 ts_utc=row["ts_utc"],
                 source_message_id=row["source_message_id"],
                 meta=self._loads_dict(row["meta_json"]),
@@ -433,6 +439,7 @@ class AnalysisStore:
             event_type=event_type,
             role=role,
             text=text,
+            description=None,
             ts_utc=ts_utc,
             source_message_id=source_message_id,
             meta=meta,
@@ -441,7 +448,7 @@ class AnalysisStore:
     def list_events(self, chat_id: int, limit: int = 500) -> list[EventRecord]:
         rows = self._conn.execute(
             """
-            SELECT id, chat_id, event_type, role, text, ts_utc, source_message_id, meta_json
+            SELECT id, chat_id, event_type, role, text, description, ts_utc, source_message_id, meta_json
             FROM events
             WHERE chat_id = ?
             ORDER BY ts_utc ASC
@@ -456,6 +463,7 @@ class AnalysisStore:
                 event_type=str(row["event_type"]),
                 role=str(row["role"]),
                 text=row["text"],
+                description=row["description"],
                 ts_utc=row["ts_utc"],
                 source_message_id=row["source_message_id"],
                 meta=self._loads_dict(row["meta_json"]),
@@ -529,6 +537,48 @@ class AnalysisStore:
         )
         self._conn.commit()
         return int(cur.rowcount) if cur.rowcount and cur.rowcount > 0 else 0
+
+    def update_event_description(self, event_id: int, description: str) -> None:
+        """Update the description field of an existing event."""
+        self._conn.execute(
+            "UPDATE events SET description = ? WHERE id = ?", (description, event_id)
+        )
+        self._conn.commit()
+
+    def reset_summary_cursor_if_before(self, chat_id: int, event_id: int) -> None:
+        """Reset memory summary cursor if it's >= event_id, so the next update reprocesses this event."""
+        summary = self.get_summary(chat_id)
+        if summary and summary.cursor_event_id >= event_id:
+            new_cursor = max(0, event_id - 1)
+            self._conn.execute(
+                "UPDATE summaries SET cursor_event_id = ? WHERE chat_id = ?",
+                (new_cursor, chat_id),
+            )
+            self._conn.commit()
+
+    def _get_event_by_source(self, chat_id: int, source_message_id: str) -> EventRecord | None:
+        """Lookup an event by chat_id and source_message_id for backfill deduplication."""
+        row = self._conn.execute(
+            """
+            SELECT id, chat_id, event_type, role, text, description, ts_utc, source_message_id, meta_json
+            FROM events
+            WHERE chat_id = ? AND source_message_id = ?
+            """,
+            (chat_id, source_message_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return EventRecord(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            event_type=str(row["event_type"]),
+            role=str(row["role"]),
+            text=row["text"],
+            description=row["description"],
+            ts_utc=row["ts_utc"],
+            source_message_id=row["source_message_id"],
+            meta=self._loads_dict(row["meta_json"]),
+        )
 
     def clear_chat_context(self, chat_id: int) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -808,6 +858,12 @@ class AnalysisStore:
             self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0")
         if "reject_reason" not in columns:
             self._conn.execute("ALTER TABLE generation_attempts ADD COLUMN reject_reason TEXT")
+
+    def _ensure_events_columns(self) -> None:
+        rows = self._conn.execute("PRAGMA table_info(events)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "description" not in columns:
+            self._conn.execute("ALTER TABLE events ADD COLUMN description TEXT")
 
     def next_attempt_no(self, chat_id: int) -> int:
         row = self._conn.execute(

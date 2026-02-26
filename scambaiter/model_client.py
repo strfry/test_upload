@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -129,3 +130,72 @@ def extract_reasoning_details(response_json: dict[str, Any]) -> tuple[int, str]:
     if snippet and len(snippet) > 1000:
         snippet = snippet[: 997] + "..."
     return cycles, snippet
+
+
+def call_hf_vision(
+    *,
+    token: str,
+    model: str,
+    image_bytes: bytes,
+    prompt: str,
+    base_url: str | None = None,
+    max_tokens: int = 800,
+    timeout_seconds: float = 60.0,
+) -> str:
+    """Call a vision/multimodal model to describe an image.
+
+    Args:
+        token: HuggingFace API token
+        model: Model identifier (e.g., "Qwen/Qwen2-VL-7B-Instruct")
+        image_bytes: Raw image data
+        prompt: Text prompt describing what to extract from the image
+        base_url: Optional custom base URL (defaults to HuggingFace router)
+        max_tokens: Max tokens in response
+        timeout_seconds: Request timeout
+
+    Returns:
+        The vision model's description of the image as a string.
+
+    Raises:
+        RuntimeError: If openai package is missing or API call fails.
+    """
+    try:
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - dependency edge
+        raise RuntimeError("openai package missing. Install with: pip install openai") from exc
+
+    client = OpenAI(
+        api_key=token,
+        base_url=(base_url or "https://router.huggingface.co/v1").rstrip("/"),
+        timeout=timeout_seconds,
+    )
+
+    # Encode image to base64 for inline embedding
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    # Build multimodal message with image + text
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+    except Exception as exc:  # pragma: no cover - network/provider edge
+        raise RuntimeError(str(exc)) from exc
+
+    # Extract and return the response text directly
+    if response.choices and len(response.choices) > 0:
+        choice = response.choices[0]
+        if hasattr(choice, "message") and hasattr(choice.message, "content"):
+            return str(choice.message.content).strip()
+    return ""

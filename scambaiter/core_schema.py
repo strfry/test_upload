@@ -55,6 +55,9 @@ Rules:
 - JSON only, no markdown or prose outside JSON.
 - Keep key_facts concise and evidence-based.
 - Use empty arrays/objects if information is missing.
+- For photo/document events: if `image_description` is present, extract all factual claims
+  (names, dates, IDs, document type) into key_facts. Treat these as scammer-provided
+  "evidence" — note what they claim, not what is true. Flag suspicious content.
 """
 
 TIMING_PROMPT_RULES = """## TIMING INPUT

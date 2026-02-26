@@ -48,10 +48,11 @@ async def _run() -> None:
         await telethon_executor.start_listener(
             store=store,
             service=service,
+            config=config,
             folder_name=folder_name,
         )
         try:
-            await telethon_executor.startup_backfill(store=store, folder_name=folder_name)
+            await telethon_executor.startup_backfill(store=store, config=config, folder_name=folder_name)
         except Exception as exc:
             raise RuntimeError(f"startup_backfill failed: {exc}") from exc
     register_command_menu = app.bot_data.get("register_command_menu")

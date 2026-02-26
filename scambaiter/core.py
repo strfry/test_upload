@@ -108,6 +108,7 @@ class ScambaiterCore:
                     "event_type": event.event_type,
                     "role": event.role,
                     "text": event.text,
+                    "description": getattr(event, "description", None),
                     "time": self._as_hhmm(event.ts_utc),
                     "meta": event.meta,
                 }
@@ -221,6 +222,7 @@ class ScambaiterCore:
                 text_value = getattr(event, "text", None)
                 if isinstance(text_value, str) and text_value.strip():
                     caption = text_value.strip()
+            image_description = getattr(event, "description", None)
             out.append(
                 {
                     "event_id": event_id,
@@ -232,6 +234,7 @@ class ScambaiterCore:
                     "caption": caption,
                     "citation": meta.get("citation"),
                     "media_type": media_type,
+                    "image_description": image_description,
                 }
             )
         return out
