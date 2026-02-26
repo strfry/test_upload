@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import asyncio
+import logging
 import os
 
 from scambaiter.bot_api import create_bot_app
@@ -71,6 +73,21 @@ async def _run() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the Scambaiter control bot.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+        )
+
     asyncio.run(_run())
 
 
