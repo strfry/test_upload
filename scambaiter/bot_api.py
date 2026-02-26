@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 from typing import Any
 
 from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
@@ -11,6 +12,8 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 from scambaiter.core import parse_structured_model_output
 from scambaiter.forward_meta import baiter_name_from_meta, scammer_name_from_meta
+
+_log = logging.getLogger(__name__)
 
 # Re-export state accessors so existing ``from scambaiter.bot_api import _X`` keeps working.
 from scambaiter.bot_state import (  # noqa: F401 — re-exports
@@ -900,7 +903,9 @@ async def _run_send_task(
     if executor is None:
         return
 
-    message_text = str((parsed_output.get("message") or {}).get("text") or "").strip()
+    message_text = _extract_action_message_text(parsed_output)
+    if not message_text:
+        message_text = str((parsed_output.get("message") or {}).get("text") or "").strip()
     report = await executor.execute_actions(chat_id=chat_id, parsed_output=parsed_output)
 
     # Nachricht in History speichern wenn erfolgreich
@@ -2143,12 +2148,34 @@ async def _run_auto_send_loop(
     result_card_msg: Any = None
     result_card_msg_id: int | None = None
 
-    # Phase 0: Eingehende Nachricht als gelesen markieren
-    try:
-        await executor.mark_read(target_chat_id)
-    except Exception as exc:
-        _log = __import__("logging").getLogger(__name__)
-        _log.debug("_run_auto_send_loop: mark_read fehlgeschlagen für %d: %s", target_chat_id, exc)
+    async def _render_auto_send_error_card(card_state: dict[str, Any]) -> None:
+        nonlocal result_card_msg, result_card_msg_id
+        card_state = {**card_state, "active_section": card_state.get("active_section") or "error"}
+        card_text = _render_result_card_text(card_state, section="error")
+        has_raw = bool(card_state.get("response_json"))
+        card_markup = _result_card_keyboard(
+            chat_id=target_chat_id,
+            active_section=card_state["active_section"],
+            status=card_state.get("status") or "error",
+            telethon_enabled=True,
+            retry_enabled=False,
+            has_raw=has_raw,
+        )
+        if result_card_msg is None:
+            result_card_msg = await application.bot.send_message(
+                chat_id=control_chat_id, text=card_text, reply_markup=card_markup
+            )
+            result_card_msg_id = int(result_card_msg.message_id)
+        else:
+            try:
+                await result_card_msg.edit_text(card_text, reply_markup=card_markup)
+            except Exception:
+                pass
+        target_message_id = result_card_msg_id if result_card_msg_id is not None else (
+            int(result_card_msg.message_id) if result_card_msg is not None else None
+        )
+        if target_message_id is not None:
+            _set_reply_card_state(application, target_message_id, **card_state)
 
     # Phase 1: Lesezeit (200 Zeichen/Min = 3.33 Zeichen/Sek)
     incoming_text = getattr(events[-1], "text", None) or ""
@@ -2164,9 +2191,14 @@ async def _run_auto_send_loop(
         await _skippable_sleep(read_seconds, skip_event)
     finally:
         await _set_auto_send_phase(application, target_chat_id, None)
+    try:
+        await executor.mark_read(target_chat_id)
+    except Exception as exc:
+        _log.debug("_run_auto_send_loop: mark_read fehlgeschlagen für %d: %s", target_chat_id, exc)
 
     for attempt_no in range(1, max_retries + 1):
         try:
+            dry_run_result = None
             # -- Generierungsphase --
             await _set_auto_send_phase(application, target_chat_id, "generating", attempt_no=attempt_no)
             loop = asyncio.get_event_loop()
@@ -2181,8 +2213,6 @@ async def _run_auto_send_loop(
 
             if status != "ok":
                 await _set_auto_send_phase(application, target_chat_id, None)
-                # Fehler-Card anzeigen oder aktualisieren
-                run_id = _next_reply_run_id(application)
                 card_state = {
                     "chat_id": target_chat_id,
                     "provider": str(dry_run_result.get("provider") or "unknown"),
@@ -2190,7 +2220,7 @@ async def _run_auto_send_loop(
                     "parsed_output": parsed_output if isinstance(parsed_output, dict) else None,
                     "result_text": str(dry_run_result.get("result_text") or ""),
                     "retry_context": None,
-                    "run_id": run_id,
+                    "run_id": _next_reply_run_id(application),
                     "status": status,
                     "outcome_class": outcome_class or "unknown",
                     "error_message": f"Auto-Send Versuch {attempt_no}/{max_retries}: {error_message or 'Generierung fehlgeschlagen'}",
@@ -2200,27 +2230,7 @@ async def _run_auto_send_loop(
                     "pivot": dry_run_result.get("pivot") if isinstance(dry_run_result.get("pivot"), dict) else None,
                     "active_section": "error",
                 }
-                card_text = _render_result_card_text(card_state, section="error")
-                has_raw = bool(card_state["response_json"])
-                card_markup = _result_card_keyboard(
-                    chat_id=target_chat_id,
-                    active_section="error",
-                    status=status,
-                    telethon_enabled=True,
-                    retry_enabled=False,
-                    has_raw=has_raw,
-                )
-                if result_card_msg is None:
-                    result_card_msg = await application.bot.send_message(
-                        chat_id=control_chat_id, text=card_text, reply_markup=card_markup
-                    )
-                    result_card_msg_id = int(result_card_msg.message_id)
-                    _set_reply_card_state(application, result_card_msg_id, **card_state)
-                else:
-                    try:
-                        await result_card_msg.edit_text(card_text, reply_markup=card_markup)
-                    except Exception:
-                        pass
+                await _render_auto_send_error_card(card_state)
                 if attempt_no < max_retries:
                     await asyncio.sleep(2.0)
                 continue
@@ -2321,7 +2331,26 @@ async def _run_auto_send_loop(
         except asyncio.CancelledError:
             raise  # immer re-raisen!
 
-        except Exception:
+        except Exception as exc:
+            await _set_auto_send_phase(application, target_chat_id, None)
+            line_state = {
+                "chat_id": target_chat_id,
+                "provider": "unknown",
+                "model": "unknown",
+                "parsed_output": None,
+                "result_text": "",
+                "retry_context": None,
+                "run_id": _next_reply_run_id(application),
+                "status": "error",
+                "outcome_class": "exception",
+                "error_message": f"Auto-Send Versuch {attempt_no}/{max_retries}: {exc}",
+                "contract_issues": [],
+                "response_json": {},
+                "conflict": None,
+                "pivot": None,
+                "active_section": "error",
+            }
+            await _render_auto_send_error_card(line_state)
             if attempt_no < max_retries:
                 await asyncio.sleep(2.0)
 

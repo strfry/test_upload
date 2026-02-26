@@ -358,9 +358,17 @@ def _render_messages_chat_window(
 ) -> list[str]:
     def _role_name(raw_role: str) -> str:
         role = raw_role.strip().lower()
-        if role in ("assistant", "scammer", "scambaiter"):
+        if role == "assistant":
             return "A"
-        return "U"
+        if role == "scambaiter":
+            return "B"
+        if role == "scammer":
+            return "S"
+        if role == "system":
+            return "S"
+        if role == "user":
+            return "U"
+        return role[:1].upper() if role else "U"
 
     def _clean_and_truncate(text: str) -> str:
         compact = " ".join(text.split())

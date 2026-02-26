@@ -659,7 +659,7 @@ class BotApiForwardIngestTest(unittest.TestCase):
             memory=None,
         )
         self.assertIn("```", text)
-        self.assertIn("14:05 A: [sticker]", text)
+        self.assertIn("14:05 S: [sticker]", text)
 
     def test_render_prompt_section_text_messages_limits_to_twenty_items(self) -> None:
         model_messages: list[dict[str, str]] = []
