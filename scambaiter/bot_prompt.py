@@ -12,8 +12,9 @@ from scambaiter.bot_state import _prompt_card_contexts
 
 
 PROMPT_SECTION_LABELS: dict[str, str] = {
+    "overview": "overview",
     "messages": "messages",
-    "memory": "memory",
+    "summary": "summary",
     "system": "system",
 }
 
@@ -89,7 +90,7 @@ def _matches_prompt_card_context(application: Application, message_id: int, chat
 
 def _prompt_keyboard(
     chat_id: int,
-    active_section: str = "messages",
+    active_section: str = "overview",
 ) -> InlineKeyboardMarkup:
     def _btn(code: str) -> InlineKeyboardButton:
         label = PROMPT_SECTION_LABELS.get(code, code)
@@ -99,7 +100,8 @@ def _prompt_keyboard(
 
     return InlineKeyboardMarkup(
         [
-            [_btn("messages"), _btn("memory"), _btn("system")],
+            [_btn("overview"), _btn("messages"), _btn("summary")],
+            [_btn("system")],
             [
                 InlineKeyboardButton("Dry Run", callback_data=f"sc:dryrun:{chat_id}"),
                 InlineKeyboardButton("Close", callback_data=f"sc:prompt_close:{chat_id}"),
@@ -183,7 +185,7 @@ def _normalize_memory_payload(memory: Any) -> tuple[dict[str, Any], dict[str, An
 def _render_memory_compact(summary: dict[str, Any], meta: dict[str, Any], *, chat_id: int, events_in_prompt: int) -> str:
     state = str(meta.get("state") or "missing")
     lines = [
-        "Model Input Section: memory",
+        "Model Input Section: summary",
         f"chat_id: /{chat_id}",
         f"events_in_prompt: {events_in_prompt}",
         f"state: {state}",
@@ -389,6 +391,98 @@ def _render_messages_chat_window(
     return lines
 
 
+def _clean_overview_text(raw: Any | None, max_len: int = 200) -> str:
+    if raw is None:
+        return ""
+    text = " ".join(str(raw).split())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def _overview_memory_counts(summary: dict[str, Any]) -> dict[str, int]:
+    def _dict_count(key: str) -> int:
+        value = summary.get(key)
+        if isinstance(value, dict):
+            return len(value)
+        return 0
+
+    def _list_count(key: str) -> int:
+        value = summary.get(key)
+        if isinstance(value, list):
+            return len(value)
+        return 0
+
+    return {
+        "key_facts": _dict_count("key_facts"),
+        "risk_flags": _list_count("risk_flags"),
+        "open_questions": _list_count("open_questions"),
+        "next_focus": _list_count("next_focus"),
+    }
+
+
+def _render_overview_section(
+    *,
+    chat_id: int,
+    prompt_events: list[dict[str, Any]],
+    memory: dict[str, Any] | None,
+    latest_raw: str,
+    latest_status: str | None,
+    total_event_count: int | None,
+) -> str:
+    total_events = len(prompt_events)
+    trimmed = None
+    if total_event_count is not None:
+        trimmed = max(0, total_event_count - total_events)
+    char_count = sum(len(str(event.get("text") or "")) for event in prompt_events)
+    memory_summary, memory_meta = _normalize_memory_payload(memory)
+    memory_state = str(memory_meta.get("state") or "missing")
+    memory_counts = _overview_memory_counts(memory_summary)
+    current_intent = memory_summary.get("current_intent")
+    latest_topic = ""
+    if isinstance(current_intent, dict):
+        candidate = current_intent.get("latest_topic")
+        if isinstance(candidate, str) and candidate.strip():
+            latest_topic = candidate.strip()
+    last_event_line = ""
+    if prompt_events:
+        last = prompt_events[-1]
+        last_time = str(last.get("time") or "--:--")
+        last_role = str(last.get("role") or "unknown")
+        last_text = _clean_overview_text(last.get("text"))
+        if not last_text:
+            last_text = _placeholder_for_event_type(str(last.get("event_type") or "message"))
+        last_event_line = f"{last_time} {last_role}: {last_text}"
+    preview_raw = latest_raw.strip()
+    preview = _clean_overview_text(preview_raw, max_len=400)
+    lines = [
+        "Prompt overview",
+        f"chat_id: /{chat_id}",
+        f"events_in_prompt: {total_events}",
+        f"chars_in_prompt: {char_count}",
+    ]
+    if total_event_count is not None:
+        lines.append(f"total_events: {total_event_count}")
+        lines.append(f"events_trimmed: {trimmed}")
+    if last_event_line:
+        lines.append(f"last_event: {last_event_line}")
+
+    lines.append(f"memory_state: {memory_state}")
+    lines.append(f"memory_key_facts: {memory_counts['key_facts']}")
+    lines.append(f"memory_risk_flags: {memory_counts['risk_flags']}")
+    lines.append(f"memory_open_questions: {memory_counts['open_questions']}")
+    lines.append(f"memory_next_focus: {memory_counts['next_focus']}")
+    if latest_topic:
+        lines.append(f"current_topic: {latest_topic}")
+    if latest_status:
+        lines.append(f"latest_attempt_status: {latest_status}")
+    if preview:
+        lines.append("latest_attempt_preview:")
+        lines.append(preview)
+    lines.append("---")
+    return _trim_block("\n".join(lines))
+
+
 def _render_prompt_section_text(
     *,
     chat_id: int,
@@ -400,8 +494,19 @@ def _render_prompt_section_text(
     latest_status: str | None,
     section: str,
     memory: dict[str, Any] | None = None,
+    total_event_count: int | None = None,
 ) -> str:
-    if section == "messages":
+    normalized_section = "summary" if section == "memory" else section
+    if normalized_section == "overview":
+        return _render_overview_section(
+            chat_id=chat_id,
+            prompt_events=prompt_events,
+            memory=memory,
+            latest_raw=latest_raw,
+            latest_status=latest_status,
+            total_event_count=total_event_count,
+        )
+    if normalized_section == "messages":
         recent_messages = _extract_recent_messages(model_messages)
         message_lines = _render_messages_chat_window(recent_messages, max_items=20, max_chars=160)
         memory_summary, memory_meta = _normalize_memory_payload(memory)

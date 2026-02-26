@@ -11,6 +11,7 @@ import asyncio
 from unittest.mock import patch
 
 from scambaiter.bot_api import (
+    _analysis_lines_for_card,
     _build_forward_payload,
     _chat_button_label,
     _delete_control_message,
@@ -46,7 +47,7 @@ from scambaiter.bot_api import (
     ingest_forwarded_message,
 )
 from scambaiter.forward_meta import baiter_name_from_meta, scammer_name_from_meta
-from scambaiter.storage import AnalysisStore
+from scambaiter.storage import AnalysisStore, StoredAnalysis
 
 
 class _FakeMessage:
@@ -494,6 +495,23 @@ class BotApiForwardIngestTest(unittest.TestCase):
         self.assertIn("chat_id: /12345", text)
         self.assertIn("events: 7", text)
 
+    def test_analysis_lines_for_card_show_reason_and_notes(self) -> None:
+        analysis = StoredAnalysis(
+            id=1,
+            chat_id=12345,
+            title="Team Call",
+            suggestion="respond soon",
+            analysis={"reason": "needs operator input", "notes": ["note one", "note two"]},
+            actions=[],
+            metadata={},
+            created_at="2026-02-25T12:00:00Z",
+        )
+        lines = _analysis_lines_for_card(analysis)
+        self.assertIn("Latest analysis:", lines)
+        self.assertIn("reason: needs operator input", lines)
+        self.assertIn("notes:", lines)
+        self.assertIn("- note one", lines)
+
     def test_chat_button_label_prefers_display_name_and_username(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "analysis.sqlite3"
@@ -629,6 +647,7 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_status=None,
             section="messages",
             memory={"current_intent": {"latest_topic": "topic"}, "key_facts": {"fact": "value"}},
+            total_event_count=len(prompt_events),
         )
         self.assertIn("Model Input Section: messages", text)
         self.assertIn("recent_messages_count: 2", text)
@@ -657,9 +676,43 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_status=None,
             section="messages",
             memory=None,
+            total_event_count=len(prompt_events),
         )
         self.assertIn("```", text)
         self.assertIn("14:05 S: [sticker]", text)
+
+    def test_render_prompt_section_overview_shows_totals_and_preview(self) -> None:
+        prompt_events = [
+            {"time": "01:00", "role": "manual", "text": "user text"},
+            {"time": "01:02", "role": "scammer", "text": "scammer reply"},
+        ]
+        memory = {
+            "current_intent": {"latest_topic": "wallet"},
+            "key_facts": {"a": "b"},
+            "risk_flags": ["guaranteed"],
+            "open_questions": ["which wallet"],
+            "next_focus": ["ask tx"],
+        }
+        text = _render_prompt_section_text(
+            chat_id=321,
+            prompt_events=prompt_events,
+            model_messages=[],
+            latest_payload=None,
+            latest_raw='{"message":{"text":"preview text"}}',
+            latest_attempt_id=None,
+            latest_status="ok",
+            section="overview",
+            memory=memory,
+            total_event_count=5,
+        )
+        self.assertIn("Prompt overview", text)
+        self.assertIn("events_trimmed: 3", text)
+        self.assertIn("memory_state: ok", text)
+        self.assertIn("memory_key_facts: 1", text)
+        self.assertIn("memory_risk_flags: 1", text)
+        self.assertIn("current_topic: wallet", text)
+        self.assertIn("latest_attempt_status: ok", text)
+        self.assertIn("latest_attempt_preview:", text)
 
     def test_render_prompt_section_text_messages_limits_to_twenty_items(self) -> None:
         model_messages: list[dict[str, str]] = []
@@ -676,6 +729,7 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_status=None,
             section="messages",
             memory=None,
+            total_event_count=len(model_messages),
         )
         self.assertIn("recent_messages_count: 30", text)
         self.assertIn("showing_recent_messages: 20", text)
@@ -687,10 +741,9 @@ class BotApiForwardIngestTest(unittest.TestCase):
         keyboard = _prompt_keyboard(chat_id=999, active_section="messages")
         self.assertTrue(keyboard.inline_keyboard)
         prompt_row = keyboard.inline_keyboard[0]
-        self.assertEqual("• messages", prompt_row[0].text)
-        self.assertEqual("sc:psec:messages:999", prompt_row[0].callback_data)
-        self.assertEqual("memory", prompt_row[1].text)
-        self.assertEqual("system", prompt_row[2].text)
+        self.assertEqual("overview", prompt_row[0].text)
+        self.assertEqual("• messages", prompt_row[1].text)
+        self.assertEqual("summary", prompt_row[2].text)
 
     def test_manual_alias_placeholder_is_consistent_and_negative(self) -> None:
         first = _manual_alias_placeholder("scammer_alias")
@@ -810,10 +863,11 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_raw="",
             latest_attempt_id=23,
             latest_status="ok",
-            section="memory",
+            section="summary",
             memory={"current_intent": {"latest_topic": "topic"}},
+            total_event_count=len(prompt_events),
         )
-        self.assertIn("Model Input Section: memory", text)
+        self.assertIn("Model Input Section: summary", text)
         self.assertIn("state: ok", text)
         self.assertIn("current_intent.topic: topic", text)
 
@@ -847,8 +901,9 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_raw="",
             latest_attempt_id=None,
             latest_status=None,
-            section="memory",
+            section="summary",
             memory=None,
+            total_event_count=0,
         )
         self.assertIn("state: missing", text)
         self.assertIn("memory unavailable", text)
@@ -876,8 +931,9 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_raw="",
             latest_attempt_id=None,
             latest_status=None,
-            section="memory",
+            section="summary",
             memory=memory_obj,
+            total_event_count=0,
         )
         self.assertIn("state: ok", text)
         self.assertIn("cursor_event_id: 88", text)
@@ -893,8 +949,9 @@ class BotApiForwardIngestTest(unittest.TestCase):
             latest_raw="",
             latest_attempt_id=None,
             latest_status=None,
-            section="memory",
+            section="summary",
             memory="broken",
+            total_event_count=0,
         )
         self.assertIn("state: invalid", text)
         self.assertIn("unsupported memory type", text)

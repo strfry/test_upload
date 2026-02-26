@@ -42,6 +42,7 @@ from scambaiter.bot_state import (  # noqa: F401 — re-exports
     _set_reply_card_state,
     _user_card_tasks,
 )
+from scambaiter.storage import StoredAnalysis
 
 # Re-export card helpers from bot_cards.
 from scambaiter.bot_cards import (  # noqa: F401 — re-exports
@@ -74,6 +75,25 @@ from scambaiter.bot_cards import (  # noqa: F401 — re-exports
 )
 
 # Re-export forward helpers from bot_forward.
+# Helper used for the control-chat cards.
+def _analysis_lines_for_card(analysis: StoredAnalysis | None) -> list[str]:
+    if analysis is None:
+        return []
+    notes = analysis.analysis.get("notes")
+    lines: list[str] = ["Latest analysis:"]
+    if analysis.title:
+        lines.append(f"title: {analysis.title}")
+    reason = analysis.analysis.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        lines.append(f"reason: {reason.strip()}")
+    if isinstance(notes, list) and notes:
+        lines.append("notes:")
+        for note in notes[:3]:
+            if isinstance(note, str) and note.strip():
+                lines.append(f"- {note.strip()}")
+    return lines
+
+
 from scambaiter.bot_forward import (  # noqa: F401 — re-exports
     _build_existing_identity_index,
     _build_forward_payload,
@@ -216,6 +236,10 @@ async def _show_user_card(
         profile_lines = _profile_lines_from_stored_profile(stored_profile.snapshot)
     else:
         profile_lines = _profile_lines_from_events(events)
+    analysis_record = store.latest_for_chat(target_chat_id)
+    analysis_lines = _analysis_lines_for_card(analysis_record)
+    if analysis_lines:
+        profile_lines = profile_lines + [""] + analysis_lines
     live_mode = application.bot_data.get("mode") == "live"
     auto_on = _auto_send_enabled(application).get(target_chat_id, False)
     current_phase = _auto_send_waiting_phase(application).get(target_chat_id)
@@ -499,6 +523,7 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     memory = store.get_summary(chat_id=chat_id)
+    total_event_count = store.count_events(chat_id)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -507,12 +532,13 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
         latest_raw=latest_raw,
         latest_attempt_id=latest_attempt_id,
         latest_status=latest_status,
-        section="messages",
+        section="overview",
         memory=memory,
+        total_event_count=total_event_count,
     )
     sent = await message.reply_text(
         prompt_text,
-        reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="messages"),
+        reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="overview"),
     )
     _set_prompt_card_context(app, int(sent.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
     sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
@@ -711,6 +737,7 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
     model_messages = core.build_model_messages(chat_id=chat_id)
     latest_payload, latest_raw, latest_attempt_id, latest_status = _load_latest_reply_payload(store, chat_id)
     memory = store.get_summary(chat_id=chat_id)
+    total_event_count = store.count_events(chat_id)
     prompt_text = _render_prompt_section_text(
         chat_id=chat_id,
         prompt_events=prompt_events,
@@ -721,6 +748,7 @@ async def _handle_prompt_section_button(update: Update, context: ContextTypes.DE
         latest_status=latest_status,
         section=section,
         memory=memory,
+        total_event_count=total_event_count,
     )
     try:
         await query.edit_message_text(
