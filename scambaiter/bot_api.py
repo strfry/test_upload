@@ -24,6 +24,7 @@ from scambaiter.bot_state import (  # noqa: F401 — re-exports
     _auto_send_tasks,
     _auto_send_waiting_phase,
     _auto_targets,
+    _directive_input_sessions,
     _drop_reply_card_state,
     _forward_card_messages,
     _forward_card_targets,
@@ -41,6 +42,7 @@ from scambaiter.bot_state import (  # noqa: F401 — re-exports
     _sent_control_messages,
     _set_reply_card_state,
     _user_card_tasks,
+    DirectiveInputSession,
 )
 from scambaiter.storage import StoredAnalysis
 
@@ -163,6 +165,12 @@ from scambaiter.bot_chat import (  # noqa: F401 — re-exports
     _render_whoami_text,
     _sanitize_legacy_profile_text,
     _truncate_chat_button_label,
+)
+
+# Re-export directive helpers from bot_directives.
+from scambaiter.bot_directives import (  # noqa: F401 — re-exports
+    _directive_card_keyboard,
+    _render_directive_list_card,
 )
 
 
@@ -2386,6 +2394,232 @@ async def _run_auto_send_loop(
     _auto_send_tasks(application).pop(target_chat_id, None)
 
 
+# --- Directive Handlers ---
+
+
+async def _handle_directives_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:directives:{chat_id} — show directive panel for a chat."""
+    app = context.application
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    if not await _require_allowed_chat(app, update, app.bot_data.get("allowed_chat_id")):
+        await query.answer("Unauthorized")
+        return
+    try:
+        target_chat_id = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    directives = store.list_directives(chat_id=target_chat_id, active_only=True, limit=10)
+    text = _render_directive_list_card(target_chat_id, directives)
+    kb = _directive_card_keyboard(target_chat_id, directives)
+    sent = await query.message.reply_text(text, reply_markup=kb)
+    sent_msgs = _sent_control_messages(app).setdefault(int(query.message.chat_id), [])
+    sent_msgs.append(int(sent.message_id))
+    if len(sent_msgs) > 500:
+        del sent_msgs[: len(sent_msgs) - 500]
+    await query.answer("Directives")
+
+
+async def _handle_dir_add_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:dir_add:{chat_id} — prompt operator for directive text via ForceReply."""
+    app = context.application
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    if not await _require_allowed_chat(app, update, app.bot_data.get("allowed_chat_id")):
+        await query.answer("Unauthorized")
+        return
+    try:
+        target_chat_id = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer("Invalid chat_id")
+        return
+    control_chat_id = int(query.message.chat_id)
+    sessions = _directive_input_sessions(app)
+    if control_chat_id in sessions:
+        await query.answer("Input already pending — reply above")
+        return
+    prompt = await query.message.reply_text(
+        f"New directive for /{target_chat_id}:\n"
+        "Reply with the instruction to inject into the LLM system prompt.",
+        reply_markup=ForceReply(selective=True),
+    )
+    sessions[control_chat_id] = DirectiveInputSession(
+        target_chat_id=target_chat_id,
+        prompt_message_id=int(prompt.message_id),
+        scope="chat",
+    )
+    await query.answer("Awaiting directive text")
+
+
+async def _handle_directive_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process ForceReply response to directive input."""
+    app = context.application
+    message = update.effective_message
+    if message is None or message.reply_to_message is None:
+        return
+    control_chat_id = int(message.chat_id)
+    sessions = _directive_input_sessions(app)
+    session = sessions.get(control_chat_id)
+    if not isinstance(session, DirectiveInputSession):
+        return
+    if int(message.reply_to_message.message_id) != session.prompt_message_id:
+        return  # Not our ForceReply
+    sessions.pop(control_chat_id, None)
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply_text("Directive text cannot be empty.")
+        return
+    target_chat_id = session.target_chat_id
+    scope = session.scope
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    directive = store.add_directive(chat_id=target_chat_id, text=text, scope=scope)
+    # Refresh directive card (send new one)
+    directives = store.list_directives(chat_id=target_chat_id, active_only=True, limit=10)
+    card_text = _render_directive_list_card(target_chat_id, directives)
+    card_kb = _directive_card_keyboard(target_chat_id, directives)
+    await message.reply_text(card_text, reply_markup=card_kb)
+    # Auto dry-run in background
+    core = getattr(service, "core", None)
+    if core is not None:
+        async def _auto_dryrun() -> None:
+            try:
+                loop = asyncio.get_event_loop()
+                dry_result = await loop.run_in_executor(None, core.run_hf_dry_run, target_chat_id)
+                # Build and send result card using existing infrastructure
+                run_id = _next_reply_run_id(app)
+                parsed_output = dry_result.get("parsed_output") if isinstance(dry_result.get("parsed_output"), dict) else None
+                result_text = str(dry_result.get("result_text") or "")
+                status = "ok" if bool(dry_result.get("valid_output")) and not dry_result.get("error_message") else "error"
+                outcome_class = str(dry_result.get("outcome_class") or "ok")
+                if outcome_class == "semantic_conflict":
+                    status = "semantic_conflict"
+                state_payload = {
+                    "chat_id": target_chat_id,
+                    "provider": str(dry_result.get("provider") or "unknown"),
+                    "model": str(dry_result.get("model") or "unknown"),
+                    "parsed_output": parsed_output,
+                    "result_text": result_text,
+                    "retry_context": None,
+                    "run_id": run_id,
+                    "status": status,
+                    "outcome_class": outcome_class,
+                    "error_message": str(dry_result.get("error_message") or ""),
+                    "contract_issues": [i for i in (dry_result.get("contract_issues") or []) if isinstance(i, dict)],
+                    "response_json": dry_result.get("response_json") if isinstance(dry_result.get("response_json"), dict) else {},
+                    "conflict": dry_result.get("conflict") if isinstance(dry_result.get("conflict"), dict) else None,
+                    "pivot": dry_result.get("pivot") if isinstance(dry_result.get("pivot"), dict) else None,
+                    "active_section": "message" if status == "ok" else "error",
+                }
+                card_t = _render_result_card_text(state_payload, section=state_payload["active_section"])
+                card_m = _result_card_keyboard(
+                    chat_id=target_chat_id,
+                    active_section=state_payload["active_section"],
+                    status=status,
+                    telethon_enabled=app.bot_data.get("mode") == "live",
+                    retry_enabled=bool(dry_result.get("repair_available")),
+                    has_raw=bool(dry_result.get("response_json")),
+                )
+                sent_card = await app.bot.send_message(
+                    chat_id=control_chat_id, text=card_t, reply_markup=card_m
+                )
+                _set_reply_card_state(app, int(sent_card.message_id), **state_payload)
+                sent_msgs = _sent_control_messages(app).setdefault(control_chat_id, [])
+                sent_msgs.append(int(sent_card.message_id))
+            except Exception as exc:
+                _log.warning("_handle_directive_reply: auto dry-run failed: %s", exc)
+        asyncio.create_task(_auto_dryrun())
+
+
+async def _handle_dir_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:dir_delete:{directive_id}:{chat_id}"""
+    app = context.application
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    if not await _require_allowed_chat(app, update, app.bot_data.get("allowed_chat_id")):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await query.answer("Invalid")
+        return
+    try:
+        directive_id = int(parts[2])
+        chat_id = int(parts[3])
+    except ValueError:
+        await query.answer("Invalid ids")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    store.deactivate_directive(directive_id)
+    directives = store.list_directives(chat_id=chat_id, active_only=True, limit=10)
+    card_text = _render_directive_list_card(chat_id, directives)
+    card_kb = _directive_card_keyboard(chat_id, directives)
+    try:
+        await query.edit_message_text(card_text, reply_markup=card_kb)
+    except Exception:
+        pass
+    await query.answer("Directive deleted")
+
+
+async def _handle_dir_toggle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:dir_toggle:{directive_id}:{chat_id}"""
+    app = context.application
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    if not await _require_allowed_chat(app, update, app.bot_data.get("allowed_chat_id")):
+        await query.answer("Unauthorized")
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        await query.answer("Invalid")
+        return
+    try:
+        directive_id = int(parts[2])
+        chat_id = int(parts[3])
+    except ValueError:
+        await query.answer("Invalid ids")
+        return
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    # Find the directive to get its current text
+    existing = [d for d in store.list_directives(chat_id=chat_id, active_only=True, limit=50) if d.id == directive_id]
+    if not existing:
+        await query.answer("Directive not found")
+        return
+    old = existing[0]
+    new_scope = "once" if old.scope == "chat" else "chat"
+    store.deactivate_directive(directive_id)
+    store.add_directive(chat_id=chat_id, text=old.text, scope=new_scope)
+    directives = store.list_directives(chat_id=chat_id, active_only=True, limit=10)
+    card_text = _render_directive_list_card(chat_id, directives)
+    card_kb = _directive_card_keyboard(chat_id, directives)
+    try:
+        await query.edit_message_text(card_text, reply_markup=card_kb)
+    except Exception:
+        pass
+    await query.answer(f"Scope changed to {new_scope}")
+
+
+async def _handle_dir_close_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:dir_close:{chat_id}"""
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    await query.answer("Closed")
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+
 async def _register_command_menu(application: Application) -> None:
     await application.bot.set_my_commands(
         [
@@ -2450,6 +2684,14 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_button, pattern=r"^sc:autosend_toggle:[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_autosend_skip_button, pattern=r"^sc:autosend_skip:[0-9]+$"))
+    # Directive management handlers
+    app.add_handler(CallbackQueryHandler(_handle_directives_button, pattern=r"^sc:directives:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_add_button, pattern=r"^sc:dir_add:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_delete_button, pattern=r"^sc:dir_delete:[0-9]+:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_toggle_button, pattern=r"^sc:dir_toggle:[0-9]+:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_close_button, pattern=r"^sc:dir_close:[0-9]+$"))
+    # Directive reply must come before existing REPLY and ALL handlers (order critical)
+    app.add_handler(MessageHandler(filters.REPLY, _handle_directive_reply))
     app.add_handler(MessageHandler(filters.REPLY, _handle_manual_override_response))
     app.add_handler(MessageHandler(filters.ALL, _handle_forward))
 

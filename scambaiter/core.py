@@ -377,6 +377,7 @@ class ScambaiterCore:
         force_refresh_memory: bool = False,
         include_memory: bool = True,
         timing: dict[str, Any] | None = None,
+        directives: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
         prompt_events = self.build_prompt_events(chat_id=chat_id, token_limit=token_limit)
         memory_state: dict[str, Any] = {"summary": {}, "cursor_event_id": 0, "updated": False}
@@ -399,6 +400,21 @@ class ScambaiterCore:
                     "content": TIMING_PROMPT_RULES + "\n\nTiming data:\n" + json.dumps(timing, ensure_ascii=True),
                 }
             )
+        if directives:
+            directive_lines = [
+                f"- {d.get('text', '')}"
+                for d in directives
+                if d.get('text')
+            ]
+            if directive_lines:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "[OPERATOR_DIRECTIVES]\nThe following instructions override normal conversation flow:\n"
+                                   + "\n".join(directive_lines)
+                                   + "\n[END_DIRECTIVES]",
+                    }
+                )
         for event in prompt_events:
             payload = {
                 "time": event.get("time"),
@@ -564,7 +580,18 @@ class ScambaiterCore:
 
         attempts: list[dict[str, Any]] = []
         timing = self.compute_timing_stats(chat_id) if include_timing else None
-        initial_messages = self.build_model_messages(chat_id=chat_id, include_memory=False, timing=timing)
+        # Load active directives for injection into prompt
+        active_directives = self.store.list_directives(chat_id=chat_id, active_only=True, limit=50)
+        directive_dicts: list[dict[str, Any]] = [
+            {"id": str(d.id), "text": d.text}
+            for d in active_directives
+        ] if active_directives else []
+        initial_messages = self.build_model_messages(
+            chat_id=chat_id,
+            include_memory=False,
+            timing=timing,
+            directives=directive_dicts or None,
+        )
         initial_prompt = {"messages": initial_messages, "max_tokens": max_tokens}
         reasoning_cycles = 0
         reasoning_snippet: str = ""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 from telegram.ext import Application
@@ -225,4 +226,24 @@ def _auto_send_waiting_phase(application: Application) -> dict[int, str | None]:
     if not isinstance(state, dict):
         state = {}
         application.bot_data["auto_send_waiting_phase_by_target_chat"] = state
+    return state
+
+
+# --- Directive Input Session ---
+
+
+@dataclass(slots=True)
+class DirectiveInputSession:
+    """Pending ForceReply input session for a directive."""
+    target_chat_id: int
+    prompt_message_id: int
+    scope: str = "chat"
+
+
+def _directive_input_sessions(application: Application) -> dict[int, DirectiveInputSession]:
+    """Pending directive input sessions keyed by control_chat_id."""
+    state = application.bot_data.setdefault("directive_input_sessions_by_control_chat", {})
+    if not isinstance(state, dict):
+        state = {}
+        application.bot_data["directive_input_sessions_by_control_chat"] = state
     return state

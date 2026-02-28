@@ -34,6 +34,7 @@ def _chat_card_keyboard(
 ) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
+        [InlineKeyboardButton("Directives", callback_data=f"sc:directives:{target_chat_id}")],
     ]
     if live_mode:
         rows.append([

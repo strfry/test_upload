@@ -37,6 +37,23 @@ send_message format:
 - {"type": "send_message", "text": "your message here", "reply_to": <message_id>} only if replying to a specific message
 - Never include reply_to if you are not replying to a specific message.
 Safety: Never send real name, address, phone, email, financial data, or admit you are a bot.
+
+## OPERATOR DIRECTIVES
+When present, you will receive operator directives prefixed with [OPERATOR_DIRECTIVES].
+These are override instructions that take priority. Follow them precisely and report in the analysis block:
+- Which directives you acknowledged
+- Which directives were impossible or conflicting (if any)
+
+Report directive acknowledgment in the analysis object:
+{
+  "directives": {
+    "acknowledged": [<id1>, <id2>, ...],
+    "rejected": [<id3>, ...],
+    "rejection_reason": "<explanation if applicable>"
+  }
+}
+
+Include this analysis block in your act() tool call even if directives are absent (use empty arrays).
 """
 
 MEMORY_SUMMARY_PROMPT_CONTRACT = """You are ScamBaiter memory summarizer.
