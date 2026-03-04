@@ -311,17 +311,17 @@ async def _require_allowed_chat(
     update: Update,
     allowed_chat_id: int | None,
 ) -> bool:
-    if allowed_chat_id is None:
-        return True
+    allowed_ids: set[int] = application.bot_data.get("allowed_chat_ids", set())
+    if not allowed_ids:
+        # Fallback: einzelne ID aus altem Interface
+        if allowed_chat_id is None:
+            return True
+        allowed_ids = {int(allowed_chat_id)}
     message = update.effective_message
     if message is None:
         return False
-    if int(message.chat_id) != int(allowed_chat_id):
-        await _send_control_text(
-            application=application,
-            message=message,
-            text="Unauthorized chat.",
-        )
+    if int(message.chat_id) not in allowed_ids:
+        _log.debug("_require_allowed_chat: Anfrage von unbekanntem Chat %s ignoriert", message.chat_id)
         return False
     return True
 
@@ -437,7 +437,8 @@ async def _cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if message is None:
         return
     store = _resolve_store(app.bot_data["service"])
-    chat_ids = store.list_chat_ids(limit=100)
+    control_ids: set[int] = app.bot_data.get("allowed_chat_ids", set())
+    chat_ids = [c for c in store.list_chat_ids(limit=100) if c not in control_ids]
     if not chat_ids:
         await _send_control_text(application=app, message=message, text="No chat history stored yet.")
         return
@@ -825,7 +826,8 @@ async def _handle_chat_close_button(update: Update, context: ContextTypes.DEFAUL
         return
     service = app.bot_data.get("service")
     store = _resolve_store(service)
-    chat_ids = store.list_chat_ids(limit=100)
+    control_ids: set[int] = app.bot_data.get("allowed_chat_ids", set())
+    chat_ids = [c for c in store.list_chat_ids(limit=100) if c not in control_ids]
     await query.answer("Closed")
     await _delete_control_message(message)
     _last_user_card_message(app).pop(int(message.chat_id), None)
@@ -2232,7 +2234,12 @@ async def _run_auto_send_loop(
     except Exception as exc:
         _log.debug("_run_auto_send_loop: mark_read fehlgeschlagen für %d: %s", target_chat_id, exc)
 
-    for attempt_no in range(1, max_retries + 1):
+    _LATENCY_CLASS_SECONDS: dict[str, float] = {"short": 30.0, "medium": 180.0, "long": 900.0}
+    error_count = 0
+    wait_count = 0
+    MAX_WAIT_CYCLES = 20  # Schutz gegen endlose Warteschleifen
+    while error_count < max_retries and wait_count < MAX_WAIT_CYCLES:
+        attempt_no = error_count + 1
         try:
             dry_run_result = None
             # -- Generierungsphase --
@@ -2266,6 +2273,7 @@ async def _run_auto_send_loop(
                     "pivot": dry_run_result.get("pivot") if isinstance(dry_run_result.get("pivot"), dict) else None,
                     "active_section": "error",
                 }
+                error_count += 1
                 await _render_auto_send_error_card(card_state)
                 if attempt_no < max_retries:
                     await asyncio.sleep(2.0)
@@ -2275,10 +2283,37 @@ async def _run_auto_send_loop(
             message_text = _extract_action_message_text(parsed_output)
             actions = parsed_output.get("actions") if isinstance(parsed_output.get("actions"), list) else []
             if not actions and not message_text:
+                error_count += 1
                 await _set_auto_send_phase(application, target_chat_id, None)
                 if attempt_no < max_retries:
                     await asyncio.sleep(2.0)
                 continue
+
+            # -- Wait-only: Modell will pausieren und später neu generieren --
+            _wait_actions = [a for a in actions if isinstance(a, dict) and str(a.get("type") or "") == "wait"]
+            _has_send = any(isinstance(a, dict) and str(a.get("type") or "") == "send_message" for a in actions)
+            if _wait_actions and not _has_send and not message_text:
+                _wa = _wait_actions[0]
+                _lc = str(_wa.get("latency_class") or "short").strip().lower()
+                _wait_secs = _LATENCY_CLASS_SECONDS.get(_lc, 30.0)
+                # Wait-Event speichern, damit das Modell beim nächsten Durchlauf weiß, dass gewartet wurde
+                try:
+                    store.ingest_event(
+                        chat_id=target_chat_id,
+                        event_type="wait",
+                        role="scambaiter",
+                        meta={"latency_class": _lc, "seconds": _wait_secs, "origin": "auto_send"},
+                    )
+                except Exception as _we:
+                    _log.debug("_run_auto_send_loop: wait-Event konnte nicht gespeichert werden: %s", _we)
+                await _set_auto_send_phase(application, target_chat_id, "wait")
+                skip_event.clear()
+                try:
+                    await _skippable_sleep(_wait_secs, skip_event)
+                finally:
+                    await _set_auto_send_phase(application, target_chat_id, None)
+                wait_count += 1
+                continue  # Neu generieren ohne Fehler zu zählen
 
             # Phase 2: Tippzeit mit Pausen zwischen Sätzen
             await _set_auto_send_phase(application, target_chat_id, "typing")
@@ -2335,6 +2370,7 @@ async def _run_auto_send_loop(
                         await result_card_msg.edit_text(card_text, reply_markup=card_markup)
                     except Exception:
                         pass
+                error_count += 1
                 if attempt_no < max_retries:
                     await asyncio.sleep(2.0)
                 continue
@@ -2386,6 +2422,7 @@ async def _run_auto_send_loop(
                 "pivot": None,
                 "active_section": "error",
             }
+            error_count += 1
             await _render_auto_send_error_card(line_state)
             if attempt_no < max_retries:
                 await asyncio.sleep(2.0)
@@ -2637,10 +2674,18 @@ def create_bot_app(
     service: Any,
     allowed_chat_id: int | None = None,
     telethon_executor: Any | None = None,
+    extra_allowed_chat_ids: list[int] | None = None,
 ) -> Any:
     app = Application.builder().token(token).build()
     app.bot_data["service"] = service
     app.bot_data["allowed_chat_id"] = allowed_chat_id
+    # Alle erlaubten Chat-IDs als Set (persönlicher Chat + ggf. Gruppe)
+    allowed_ids: set[int] = set()
+    if allowed_chat_id is not None:
+        allowed_ids.add(int(allowed_chat_id))
+    for cid in (extra_allowed_chat_ids or []):
+        allowed_ids.add(int(cid))
+    app.bot_data["allowed_chat_ids"] = allowed_ids
     app.bot_data["telethon_executor"] = telethon_executor
     app.bot_data["mode"] = "live" if telethon_executor is not None else "relay"
     app.bot_data["register_command_menu"] = lambda: _register_command_menu(app)
@@ -2650,46 +2695,46 @@ def create_bot_app(
     app.add_handler(CommandHandler("chats", _cmd_chats))
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(MessageHandler(filters.Regex(r"^/(?:c)?[0-9]+(?:\s.*)?$"), _cmd_chat_id_shortcut))
-    app.add_handler(CallbackQueryHandler(_handle_select_chat_button, pattern=r"^sc:selchat:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_chat_close_button, pattern=r"^sc:chat_close:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_clear_history_button, pattern=r"^sc:clear_history:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_clear_history_arm_button, pattern=r"^sc:clear_history_arm:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_select_chat_button, pattern=r"^sc:selchat:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_chat_close_button, pattern=r"^sc:chat_close:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_clear_history_button, pattern=r"^sc:clear_history:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_clear_history_arm_button, pattern=r"^sc:clear_history_arm:-?[0-9]+$"))
     app.add_handler(
-        CallbackQueryHandler(_handle_clear_history_confirm_button, pattern=r"^sc:clear_history_confirm:[0-9]+$")
+        CallbackQueryHandler(_handle_clear_history_confirm_button, pattern=r"^sc:clear_history_confirm:-?[0-9]+$")
     )
     app.add_handler(
-        CallbackQueryHandler(_handle_clear_history_cancel_button, pattern=r"^sc:clear_history_cancel:[0-9]+$")
+        CallbackQueryHandler(_handle_clear_history_cancel_button, pattern=r"^sc:clear_history_cancel:-?[0-9]+$")
     )
-    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:messages|memory|system):[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_prompt_close_button, pattern=r"^sc:prompt_close:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_reply_send_button, pattern=r"^sc:reply_send:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_reply_mark_button, pattern=r"^sc:reply_mark:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_undo_send_button, pattern=r"^sc:undo_send:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_dry_run_retry_button, pattern=r"^sc:reply_retry:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_section_button, pattern=r"^sc:psec:(?:messages|memory|system):-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_prompt_close_button, pattern=r"^sc:prompt_close:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_reply_send_button, pattern=r"^sc:reply_send:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_reply_mark_button, pattern=r"^sc:reply_mark:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_undo_send_button, pattern=r"^sc:undo_send:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dry_run_button, pattern=r"^sc:dryrun:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dry_run_retry_button, pattern=r"^sc:reply_retry:-?[0-9]+$"))
     app.add_handler(
-        CallbackQueryHandler(_handle_result_section_button, pattern=r"^sc:rsec:(?:message|actions|analysis|error|response|raw):[0-9]+$")
+        CallbackQueryHandler(_handle_result_section_button, pattern=r"^sc:rsec:(?:message|actions|analysis|error|response|raw):-?[0-9]+$")
     )
-    app.add_handler(CallbackQueryHandler(_handle_result_rawfile_button, pattern=r"^sc:rawfile:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_forward_insert_button, pattern=r"^sc:fwd_insert:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_forward_discard_button, pattern=r"^sc:fwd_discard:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_forward_select_chat_button, pattern=r"^sc:fwd_selchat:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_forward_manual_override_button, pattern=r"^sc:fwd_manual:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_reply_delete_button, pattern=r"^sc:reply_delete:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_result_rawfile_button, pattern=r"^sc:rawfile:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_insert_button, pattern=r"^sc:fwd_insert:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_discard_button, pattern=r"^sc:fwd_discard:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_select_chat_button, pattern=r"^sc:fwd_selchat:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_forward_manual_override_button, pattern=r"^sc:fwd_manual:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_reply_delete_button, pattern=r"^sc:reply_delete:-?[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_delete_button, pattern=r"^sc:prompt_delete$"))
     app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:nop$"))
-    app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:noop:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_fetch_profile_button, pattern=r"^sc:fetch_profile:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_button, pattern=r"^sc:autosend_toggle:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_autosend_skip_button, pattern=r"^sc:autosend_skip:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_noop_button, pattern=r"^sc:noop:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_fetch_profile_button, pattern=r"^sc:fetch_profile:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_button, pattern=r"^sc:autosend_toggle:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_autosend_skip_button, pattern=r"^sc:autosend_skip:-?[0-9]+$"))
     # Directive management handlers
-    app.add_handler(CallbackQueryHandler(_handle_directives_button, pattern=r"^sc:directives:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_dir_add_button, pattern=r"^sc:dir_add:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_dir_delete_button, pattern=r"^sc:dir_delete:[0-9]+:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_dir_toggle_button, pattern=r"^sc:dir_toggle:[0-9]+:[0-9]+$"))
-    app.add_handler(CallbackQueryHandler(_handle_dir_close_button, pattern=r"^sc:dir_close:[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_directives_button, pattern=r"^sc:directives:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_add_button, pattern=r"^sc:dir_add:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_delete_button, pattern=r"^sc:dir_delete:[0-9]+:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_toggle_button, pattern=r"^sc:dir_toggle:[0-9]+:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_dir_close_button, pattern=r"^sc:dir_close:-?[0-9]+$"))
     # Directive reply must come before existing REPLY and ALL handlers (order critical)
     app.add_handler(MessageHandler(filters.REPLY, _handle_directive_reply))
     app.add_handler(MessageHandler(filters.REPLY, _handle_manual_override_response))

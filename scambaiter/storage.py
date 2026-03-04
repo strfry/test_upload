@@ -9,7 +9,7 @@ from typing import Any
 import threading
 
 
-ALLOWED_EVENT_TYPES = {"message", "photo", "forward", "sticker", "typing_interval"}
+ALLOWED_EVENT_TYPES = {"message", "photo", "forward", "sticker", "typing_interval", "wait"}
 ALLOWED_ROLES = {"manual", "scammer", "scambaiter", "system"}
 
 
@@ -116,6 +116,7 @@ class AnalysisStore:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         raw_conn = sqlite3.connect(db_path, check_same_thread=False)
+        raw_conn.execute("PRAGMA journal_mode=WAL")  # erlaubt gleichzeitige Reads während Writes
         raw_conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._conn = _LockingConnection(raw_conn, self._lock)

@@ -164,6 +164,11 @@ class TelethonExecutor:
         await self._client.disconnect()
         self._started = False
 
+    async def send_message(self, chat_id: int, text: str) -> None:
+        """Sendet eine Nachricht als User-Account (für Probe/Testing in der Gruppe)."""
+        entity = await self._client.get_entity(chat_id)
+        await self._client.send_message(entity, text)
+
     async def mark_read(self, chat_id: int) -> None:
         entity = await self._client.get_entity(chat_id)
         await self._client.send_read_acknowledge(entity)
@@ -259,15 +264,19 @@ class TelethonExecutor:
                     continue
 
                 if action_type == "wait":
+                    _LATENCY_CLASS_SECONDS = {"short": 30.0, "medium": 180.0, "long": 900.0}
+                    latency_class = str(action.get("latency_class") or "").strip().lower()
                     value = float(action.get("value") or 0)
                     unit = str(action.get("unit") or "seconds").strip().lower()
-                    if unit == "minutes":
-                        seconds = value * 60.0
+                    if latency_class in _LATENCY_CLASS_SECONDS:
+                        seconds = _LATENCY_CLASS_SECONDS[latency_class]
+                    elif value > 0:
+                        seconds = value * 60.0 if unit == "minutes" else value
                     else:
-                        seconds = value
+                        seconds = 0.0
                     seconds = max(0.0, seconds)
                     await _wait_or_skip(seconds, skip_event)
-                    report.executed_actions.append(f"{idx}. wait({seconds:.1f}s)")
+                    report.executed_actions.append(f"{idx}. wait({seconds:.1f}s, latency={latency_class or 'explicit'})")
                     continue
 
                 if action_type == "send_message":
@@ -377,6 +386,7 @@ class TelethonExecutor:
         service: Any,
         config: Any,
         folder_name: str = "Scammers",
+        control_chat_ids: set[int] | None = None,
     ) -> None:
         """Register Live Mode event handlers for auto-receive and typing monitoring.
 
@@ -398,9 +408,13 @@ class TelethonExecutor:
             len(_folder_set),
         )
 
+        _control_ids: set[int] = control_chat_ids or set()
+
         @self._client.on(events.NewMessage(incoming=True))
         async def _on_new_message(event: Any) -> None:
             chat_id = int(event.chat_id)
+            if chat_id in _control_ids:
+                return  # Control-Channels (z.B. Gruppe) niemals als Scammer-Chat behandeln
             if _folder_set and chat_id not in _folder_set:
                 return
             msg = event.message

@@ -60,6 +60,11 @@ def _chat_card_keyboard(
             )])
         elif waiting_phase == "sending":
             rows.append([InlineKeyboardButton("📤 Sendet...", callback_data=f"sc:noop:{target_chat_id}")])
+        elif waiting_phase == "wait":
+            rows.append([InlineKeyboardButton(
+                "⏸ Wartet (LLM-Delay)...",
+                callback_data=f"sc:autosend_skip:{target_chat_id}"
+            )])
     rows.append([InlineKeyboardButton("Close", callback_data=f"sc:chat_close:{target_chat_id}")])
     return InlineKeyboardMarkup(rows)
 
