@@ -2292,6 +2292,12 @@ async def _run_auto_send_loop(
     wait_count = 0
     MAX_WAIT_CYCLES = 20  # Schutz gegen endlose Warteschleifen
     while error_count < max_retries and wait_count < MAX_WAIT_CYCLES:
+        # Guard wiederholen: falls zwischenzeitlich eine Baiter-Nachricht gespeichert wurde
+        # (z.B. manuell gesendet oder von vorherigem Loop-Durchlauf), abbrechen.
+        current_events = store.list_events(chat_id=target_chat_id, limit=5000)
+        if not current_events or getattr(current_events[-1], "role", None) != "scammer":
+            _log.debug("_run_auto_send_loop: letzter Event kein scammer mehr, breche ab (%d)", target_chat_id)
+            return
         attempt_no = error_count + 1
         try:
             dry_run_result = None
