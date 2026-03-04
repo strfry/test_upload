@@ -113,12 +113,23 @@ async def main(chat_id: int | None, cmd: str | None, dryrun: bool, send: bool, w
     await asyncio.sleep(wait)
 
     # Antworten via Telethon lesen (persönlicher Chat + Gruppe)
+    from telethon.tl.types import ReplyInlineMarkup, KeyboardButtonCallback, KeyboardButtonRow
     responses = []
     for chat in [bot_entity]:
         async for msg in client.iter_messages(chat, limit=10):
             if msg.sender_id == main_me.id:
                 text = msg.text or msg.caption or "<non-text>"
-                responses.append((chat, msg.id, text))
+                buttons = []
+                if msg.reply_markup and isinstance(msg.reply_markup, ReplyInlineMarkup):
+                    for row in msg.reply_markup.rows:
+                        row_labels = []
+                        for btn in row.buttons:
+                            data = ""
+                            if isinstance(btn, KeyboardButtonCallback):
+                                data = btn.data.decode() if isinstance(btn.data, bytes) else btn.data
+                            row_labels.append(f"[{btn.text}]" + (f"→{data}" if data else ""))
+                        buttons.append("  ".join(row_labels))
+                responses.append((chat, msg.id, text, buttons))
             if len(responses) >= 5:
                 break
 
@@ -126,9 +137,14 @@ async def main(chat_id: int | None, cmd: str | None, dryrun: bool, send: bool, w
 
     print(f"\n── Ergebnis ({len(responses)} Antworten von @{main_me.username}) ──")
     if responses:
-        for _chat, msg_id, text in responses:
+        for _chat, msg_id, text, buttons in responses:
             preview = text[:400].replace("\n", "\n   ")
-            print(f"  ✅ msg_id={msg_id}:\n   {preview}\n")
+            print(f"  ✅ msg_id={msg_id}:\n   {preview}")
+            if buttons:
+                print("   Buttons:")
+                for row in buttons:
+                    print(f"     {row}")
+            print()
     else:
         print("  ⚠️  Keine Antwort empfangen.")
 

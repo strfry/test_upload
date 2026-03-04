@@ -151,22 +151,35 @@ Gruppennnachrichten inkl. Bot-Nachrichten als normale Updates.
 
 ### Probe-Scripts — End-to-End Tests
 
-Alle Probe-Scripts brauchen `source secret.sh` vorher. Virtualenv: `/home/strfry/scambaiter-venv/bin/python3`.
-
-#### Lokaler Server (für Tests ohne Uberspace)
+#### ⚠️ Voraussetzungen (immer zuerst)
 
 ```bash
-# Server starten (kein Backfill, schnell):
-PYTHONPATH=. python3 -m scripts.run_control_bot --timeout 120 --no-backfill > /tmp/controlbot.log 2>&1 &
-# Warten bis bereit:
-until grep -q "getUpdates" /tmp/controlbot.log; do sleep 1; done && echo "bereit"
-# Log beobachten:
-tail -f /tmp/controlbot.log | grep -v "getUpdates\|HTTP Request"
+# 1. Secrets laden (Bot-Token, Telethon-Credentials, Chat-IDs, ...)
+source secret.sh
+
+# 2. Virtualenv aktivieren (hat telegram, telethon, alle Deps)
+source /home/strfry/scambaiter-venv/bin/activate
+
+# 3. Uberspace-Server stoppen — sonst Conflict: two getUpdates
+ssh strfry.org supervisorctl stop scambaiter
 ```
 
-Separate Session-Datei für Probes (damit keine SQLite-Lock-Konflikte mit dem laufenden Server):
+> **Warum stoppen?** Telegram erlaubt nur eine aktive `getUpdates`-Verbindung pro Bot-Token.
+> Läuft der Bot auf Uberspace noch, scheitert jede lokale Instanz mit `Conflict`.
+> Nach dem Test: `ssh strfry.org supervisorctl start scambaiter` zum Wiederstarten.
+
+#### Lokaler Server (für Tests)
+
 ```bash
-cp scambaiter.session probe_session.session
+# Server starten (im Hintergrund):
+# -m scripts.run_control_bot setzt sys.path korrekt — kein PYTHONPATH nötig
+python3 -m scripts.run_control_bot > /tmp/bot.log 2>&1 &
+
+# Warten bis bereit:
+until grep -q "Application started" /tmp/bot.log; do sleep 1; done && echo "bereit"
+
+# Log beobachten:
+tail -f /tmp/bot.log | grep -v "getUpdates\|HTTP Request"
 ```
 
 #### Uberspace (produktiv)
@@ -229,6 +242,7 @@ Erwartete Dauer pro Szenario: ~75–90s (Reading-Phase + LLM + Typing).
 
 #### Bekannte Fallstricke
 
+- **PYTHONPATH-Falle:** `python3 scripts/run_control_bot.py` scheitert mit `ModuleNotFoundError: No module named 'scambaiter'` wenn PYTHONPATH nicht gesetzt ist. Besser immer `python3 -m scripts.run_control_bot` benutzen — `-m` setzt sys.path automatisch auf das CWD.
 - **Zwei Bot-Instanzen:** Wenn lokaler Server läuft UND Uberspace aktiv ist, gibt es `Conflict: terminated by other getUpdates`. Uberspace vorher stoppen: `ssh strfry.org supervisorctl stop scambaiter`
 - **SQLite Lock:** Probe-Scripts brauchen `probe_session.session` (Kopie), nicht `scambaiter.session` (die der Server hält)
 - **Uberspace dirty working tree:** Der git hook macht `git reset --hard master`. Falls auf Uberspace manuelle Edits gemacht wurden, vorher `ssh strfry.org "cd ~/scambaiter && git reset --hard HEAD"` ausführen

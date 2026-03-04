@@ -478,6 +478,49 @@ class AnalysisStore:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def last_event_ts_batch(self, chat_ids: list[int]) -> dict[int, str]:
+        """Returns {chat_id: last ts_utc} for each chat_id in one query."""
+        if not chat_ids:
+            return {}
+        placeholders = ",".join("?" * len(chat_ids))
+        rows = self._conn.execute(
+            f"SELECT chat_id, MAX(ts_utc) as last_ts FROM events WHERE chat_id IN ({placeholders}) GROUP BY chat_id",
+            chat_ids,
+        ).fetchall()
+        return {int(row["chat_id"]): str(row["last_ts"]) for row in rows if row["last_ts"]}
+
+    def has_pending_suggestion_batch(self, chat_ids: list[int]) -> dict[int, bool]:
+        """Returns {chat_id: True} for chats that have at least one stored analysis (pending suggestion)."""
+        if not chat_ids:
+            return {}
+        placeholders = ",".join("?" * len(chat_ids))
+        rows = self._conn.execute(
+            f"SELECT DISTINCT chat_id FROM analyses WHERE chat_id IN ({placeholders})",
+            chat_ids,
+        ).fetchall()
+        found = {int(row["chat_id"]) for row in rows}
+        return {cid: (cid in found) for cid in chat_ids}
+
+    def last_scammer_text_batch(self, chat_ids: list[int]) -> dict[int, str]:
+        """Returns {chat_id: text} of the most recent scammer message per chat (for name fallback)."""
+        if not chat_ids:
+            return {}
+        placeholders = ",".join("?" * len(chat_ids))
+        rows = self._conn.execute(
+            f"""
+            SELECT e.chat_id, e.text
+            FROM events e
+            INNER JOIN (
+                SELECT chat_id, MAX(id) as max_id
+                FROM events
+                WHERE chat_id IN ({placeholders}) AND role = 'scammer' AND text IS NOT NULL AND text != ''
+                GROUP BY chat_id
+            ) latest ON e.chat_id = latest.chat_id AND e.id = latest.max_id
+            """,
+            chat_ids,
+        ).fetchall()
+        return {int(row["chat_id"]): str(row["text"]) for row in rows if row["text"]}
+
     def repair_timestamps_from_meta(self, chat_id: int | None = None) -> int:
         """Fill ts_utc = '' from meta_json forward_profile.origin_date_utc where available."""
         if chat_id is not None:

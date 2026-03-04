@@ -83,7 +83,13 @@ def _truncate_chat_button_label(base: str, chat_id: int, max_len: int = 56) -> s
     return f"{compact[: remaining - 3]}...{suffix}"
 
 
-def _chat_button_label(store: Any, chat_id: int) -> str:
+def _chat_name_label(
+    store: Any,
+    chat_id: int,
+    fallback_text: str | None = None,
+    max_len: int = 28,
+) -> str:
+    """Linker Button: nur Name/Identität, kein chat_id-Suffix. Für 3-spaltige Zeile."""
     display_name: str | None = None
     username: str | None = None
     try:
@@ -102,31 +108,95 @@ def _chat_button_label(store: Any, chat_id: int) -> str:
                 if isinstance(candidate_username, str) and candidate_username.strip():
                     value = candidate_username.strip()
                     username = value if value.startswith("@") else f"@{value}"
-    if display_name:
-        base = display_name
-        if username:
-            base = f"{display_name} ({username})"
+    if display_name and username:
+        label = f"{display_name} ({username})"
+    elif display_name:
+        label = display_name
     elif username:
-        base = username
+        label = username
+    elif fallback_text:
+        snippet = " ".join(fallback_text.split())[:max_len]
+        label = f'"{snippet}…"' if len(fallback_text.split()) > 4 else f'"{snippet}"'
     else:
-        base = "Unknown"
-    return _truncate_chat_button_label(base, chat_id)
+        label = f"/{chat_id}"
+    # Truncate to max_len, add ellipsis if needed
+    compact = " ".join(label.split())
+    if len(compact) > max_len:
+        compact = compact[: max_len - 1] + "…"
+    return compact
 
 
-def _known_chats_keyboard(store: Any, chat_ids: list[int], max_buttons: int = 30) -> InlineKeyboardMarkup:
+def _known_chats_keyboard(
+    store: Any,
+    chat_ids: list[int],
+    max_buttons: int = 30,
+    auto_send_map: dict[int, bool] | None = None,
+    pending_map: dict[int, bool] | None = None,
+    fallback_text_map: dict[int, str] | None = None,
+    live_mode: bool = False,
+) -> InlineKeyboardMarkup:
+    """
+    Pro Chat-Zeile drei Buttons (live mode) oder zwei (relay mode):
+      [ Name / Fallback ]  [ 💬 /chat_id ]  [ 🟢 ]
+      [ Name / Fallback ]  [ /chat_id ]
+    Telegram verteilt Breite gleichmäßig — deshalb 3 sinnvoll befüllte Spalten statt 1 breite + 1 schmale.
+    """
     rows: list[list[InlineKeyboardButton]] = []
+    auto_send_map = auto_send_map or {}
+    pending_map = pending_map or {}
+    fallback_text_map = fallback_text_map or {}
     for item in chat_ids[:max_buttons]:
-        rows.append([InlineKeyboardButton(_chat_button_label(store, item), callback_data=f"sc:selchat:{item}")])
+        has_pending = pending_map.get(item, False)
+        name_label = _chat_name_label(store, item, fallback_text=fallback_text_map.get(item))
+        pending_prefix = "💬 " if has_pending else ""
+        id_label = f"{pending_prefix}/{item}"
+        left = InlineKeyboardButton(name_label, callback_data=f"sc:selchat:{item}")
+        mid = InlineKeyboardButton(id_label, callback_data=f"sc:selchat:{item}")
+        if live_mode:
+            auto_on = auto_send_map.get(item, False)
+            auto_label = "🟢" if auto_on else "⬜"
+            right = InlineKeyboardButton(auto_label, callback_data=f"sc:autosend_toggle:{item}")
+            rows.append([left, mid, right])
+        else:
+            rows.append([left, mid])
     return InlineKeyboardMarkup(rows)
 
 
-def _known_chats_card_content(store: Any, chat_ids: list[int]) -> tuple[str, InlineKeyboardMarkup]:
-    shown = chat_ids[:30]
+def _known_chats_card_content(
+    store: Any,
+    chat_ids: list[int],
+    auto_send_map: dict[int, bool] | None = None,
+    live_mode: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
+    # Sort by last activity (most recent first)
+    try:
+        last_ts_map = store.last_event_ts_batch(chat_ids)
+    except Exception:
+        last_ts_map = {}
+    sorted_ids = sorted(chat_ids, key=lambda c: last_ts_map.get(c, ""), reverse=True)
+
+    shown = sorted_ids[:30]
     extra = len(chat_ids) - len(shown)
-    title = f"Known chat ids ({len(chat_ids)} total):\nSelect one:"
+    title = f"Chats ({len(chat_ids)} total) — neueste zuerst:\nSelect one:"
     if extra > 0:
-        title += f"\n(showing first {len(shown)}, {extra} hidden)"
-    return title, _known_chats_keyboard(store, chat_ids)
+        title += f"\n({extra} weitere ausgeblendet)"
+
+    try:
+        pending_map = store.has_pending_suggestion_batch(shown)
+    except Exception:
+        pending_map = {}
+    try:
+        fallback_text_map = store.last_scammer_text_batch(shown)
+    except Exception:
+        fallback_text_map = {}
+
+    return title, _known_chats_keyboard(
+        store, shown,
+        auto_send_map=auto_send_map,
+        pending_map=pending_map,
+        fallback_text_map=fallback_text_map,
+        live_mode=live_mode,
+    )
 
 
 def _chat_card_clear_confirm_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:

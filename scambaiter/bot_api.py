@@ -152,7 +152,7 @@ from scambaiter.bot_prompt import (  # noqa: F401 — re-exports
 
 # Re-export chat helpers from bot_chat.
 from scambaiter.bot_chat import (  # noqa: F401 — re-exports
-    _chat_button_label,
+    _chat_name_label,
     _chat_card_clear_confirm_keyboard,
     _chat_card_clear_safety_keyboard,
     _chat_card_keyboard,
@@ -164,7 +164,7 @@ from scambaiter.bot_chat import (  # noqa: F401 — re-exports
     _render_user_card,
     _render_whoami_text,
     _sanitize_legacy_profile_text,
-    _truncate_chat_button_label,
+    _truncate_chat_button_label,  # noqa: F401 — kept for potential external use
 )
 
 # Re-export directive helpers from bot_directives.
@@ -442,7 +442,9 @@ async def _cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not chat_ids:
         await _send_control_text(application=app, message=message, text="No chat history stored yet.")
         return
-    title, keyboard = _known_chats_card_content(store, chat_ids)
+    live_mode = app.bot_data.get("mode") == "live"
+    auto_send_map = _auto_send_enabled(app) if live_mode else {}
+    title, keyboard = _known_chats_card_content(store, chat_ids, auto_send_map=auto_send_map, live_mode=live_mode)
     await _send_control_text(
         application=app,
         message=message,
@@ -839,7 +841,9 @@ async def _handle_chat_close_button(update: Update, context: ContextTypes.DEFAUL
             replace_previous_status=False,
         )
         return
-    title, keyboard = _known_chats_card_content(store, chat_ids)
+    live_mode = app.bot_data.get("mode") == "live"
+    auto_send_map = _auto_send_enabled(app) if live_mode else {}
+    title, keyboard = _known_chats_card_content(store, chat_ids, auto_send_map=auto_send_map, live_mode=live_mode)
     sent = await app.bot.send_message(
         chat_id=int(message.chat_id),
         text=title,
