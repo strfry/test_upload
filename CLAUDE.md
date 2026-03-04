@@ -41,9 +41,20 @@ Mode is exposed as `config.mode` (`"live"` / `"relay"`) and stored in `app.bot_d
 **Deploy = push nach Uberspace:**
 ```bash
 git push uberspace master
+# → Hook deployed den Code (git checkout -f master + reset --hard)
+# → Bot wird NICHT automatisch neu gestartet — manuell:
+ssh strfry.org supervisorctl restart scambaiter
 ```
-Der git hook (`hooks/post-receive`) auf Uberspace startet den Bot automatisch neu.  
 GitHub (`origin`) ist nur Backup — kein Auto-Deploy dort.
+
+**Warum kein Auto-Restart im Hook?**  
+`supervisorctl start` blockiert den Push bis der Bot hochgefahren ist (→ Timeout).  
+Außerdem will man nach einem Deploy oft erst prüfen ob der Code korrekt ist.
+
+**Früherer Bug:** Der Hook fehlte `unset GIT_DIR` und `cd ~/scambaiter`, weshalb  
+`git reset --hard master` im falschen Verzeichnis lief und der Working-Tree nie  
+aktualisiert wurde. `receive.denyCurrentBranch = ignore` ist gesetzt damit Pushes  
+auf den checked-out Branch nicht abgewiesen werden.
 
 **Server-Steuerung via SSH:**
 ```bash
