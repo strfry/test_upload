@@ -65,6 +65,17 @@ ssh strfry.org supervisorctl start scambaiter   # starten
 ssh strfry.org supervisorctl status scambaiter  # Status
 ```
 
+**Datenbank vom Server kopieren:**
+SQLite läuft im WAL-Modus — einfaches `scp` der `.sqlite3`-Datei ergibt eine leere/inkonsistente Kopie,
+weil die eigentlichen Daten im WAL-File (`.sqlite3-wal`) stecken. Erst checkpointen:
+```bash
+ssh strfry.org "python3 -c \"
+import sqlite3
+sqlite3.connect('/home/strfry/scambaiter/scambaiter.sqlite3').execute('PRAGMA wal_checkpoint(TRUNCATE)')
+\""
+scp strfry.org:~/scambaiter/scambaiter.sqlite3 ./scambaiter.sqlite3
+```
+
 ## Scripts
 
 `scripts/` — CLI tools: `prompt_runner.py`, `prompt_cli.py`, `chat_repl.py`, `loop_analyzer.py`, `list_chat_ids.py`, `telethon_forward_helper.py`, `dry_run_cli.py`, and others.

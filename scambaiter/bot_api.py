@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+from datetime import datetime, timezone as _tz
 from typing import Any
 
 from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
@@ -953,9 +954,11 @@ async def _run_send_task(
     # Nachricht in History speichern wenn erfolgreich
     if report.ok and message_text:
         try:
+            _ts = datetime.now(_tz.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             store.ingest_event(
                 chat_id=chat_id, event_type="message", role="scambaiter",
                 text=message_text,
+                ts_utc=_ts,
                 source_message_id=str(report.sent_message_id) if report.sent_message_id else None,
                 meta={"origin": origin},
             )
@@ -2381,11 +2384,13 @@ async def _run_auto_send_loop(
 
             # -- Erfolg --
             if message_text:
+                _ts = datetime.now(_tz.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
                 store.ingest_event(
                     chat_id=target_chat_id,
                     event_type="message",
                     role="scambaiter",
                     text=message_text,
+                    ts_utc=_ts,
                     source_message_id=str(report.sent_message_id) if report.sent_message_id else None,
                     meta={"origin": "auto_send"},
                 )
