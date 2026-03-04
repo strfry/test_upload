@@ -149,14 +149,90 @@ Gruppennnachrichten inkl. Bot-Nachrichten als normale Updates.
 | `SCAMBAITER_CONTROL_CHAT_ID` | Persönlicher Operator-Chat |
 | `SCAMBAITER_TEST_CHAT_ID` | Test-Scammer-Gruppe (DebugAgentBot sendet hier rein) |
 
-### probe.py — End-to-End Test
+### Probe-Scripts — End-to-End Tests
+
+Alle Probe-Scripts brauchen `source secret.sh` vorher. Virtualenv: `/home/strfry/scambaiter-venv/bin/python3`.
+
+#### Lokaler Server (für Tests ohne Uberspace)
 
 ```bash
-source secret.sh
-# Sendet Nachricht als DebugAgentBot in Test-Scammer-Gruppe,
-# sammelt Antworten des Control Bots aus der Control-Gruppe
-PYTHONPATH=. /home/strfry/scambaiter-venv/bin/python3 scripts/probe.py "Hallo, wer bist du?"
+# Server starten (kein Backfill, schnell):
+PYTHONPATH=. python3 -m scripts.run_control_bot --timeout 120 --no-backfill > /tmp/controlbot.log 2>&1 &
+# Warten bis bereit:
+until grep -q "getUpdates" /tmp/controlbot.log; do sleep 1; done && echo "bereit"
+# Log beobachten:
+tail -f /tmp/controlbot.log | grep -v "getUpdates\|HTTP Request"
 ```
+
+Separate Session-Datei für Probes (damit keine SQLite-Lock-Konflikte mit dem laufenden Server):
+```bash
+cp scambaiter.session probe_session.session
+```
+
+#### Uberspace (produktiv)
+```bash
+# Status:
+ssh strfry.org supervisorctl status scambaiter
+# Neustart:
+ssh strfry.org supervisorctl restart scambaiter
+# Logs live:
+ssh strfry.org "supervisorctl tail -f scambaiter stderr"
+```
+
+#### probe_control.py — Control-Bot Kommandos und Buttons
+
+Schickt Kommandos via Telethon an den Control Bot, klickt Buttons, liest Antworten.
+
+```bash
+# /whoami testen:
+PYTHONPATH=. python3 scripts/probe_control.py --cmd "/whoami"
+
+# Chat-Card öffnen:
+PYTHONPATH=. python3 scripts/probe_control.py --chat $SCAMBAITER_TEST_CHAT_ID
+
+# Dry-Run (Prompt + LLM, kein Senden):
+PYTHONPATH=. python3 scripts/probe_control.py --chat $SCAMBAITER_TEST_CHAT_ID --dryrun
+
+# Kompletter Flow: Dry-Run + Senden in Test-Gruppe:
+PYTHONPATH=. python3 scripts/probe_control.py --chat $SCAMBAITER_TEST_CHAT_ID --dryrun --send
+```
+
+#### probe_scammer.py — Scammer-Nachrichten simulieren
+
+Schickt Nachrichten als DebugAgentBot in die Test-Scammer-Gruppe.
+
+```bash
+PYTHONPATH=. python3 scripts/probe_scammer.py "Hallo, ich bin Lisa!"
+PYTHONPATH=. python3 scripts/probe_scammer.py "Hallo" "Ich habe ein Angebot" --wait 30
+```
+
+#### probe_autosend.py — Auto-Send End-to-End Test
+
+Testet den vollautomatischen Modus: Toggle ON → Scammer-Nachricht → Bot antwortet selbstständig.
+
+```bash
+# Beide Szenarien (empfohlen nach Änderungen an bot_api.py / service.py):
+PYTHONPATH=. python3 scripts/probe_autosend.py
+
+# Nur Szenario A (Live-Event triggert Auto-Send):
+PYTHONPATH=. python3 scripts/probe_autosend.py --scenario a
+
+# Nur Szenario B (Auto-Send bei vorhandenen Nachrichten einschalten):
+PYTHONPATH=. python3 scripts/probe_autosend.py --scenario b
+```
+
+**Szenario A:** Auto-Send wird eingeschaltet, dann kommt eine neue Scammer-Nachricht rein → Telethon-Listener triggert `_cancel_and_restart_auto_send` → Bot antwortet automatisch.
+
+**Szenario B:** Scammer-Nachrichten existieren schon im DB, dann wird Auto-Send eingeschaltet → `_start_auto_send_task` läuft sofort an (letzter Event = scammer) → Bot antwortet automatisch.
+
+Erwartete Dauer pro Szenario: ~75–90s (Reading-Phase + LLM + Typing).
+
+#### Bekannte Fallstricke
+
+- **Zwei Bot-Instanzen:** Wenn lokaler Server läuft UND Uberspace aktiv ist, gibt es `Conflict: terminated by other getUpdates`. Uberspace vorher stoppen: `ssh strfry.org supervisorctl stop scambaiter`
+- **SQLite Lock:** Probe-Scripts brauchen `probe_session.session` (Kopie), nicht `scambaiter.session` (die der Server hält)
+- **Uberspace dirty working tree:** Der git hook macht `git reset --hard master`. Falls auf Uberspace manuelle Edits gemacht wurden, vorher `ssh strfry.org "cd ~/scambaiter && git reset --hard HEAD"` ausführen
+- **Negative Chat-IDs:** Alle Callback-Patterns in `bot_api.py` verwenden `-?[0-9]+` — bei Änderungen prüfen dass das erhalten bleibt
 
 ---
 
