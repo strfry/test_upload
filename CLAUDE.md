@@ -47,9 +47,11 @@ ssh strfry.org supervisorctl restart scambaiter
 ```
 GitHub (`origin`) ist nur Backup — kein Auto-Deploy dort.
 
-**Warum kein Auto-Restart im Hook?**  
-`supervisorctl start` blockiert den Push bis der Bot hochgefahren ist (→ Timeout).  
-Außerdem will man nach einem Deploy oft erst prüfen ob der Code korrekt ist.
+**Auto-Restart im Hook:** Nur wenn der Bot vorher lief (`supervisorctl status | grep RUNNING`).  
+War er gestoppt, bleibt er gestoppt. Der Restart läuft via `nohup ... &` im Hintergrund,  
+weil `supervisorctl restart` ~30s blockiert (wartet auf RUNNING-State) — ohne `nohup`  
+würde der Hintergrund-Job beim Hook-Exit SIGHUP kriegen und abbrechen.  
+Restart-Log: `/tmp/scambaiter-restart.log` auf Uberspace.
 
 **Früherer Bug:** Der Hook fehlte `unset GIT_DIR` und `cd ~/scambaiter`, weshalb  
 `git reset --hard master` im falschen Verzeichnis lief und der Working-Tree nie  
