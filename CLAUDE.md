@@ -36,6 +36,15 @@ Mode is exposed as `config.mode` (`"live"` / `"relay"`) and stored in `app.bot_d
 
 `tests/` — pytest suite; run with `python3 -m pytest -q`
 
+## Deployment
+
+**Deploy = push nach Uberspace:**
+```bash
+git push uberspace master
+```
+Der git hook (`hooks/post-receive`) auf Uberspace startet den Bot automatisch neu.  
+GitHub (`origin`) ist nur Backup — kein Auto-Deploy dort.
+
 ## Scripts
 
 `scripts/` — CLI tools: `prompt_runner.py`, `prompt_cli.py`, `chat_repl.py`, `loop_analyzer.py`, `list_chat_ids.py`, `telethon_forward_helper.py`, `dry_run_cli.py`, and others.
