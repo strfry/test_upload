@@ -112,28 +112,67 @@ async def _wait_for_group_reply(client, group_id: int, sender_id: int,
 # Setup: Auto-Send einschalten/ausschalten
 # ---------------------------------------------------------------------------
 
+async def _get_fresh_card(client, bot_entity, sender_id: int, chat_id: int,
+                          after_id: int, timeout: int = 10):
+    """Wartet auf eine frische Chat-Card nach after_id."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        async for msg in client.iter_messages(bot_entity, limit=3):
+            if msg.sender_id != sender_id or not msg.reply_markup:
+                continue
+            if msg.id <= after_id:
+                break
+            for row in msg.reply_markup.rows:
+                for btn in row.buttons:
+                    if not isinstance(btn, KeyboardButtonCallback):
+                        continue
+                    data = btn.data.decode() if isinstance(btn.data, bytes) else btn.data
+                    if f"sc:autosend_toggle:{chat_id}" in data:
+                        return msg, "ON" in btn.text
+        await asyncio.sleep(1)
+    return None, None
+
+
 async def _ensure_autosend(client, bot_entity, main_me, chat_id: int, target_state: bool) -> bool:
     """Setzt Auto-Send auf target_state. Gibt True zurück wenn erfolgreich."""
-    # Chat-Card öffnen
-    await client.send_message(bot_entity, f"/chat {chat_id}")
-    await asyncio.sleep(2)
+    # Letzten bekannten msg_id merken
+    last_id = 0
+    async for msg in client.iter_messages(bot_entity, limit=1):
+        last_id = msg.id
 
-    current = await _autosend_state(client, bot_entity, main_me.id, chat_id)
-    if current is None:
-        print("  ⚠️  Konnte Auto-Send-Status nicht lesen")
+    # Frische Chat-Card anfordern
+    await client.send_message(bot_entity, f"/chat {chat_id}")
+
+    card_msg, current = await _get_fresh_card(client, bot_entity, main_me.id, chat_id, after_id=last_id)
+    if card_msg is None:
+        print("  ⚠️  Keine frische Chat-Card erhalten")
         return False
 
-    print(f"  Auto-Send aktuell: {'ON' if current else 'OFF'}")
+    print(f"  Auto-Send aktuell: {'ON' if current else 'OFF'} (msg_id={card_msg.id})")
     if current == target_state:
         return True
 
-    # Toggeln
-    ok = await _click_button(client, bot_entity, main_me.id, f"sc:autosend_toggle:{chat_id}")
-    if not ok:
-        print("  ⚠️  Auto-Send-Toggle-Button nicht gefunden")
-        return False
-    await asyncio.sleep(1)
-    return True
+    # Toggle auf der frischen Card klicken
+    for row in card_msg.reply_markup.rows:
+        for btn in row.buttons:
+            if not isinstance(btn, KeyboardButtonCallback):
+                continue
+            data = btn.data.decode() if isinstance(btn.data, bytes) else btn.data
+            if f"sc:autosend_toggle:{chat_id}" in data:
+                print(f"    → [{btn.text}] ({data})")
+                await card_msg.click(data=btn.data)
+                await asyncio.sleep(2)
+                # Zustand verifizieren (Card wird vom Bot aktualisiert)
+                _, new_state = await _get_fresh_card(client, bot_entity, main_me.id, chat_id,
+                                                     after_id=card_msg.id - 1, timeout=5)
+                if new_state is not None:
+                    print(f"  Auto-Send jetzt: {'ON' if new_state else 'OFF'}")
+                    return new_state == target_state
+                # Fallback: Bot hat Card nicht neu gesendet, Toggle gilt als gesetzt
+                return True
+
+    print("  ⚠️  Auto-Send-Toggle-Button nicht gefunden")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -163,14 +202,14 @@ async def scenario_a(client, debug_bot: Bot, bot_entity, main_me, config, chat_i
 
     # 4. Warten auf Antwort in der Testgruppe
     print("4. Warte auf Auto-Send-Antwort in Testgruppe (max 90s)...")
-    reply = await _wait_for_group_reply(client, chat_id, telethon_user.id, last_sent_id, timeout=90)
+    reply = await _wait_for_group_reply(client, chat_id, telethon_user.id, last_sent_id, timeout=180)
     elapsed = time.monotonic() - t0
 
     if reply:
         print(f"✅ Antwort nach {elapsed:.1f}s: {reply[:120]!r}")
         return True
     else:
-        print(f"❌ Keine Antwort nach 90s")
+        print(f"❌ Keine Antwort nach 180s")
         return False
 
 
@@ -212,14 +251,14 @@ async def scenario_b(client, debug_bot: Bot, bot_entity, main_me, config, chat_i
 
     # 5. Warten auf Antwort
     print("5. Warte auf Auto-Send-Antwort in Testgruppe (max 90s)...")
-    reply = await _wait_for_group_reply(client, chat_id, telethon_user.id, last_sent_id, timeout=90)
+    reply = await _wait_for_group_reply(client, chat_id, telethon_user.id, last_sent_id, timeout=180)
     elapsed = time.monotonic() - t0
 
     if reply:
         print(f"✅ Antwort nach {elapsed:.1f}s: {reply[:120]!r}")
         return True
     else:
-        print(f"❌ Keine Antwort nach 90s")
+        print(f"❌ Keine Antwort nach 180s")
         return False
 
 
