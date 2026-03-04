@@ -161,14 +161,12 @@ async def _ensure_autosend(client, bot_entity, main_me, chat_id: int, target_sta
             if f"sc:autosend_toggle:{chat_id}" in data:
                 print(f"    → [{btn.text}] ({data})")
                 await card_msg.click(data=btn.data)
-                await asyncio.sleep(2)
-                # Zustand verifizieren (Card wird vom Bot aktualisiert)
-                _, new_state = await _get_fresh_card(client, bot_entity, main_me.id, chat_id,
-                                                     after_id=card_msg.id - 1, timeout=5)
-                if new_state is not None:
-                    print(f"  Auto-Send jetzt: {'ON' if new_state else 'OFF'}")
-                    return new_state == target_state
-                # Fallback: Bot hat Card nicht neu gesendet, Toggle gilt als gesetzt
+                # Hinweis: query.answer("Auto-Send aktiviert/deaktiviert") bestätigt den Toggle.
+                # Die Chat-Card zeigt erst "ON" wenn der Loop seine erste Phase setzt —
+                # das passiert nur wenn es eine offene Scammer-Nachricht gibt.
+                # Wir vertrauen dem erfolgreichen click() ohne State-Verifikation.
+                await asyncio.sleep(1)
+                print(f"  Auto-Send Toggle gesendet (Ziel: {'ON' if target_state else 'OFF'})")
                 return True
 
     print("  ⚠️  Auto-Send-Toggle-Button nicht gefunden")
