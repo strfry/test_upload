@@ -2172,6 +2172,52 @@ async def _handle_autosend_toggle_button(update: Update, context: ContextTypes.D
     await _show_user_card(app, control_chat_id, store, target_chat_id)
 
 
+async def _handle_autosend_toggle_list_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:autosend_toggle_list:{chat_id} — Toggle aus der Chats-Liste heraus.
+    Editiert die Keyboard in-place, öffnet keine Chat-Card.
+    """
+    app = context.application
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    if app.bot_data.get("mode") != "live":
+        await query.answer("Auto-Send nur im Live-Modus verfügbar")
+        return
+    try:
+        target_chat_id = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer()
+        return
+
+    enabled_map = _auto_send_enabled(app)
+    currently_on = enabled_map.get(target_chat_id, False)
+    new_state = not currently_on
+    enabled_map[target_chat_id] = new_state
+
+    control_chat_id = int(query.message.chat_id)
+    _auto_send_control_chat(app)[target_chat_id] = control_chat_id
+
+    if not new_state:
+        _cancel_auto_send_task(app, target_chat_id)
+        await query.answer("Auto-Send OFF")
+    else:
+        await query.answer("Auto-Send ON")
+        _start_auto_send_task(app, target_chat_id)
+
+    # Chats-Liste in-place neu rendern (nur Keyboard, Text bleibt)
+    service = app.bot_data.get("service")
+    store = _resolve_store(service)
+    control_ids: set[int] = app.bot_data.get("allowed_chat_ids", set())
+    chat_ids = [c for c in store.list_chat_ids(limit=100) if c not in control_ids]
+    _, new_keyboard = _known_chats_card_content(
+        store, chat_ids, auto_send_map=enabled_map, live_mode=True
+    )
+    try:
+        await query.message.edit_reply_markup(reply_markup=new_keyboard)
+    except Exception:
+        pass
+
+
 async def _run_auto_send_loop(
     application: Application,
     target_chat_id: int,
@@ -2737,6 +2783,7 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_fetch_profile_button, pattern=r"^sc:fetch_profile:-?[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_fetch_history_button, pattern=r"^sc:fetch_history:-?[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_button, pattern=r"^sc:autosend_toggle:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_autosend_toggle_list_button, pattern=r"^sc:autosend_toggle_list:-?[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_autosend_skip_button, pattern=r"^sc:autosend_skip:-?[0-9]+$"))
     # Directive management handlers
     app.add_handler(CallbackQueryHandler(_handle_directives_button, pattern=r"^sc:directives:-?[0-9]+$"))

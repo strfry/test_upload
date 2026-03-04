@@ -155,7 +155,7 @@ def _known_chats_keyboard(
         if live_mode:
             auto_on = auto_send_map.get(item, False)
             auto_label = "🟢" if auto_on else "⬜"
-            right = InlineKeyboardButton(auto_label, callback_data=f"sc:autosend_toggle:{item}")
+            right = InlineKeyboardButton(auto_label, callback_data=f"sc:autosend_toggle_list:{item}")
             rows.append([left, mid, right])
         else:
             rows.append([left, mid])
