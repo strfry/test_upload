@@ -21,7 +21,8 @@ from .core_schema import (  # noqa: F401 — re-exports
     SYSTEM_PROMPT_CONTRACT,
     TIMING_PROMPT_RULES,
     TOOL_DEFINITIONS,
-    JSON_NO_TOOL_INSTRUCTION,
+    make_json_no_tool_instruction,
+    detect_text_language,
     is_no_tool_support_error,
     ChatContext,
     ChatEvent,
@@ -579,28 +580,82 @@ class ScambaiterCore:
         token: str,
         model: str,
         max_tokens: int,
+        expected_lang: str = "",
     ) -> tuple[dict[str, Any], str, "ParseResult", list[tuple[str, str]]]:
         """Retry without tool calling: append JSON instruction, parse raw output.
+
+        If the generated reply is in the wrong language, retries once with a
+        stronger language correction hint.
 
         Returns (response_json, result_text, parse_result, memory_pairs).
         Raises on HTTP/network errors.
         """
-        from .core_schema import parse_structured_model_output_detailed  # avoid circular at module level
+        from .core_schema import parse_structured_model_output_detailed
 
-        fallback_messages = messages + [
-            {"role": "user", "content": JSON_NO_TOOL_INSTRUCTION}
-        ]
-        response = call_hf_openai_chat(
-            token=token,
-            model=model,
-            messages=fallback_messages,
-            max_tokens=max_tokens,
-            base_url=None,
-            # No tools — plain completion
-        )
-        result_text = extract_result_text(response)
+        lang_hint = (
+            f"The scammer writes in {ScambaiterCore._LANG_NAMES.get(expected_lang, expected_lang)}. "
+            f"You MUST reply in {ScambaiterCore._LANG_NAMES.get(expected_lang, expected_lang)}."
+        ) if expected_lang else ""
+
+        def _call(extra_hint: str = "") -> tuple[dict[str, Any], str]:
+            instruction = make_json_no_tool_instruction(
+                lang_hint=lang_hint,
+                lang_retry_hint=extra_hint,
+            )
+            msgs = messages + [{"role": "user", "content": instruction}]
+            resp = call_hf_openai_chat(
+                token=token, model=model, messages=msgs,
+                max_tokens=max_tokens, base_url=None,
+            )
+            return resp, extract_result_text(resp)
+
+        response, result_text = _call()
         parse_result = parse_structured_model_output_detailed(result_text)
-        return response, result_text, parse_result, []  # no memory pairs in fallback path
+
+        # Language check — retry once if clearly wrong language
+        if expected_lang and parse_result.output is not None:
+            suggestion = parse_result.output.suggestion
+            actual_lang = detect_text_language(suggestion)
+            if actual_lang != expected_lang:
+                _log.info(
+                    "_call_no_tool_fallback: language mismatch (expected=%s, got=%s) — retrying",
+                    expected_lang, actual_lang,
+                )
+                lang_name = ScambaiterCore._LANG_NAMES.get(expected_lang, expected_lang)
+                actual_name = ScambaiterCore._LANG_NAMES.get(actual_lang, actual_lang)
+                retry_hint = (
+                    f"IMPORTANT: Your previous reply was in {actual_name}. "
+                    f"You MUST reply in {lang_name}."
+                )
+                response, result_text = _call(extra_hint=retry_hint)
+                parse_result = parse_structured_model_output_detailed(result_text)
+
+        return response, result_text, parse_result, []
+
+    # ------------------------------------------------------------------
+    # Language helpers
+    # ------------------------------------------------------------------
+
+    _LANG_NAMES: dict[str, str] = {
+        "de": "German",
+        "en": "English",
+        "fr": "French",
+        "es": "Spanish",
+        "it": "Italian",
+    }
+
+    @staticmethod
+    def _detect_chat_language(store: Any, chat_id: int) -> str:
+        """Detect the dominant language of the scammer's recent messages."""
+        events = store.list_events(chat_id=chat_id, limit=50)
+        scammer_texts = [
+            e.text for e in events
+            if getattr(e, "role", "") == "scammer"
+            and isinstance(getattr(e, "text", None), str)
+            and e.text.strip()
+        ][-10:]  # last 10 scammer messages
+        combined = " ".join(scammer_texts)
+        return detect_text_language(combined)
 
     def run_hf_dry_run(self, chat_id: int, include_timing: bool = True) -> dict[str, Any]:
         token = (getattr(self.config, "hf_token", None) or "").strip()
@@ -629,6 +684,9 @@ class ScambaiterCore:
         reasoning_cycles = 0
         reasoning_snippet: str = ""
 
+        # Detect conversation language for no-tool fallback language guard
+        _conv_lang = ScambaiterCore._detect_chat_language(self.store, chat_id)
+
         _no_tool_mode = False  # becomes True if the model doesn't support tool calling
         try:
             initial_response = call_hf_openai_chat(
@@ -656,7 +714,10 @@ class ScambaiterCore:
                         initial_text,
                         _fallback_result,
                         _fallback_mem,
-                    ) = self._call_no_tool_fallback(initial_messages, token, model, max_tokens)
+                    ) = self._call_no_tool_fallback(
+                        initial_messages, token, model, max_tokens,
+                        expected_lang=_conv_lang,
+                    )
                     initial_tool_calls = []
                     reasoning_cycles, reasoning_snippet = 0, ""
                 except Exception as exc2:
@@ -962,12 +1023,16 @@ class ScambaiterCore:
                 _repair_no_tool = True
                 _log.info("run_hf_dry_run_repair: model %s does not support tool calling — retrying without tools", model)
                 try:
+                    _repair_conv_lang = ScambaiterCore._detect_chat_language(self.store, chat_id)
                     (
                         repair_response,
                         repair_text,
                         _repair_fallback_result,
                         _repair_fallback_mem,
-                    ) = self._call_no_tool_fallback(repair_messages, token, model, max_tokens)
+                    ) = self._call_no_tool_fallback(
+                        repair_messages, token, model, max_tokens,
+                        expected_lang=_repair_conv_lang,
+                    )
                     repair_tool_calls = []
                 except Exception as exc2:
                     attempts.append({

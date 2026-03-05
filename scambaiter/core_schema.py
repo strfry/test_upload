@@ -337,16 +337,69 @@ Rules:
 """
 
 
-JSON_NO_TOOL_INSTRUCTION = """\
-Respond with ONLY a valid JSON object — no markdown, no explanation, no code blocks.
-Use exactly this schema:
-{
-  "schema": "scambait.llm.v1",
-  "analysis": {"situation": "<one sentence>", "intent": "<your next goal>"},
-  "message": {"text": "<your reply to the scammer>"},
-  "actions": [{"type": "send_message", "message": {"text": "<your reply to the scammer>"}}]
-}
-The text in message.text and actions[0].message.text must be identical."""
+def make_json_no_tool_instruction(lang_hint: str = "", lang_retry_hint: str = "") -> str:
+    """Build the JSON-only output instruction for models without tool calling support.
+
+    Args:
+        lang_hint: Optional language reminder, e.g. "The scammer writes in German."
+        lang_retry_hint: If non-empty, prepended as a correction notice for retry passes,
+                         e.g. "IMPORTANT: Your previous reply was in English. You MUST reply in German."
+    """
+    parts = []
+    if lang_retry_hint:
+        parts.append(lang_retry_hint)
+    parts.append(
+        "Respond with ONLY a valid JSON object — no markdown, no explanation, no code blocks.\n"
+        "Use exactly this schema:\n"
+        "{\n"
+        '  "schema": "scambait.llm.v1",\n'
+        '  "analysis": {"situation": "<one sentence>", "intent": "<your next goal>"},\n'
+        '  "message": {"text": "<your reply to the scammer>"},\n'
+        '  "actions": [{"type": "send_message", "message": {"text": "<your reply to the scammer>"}}]\n'
+        "}\n"
+        "The text in message.text and actions[0].message.text must be identical."
+    )
+    if lang_hint:
+        parts.append(lang_hint)
+    return "\n\n".join(parts)
+
+
+# Default (no language hint) — kept for backwards compat
+JSON_NO_TOOL_INSTRUCTION = make_json_no_tool_instruction()
+
+
+def detect_text_language(text: str) -> str:
+    """Very cheap heuristic: returns 'de', 'fr', 'es', 'it', or 'en'.
+
+    Not a proper language detector — good enough to catch obvious mismatches
+    (e.g. model replies in English when conversation is German).
+    """
+    if not text:
+        return "en"
+    lower = text.lower()
+    # German: common chars and frequent function words
+    de_score = (
+        sum(lower.count(c) for c in "äöüß")
+        + sum(lower.count(w) for w in (" ich ", " und ", " der ", " die ", " das ", " ist ", " du ", " nicht ", " ein "))
+    )
+    fr_score = (
+        sum(lower.count(c) for c in "àâéèêëîïôùûüç")
+        + sum(lower.count(w) for w in (" je ", " et ", " le ", " la ", " les ", " est ", " vous ", " pas "))
+    )
+    es_score = (
+        sum(lower.count(c) for c in "áéíóúüñ¿¡")
+        + sum(lower.count(w) for w in (" yo ", " y ", " el ", " la ", " los ", " es ", " no ", " que "))
+    )
+    it_score = (
+        sum(lower.count(c) for c in "àèìíîòóùú")
+        + sum(lower.count(w) for w in (" io ", " e ", " il ", " la ", " le ", " è ", " non ", " che "))
+    )
+    scores = {"de": de_score, "fr": fr_score, "es": es_score, "it": it_score, "en": 0}
+    best = max(scores, key=lambda k: scores[k])
+    # Only return non-English if clearly dominant (avoid false positives on short texts)
+    if best != "en" and scores[best] >= 2:
+        return best
+    return "en"
 
 
 def is_no_tool_support_error(exc: BaseException) -> bool:
