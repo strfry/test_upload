@@ -337,6 +337,28 @@ Rules:
 """
 
 
+JSON_NO_TOOL_INSTRUCTION = """\
+Respond with ONLY a valid JSON object — no markdown, no explanation, no code blocks.
+Use exactly this schema:
+{
+  "schema": "scambait.llm.v1",
+  "analysis": {"situation": "<one sentence>", "intent": "<your next goal>"},
+  "message": {"text": "<your reply to the scammer>"},
+  "actions": [{"type": "send_message", "message": {"text": "<your reply to the scammer>"}}]
+}
+The text in message.text and actions[0].message.text must be identical."""
+
+
+def is_no_tool_support_error(exc: BaseException) -> bool:
+    """Return True if the exception indicates the model/server doesn't support tool calling."""
+    msg = str(exc)
+    return (
+        "enable-auto-tool-choice" in msg
+        or "tool-call-parser" in msg
+        or "tool choice requires" in msg.lower()
+    )
+
+
 @dataclass(slots=True)
 class ChatEvent:
     event_type: EventType
@@ -708,6 +730,20 @@ def parse_structured_model_output_detailed(text: str) -> ParseResult:
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
+        # Try to salvage truncated JSON: extract message.text via regex and build minimal valid object
+        import re as _re
+        msg_match = _re.search(r'"message"\s*:\s*\{[^}]*"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}', cleaned)
+        if msg_match:
+            suggestion_text = msg_match.group(1).replace('\\"', '"').replace('\\n', '\n')
+            if suggestion_text.strip():
+                return ParseResult(output=ModelOutput(
+                    raw=text,
+                    suggestion=suggestion_text.strip(),
+                    analysis={},
+                    metadata={"schema": "scambait.llm.v1", "salvaged": True},
+                    actions=[{"type": "send_message", "message": {"text": suggestion_text.strip()}}],
+                    conflict=None,
+                ), issues=[])
         return _fail("root", "invalid json", expected="valid JSON object")
 
     if not isinstance(data, dict):

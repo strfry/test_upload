@@ -21,6 +21,8 @@ from .core_schema import (  # noqa: F401 — re-exports
     SYSTEM_PROMPT_CONTRACT,
     TIMING_PROMPT_RULES,
     TOOL_DEFINITIONS,
+    JSON_NO_TOOL_INSTRUCTION,
+    is_no_tool_support_error,
     ChatContext,
     ChatEvent,
     EventType,
@@ -571,6 +573,35 @@ class ScambaiterCore:
         parsed["model"] = model
         return parsed
 
+    def _call_no_tool_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        token: str,
+        model: str,
+        max_tokens: int,
+    ) -> tuple[dict[str, Any], str, "ParseResult", list[tuple[str, str]]]:
+        """Retry without tool calling: append JSON instruction, parse raw output.
+
+        Returns (response_json, result_text, parse_result, memory_pairs).
+        Raises on HTTP/network errors.
+        """
+        from .core_schema import parse_structured_model_output_detailed  # avoid circular at module level
+
+        fallback_messages = messages + [
+            {"role": "user", "content": JSON_NO_TOOL_INSTRUCTION}
+        ]
+        response = call_hf_openai_chat(
+            token=token,
+            model=model,
+            messages=fallback_messages,
+            max_tokens=max_tokens,
+            base_url=None,
+            # No tools — plain completion
+        )
+        result_text = extract_result_text(response)
+        parse_result = parse_structured_model_output_detailed(result_text)
+        return response, result_text, parse_result, []  # no memory pairs in fallback path
+
     def run_hf_dry_run(self, chat_id: int, include_timing: bool = True) -> dict[str, Any]:
         token = (getattr(self.config, "hf_token", None) or "").strip()
         # Per-chat model override takes priority over global HF_MODEL.
@@ -598,6 +629,7 @@ class ScambaiterCore:
         reasoning_cycles = 0
         reasoning_snippet: str = ""
 
+        _no_tool_mode = False  # becomes True if the model doesn't support tool calling
         try:
             initial_response = call_hf_openai_chat(
                 token=token,
@@ -615,43 +647,90 @@ class ScambaiterCore:
                 initial_text = json.dumps(initial_tool_calls, ensure_ascii=True)
             reasoning_cycles, reasoning_snippet = extract_reasoning_details(initial_response)
         except Exception as exc:
-            attempts.append(
-                {
-                    "phase": "initial",
-                    "status": "error",
-                    "accepted": False,
-                    "reject_reason": "provider_error",
-                    "error_message": str(exc),
+            if is_no_tool_support_error(exc):
+                _no_tool_mode = True
+                _log.info("run_hf_dry_run: model %s does not support tool calling — retrying without tools", model)
+                try:
+                    (
+                        initial_response,
+                        initial_text,
+                        _fallback_result,
+                        _fallback_mem,
+                    ) = self._call_no_tool_fallback(initial_messages, token, model, max_tokens)
+                    initial_tool_calls = []
+                    reasoning_cycles, reasoning_snippet = 0, ""
+                except Exception as exc2:
+                    attempts.append({
+                        "phase": "initial_no_tool",
+                        "status": "error",
+                        "accepted": False,
+                        "reject_reason": "provider_error",
+                        "error_message": str(exc2),
+                        "prompt_json": initial_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                    })
+                    return {
+                        "provider": "huggingface_openai_compat",
+                        "model": model,
+                        "prompt_json": initial_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                        "valid_output": False,
+                        "parsed_output": None,
+                        "error_message": str(exc2),
+                        "outcome_class": "provider_error",
+                        "semantic_conflict": False,
+                        "conflict": None,
+                        "pivot": None,
+                        "repair_available": False,
+                        "repair_context": None,
+                        "attempts": attempts,
+                        "reasoning_cycles": 0,
+                        "reasoning_snippet": "",
+                    }
+            else:
+                attempts.append(
+                    {
+                        "phase": "initial",
+                        "status": "error",
+                        "accepted": False,
+                        "reject_reason": "provider_error",
+                        "error_message": str(exc),
+                        "prompt_json": initial_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                    }
+                )
+                return {
+                    "provider": "huggingface_openai_compat",
+                    "model": model,
                     "prompt_json": initial_prompt,
                     "response_json": {},
                     "result_text": "",
+                    "valid_output": False,
+                    "parsed_output": None,
+                    "error_message": str(exc),
+                    "outcome_class": "provider_error",
+                    "semantic_conflict": False,
+                    "conflict": None,
+                    "pivot": None,
+                    "repair_available": False,
+                    "repair_context": None,
+                    "attempts": attempts,
+                    "reasoning_cycles": reasoning_cycles,
+                    "reasoning_snippet": reasoning_snippet,
                 }
-            )
-            return {
-                "provider": "huggingface_openai_compat",
-                "model": model,
-                "prompt_json": initial_prompt,
-                "response_json": {},
-                "result_text": "",
-                "valid_output": False,
-                "parsed_output": None,
-                "error_message": str(exc),
-                "outcome_class": "provider_error",
-                "semantic_conflict": False,
-                "conflict": None,
-                "pivot": None,
-                "repair_available": False,
-                "repair_context": None,
-                "attempts": attempts,
-                "reasoning_cycles": reasoning_cycles,
-                "reasoning_snippet": reasoning_snippet,
-            }
 
-        parsed_result, memory_pairs = parse_tool_calls_to_model_output(initial_tool_calls, raw_response=initial_text)
+        if _no_tool_mode:
+            parsed_result = _fallback_result
+            memory_pairs = _fallback_mem
+        else:
+            parsed_result, memory_pairs = parse_tool_calls_to_model_output(initial_tool_calls, raw_response=initial_text)
         parsed = parsed_result.output
         initial_reject_reason: str | None = None
         if parsed is None:
-            initial_reject_reason = "no_tool_calls"
+            initial_reject_reason = "no_tool_calls" if not _no_tool_mode else "parse_error"
         elif violates_scambait_style_policy(parsed.suggestion):
             initial_reject_reason = "style_policy_violation"
             parsed = None
@@ -678,7 +757,7 @@ class ScambaiterCore:
         final_response = initial_response
         final_text = initial_text
 
-        if parsed is None and not initial_tool_calls:
+        if parsed is None and not initial_tool_calls and not _no_tool_mode:
             follow_messages = initial_messages + [
                 {"role": "user", "content": "Please use the available tools to respond."}
             ]
@@ -861,6 +940,9 @@ class ScambaiterCore:
         repair_messages = self.build_model_messages(chat_id=chat_id, include_memory=False)
         repair_prompt = {"messages": repair_messages, "max_tokens": max_tokens}
         attempts: list[dict[str, Any]] = []
+        _repair_no_tool = False
+        _repair_fallback_result = None
+        _repair_fallback_mem: list[tuple[str, str]] = []
         try:
             repair_response = call_hf_openai_chat(
                 token=token,
@@ -876,41 +958,85 @@ class ScambaiterCore:
             if not repair_text and repair_tool_calls:
                 repair_text = json.dumps(repair_tool_calls, ensure_ascii=True)
         except Exception as exc:
-            attempts.append(
-                {
-                    "phase": "repair",
-                    "status": "error",
-                    "accepted": False,
-                    "reject_reason": "provider_error",
-                    "error_message": str(exc),
+            if is_no_tool_support_error(exc):
+                _repair_no_tool = True
+                _log.info("run_hf_dry_run_repair: model %s does not support tool calling — retrying without tools", model)
+                try:
+                    (
+                        repair_response,
+                        repair_text,
+                        _repair_fallback_result,
+                        _repair_fallback_mem,
+                    ) = self._call_no_tool_fallback(repair_messages, token, model, max_tokens)
+                    repair_tool_calls = []
+                except Exception as exc2:
+                    attempts.append({
+                        "phase": "repair_no_tool",
+                        "status": "error",
+                        "accepted": False,
+                        "reject_reason": "provider_error",
+                        "error_message": str(exc2),
+                        "prompt_json": repair_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                    })
+                    return {
+                        "provider": "huggingface_openai_compat",
+                        "model": model,
+                        "prompt_json": repair_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                        "valid_output": False,
+                        "parsed_output": None,
+                        "error_message": str(exc2),
+                        "outcome_class": "provider_error",
+                        "semantic_conflict": False,
+                        "conflict": None,
+                        "pivot": None,
+                        "repair_available": False,
+                        "repair_context": None,
+                        "attempts": attempts,
+                    }
+            else:
+                attempts.append(
+                    {
+                        "phase": "repair",
+                        "status": "error",
+                        "accepted": False,
+                        "reject_reason": "provider_error",
+                        "error_message": str(exc),
+                        "prompt_json": repair_prompt,
+                        "response_json": {},
+                        "result_text": "",
+                    }
+                )
+                return {
+                    "provider": "huggingface_openai_compat",
+                    "model": model,
                     "prompt_json": repair_prompt,
                     "response_json": {},
                     "result_text": "",
+                    "valid_output": False,
+                    "parsed_output": None,
+                    "error_message": str(exc),
+                    "outcome_class": "provider_error",
+                    "semantic_conflict": False,
+                    "conflict": None,
+                    "pivot": None,
+                    "repair_available": False,
+                    "repair_context": None,
+                    "attempts": attempts,
                 }
-            )
-            return {
-                "provider": "huggingface_openai_compat",
-                "model": model,
-                "prompt_json": repair_prompt,
-                "response_json": {},
-                "result_text": "",
-                "valid_output": False,
-                "parsed_output": None,
-                "error_message": str(exc),
-                "outcome_class": "provider_error",
-                "semantic_conflict": False,
-                "conflict": None,
-                "pivot": None,
-                "repair_available": False,
-                "repair_context": None,
-                "attempts": attempts,
-            }
 
-        repaired_result, repair_memory_pairs = parse_tool_calls_to_model_output(repair_tool_calls, raw_response=repair_text)
+        if _repair_no_tool and _repair_fallback_result is not None:
+            repaired_result = _repair_fallback_result
+            repair_memory_pairs = _repair_fallback_mem
+        else:
+            repaired_result, repair_memory_pairs = parse_tool_calls_to_model_output(repair_tool_calls, raw_response=repair_text)
         repaired = repaired_result.output
         repair_reject_reason: str | None = None
         if repaired is None:
-            repair_reject_reason = "no_tool_calls"
+            repair_reject_reason = "no_tool_calls" if not _repair_no_tool else "parse_error"
         elif violates_scambait_style_policy(repaired.suggestion):
             repair_reject_reason = "style_policy_violation"
             repaired = None
