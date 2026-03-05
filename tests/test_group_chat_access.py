@@ -105,19 +105,22 @@ class TestCreateBotAppAllowedIds:
         svc.store = MagicMock()
         return svc
 
+    def _setup_mock_app(self, mock_app_cls):
+        mock_app = MagicMock()
+        mock_app.bot_data = {}
+        # Builder chain: .builder().token().post_init().build()
+        mock_app_cls.builder.return_value.token.return_value.post_init.return_value.build.return_value = mock_app
+        return mock_app
+
     def test_nur_persoenlicher_chat(self):
         with patch("scambaiter.bot_api.Application") as mock_app_cls:
-            mock_app = MagicMock()
-            mock_app.bot_data = {}
-            mock_app_cls.builder.return_value.token.return_value.build.return_value = mock_app
+            mock_app = self._setup_mock_app(mock_app_cls)
             create_bot_app(token="tok", service=self._make_service(), allowed_chat_id=111)
             assert mock_app.bot_data["allowed_chat_ids"] == {111}
 
     def test_mit_gruppe(self):
         with patch("scambaiter.bot_api.Application") as mock_app_cls:
-            mock_app = MagicMock()
-            mock_app.bot_data = {}
-            mock_app_cls.builder.return_value.token.return_value.build.return_value = mock_app
+            mock_app = self._setup_mock_app(mock_app_cls)
             create_bot_app(
                 token="tok",
                 service=self._make_service(),
@@ -128,8 +131,6 @@ class TestCreateBotAppAllowedIds:
 
     def test_ohne_allowed_chat_id(self):
         with patch("scambaiter.bot_api.Application") as mock_app_cls:
-            mock_app = MagicMock()
-            mock_app.bot_data = {}
-            mock_app_cls.builder.return_value.token.return_value.build.return_value = mock_app
+            mock_app = self._setup_mock_app(mock_app_cls)
             create_bot_app(token="tok", service=self._make_service())
             assert mock_app.bot_data["allowed_chat_ids"] == set()

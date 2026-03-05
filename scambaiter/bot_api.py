@@ -175,6 +175,67 @@ from scambaiter.bot_directives import (  # noqa: F401 — re-exports
 )
 
 
+# ---------------------------------------------------------------------------
+# Control-message tracking helpers
+# ---------------------------------------------------------------------------
+
+def _track_msg(
+    app: Application,
+    store: Any,
+    control_chat_id: int,
+    message_id: int,
+    *,
+    target_chat_id: int = 0,
+    msg_type: str = "other",
+) -> None:
+    """Record a bot message sent to the operator chat in memory + DB."""
+    sent_list = _sent_control_messages(app).setdefault(int(control_chat_id), [])
+    sent_list.append(int(message_id))
+    if len(sent_list) > 500:
+        del sent_list[: len(sent_list) - 500]
+    if store is not None:
+        store.add_control_message(
+            int(control_chat_id), int(message_id),
+            target_chat_id=int(target_chat_id), msg_type=msg_type,
+        )
+
+
+def _save_autosend(store: Any, target_chat_id: int, enabled: bool, control_chat_id: int) -> None:
+    """Persist auto-send state to DB."""
+    if store is not None:
+        store.set_autosend_state(int(target_chat_id), enabled, int(control_chat_id))
+
+
+async def _restore_autosend_from_db(app: Application, store: Any) -> None:
+    """Called after backfill: restore auto-send state and sent-message lists from DB."""
+    if store is None:
+        return
+    # Restore auto-send enabled chats
+    entries = store.get_all_autosend_enabled()
+    for target_chat_id, control_chat_id in entries:
+        _auto_send_enabled(app)[target_chat_id] = True
+        if control_chat_id:
+            _auto_send_control_chat(app)[target_chat_id] = control_chat_id
+        _log.info("restore_autosend: chat %d (control=%s) → starting loop", target_chat_id, control_chat_id)
+        _start_auto_send_task(app, target_chat_id)
+
+    # Restore sent-message lists and last card IDs
+    all_ctrl_chats = store.get_autosend_control_chats()  # {target: ctrl}
+    seen_ctrl: set[int] = set()
+    for target_chat_id, ctrl_id in all_ctrl_chats.items():
+        if ctrl_id in seen_ctrl:
+            continue
+        seen_ctrl.add(ctrl_id)
+        ids = store.get_control_message_ids(ctrl_id)
+        if ids:
+            _sent_control_messages(app)[ctrl_id] = ids[-500:]  # cap at 500
+    # Restore last card message IDs
+    for target_chat_id, ctrl_id in all_ctrl_chats.items():
+        last_card = store.get_last_card_message_id(ctrl_id, target_chat_id)
+        if last_card:
+            _last_user_card_message(app)[ctrl_id] = last_card
+
+
 async def _send_control_text(
     application: Application,
     message: Message,
@@ -201,10 +262,9 @@ async def _send_control_text(
         disable_web_page_preview=True,
         reply_markup=reply_markup,
     )
-    sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
-    sent_messages.append(int(sent.message_id))
-    if len(sent_messages) > 500:
-        del sent_messages[: len(sent_messages) - 500]
+    _svc = application.bot_data.get("service")
+    _store = getattr(_svc, "store", None)
+    _track_msg(application, _store, chat_id, sent.message_id)
     if replace_previous_status:
         last_status[chat_id] = int(sent.message_id)
     return sent
@@ -258,10 +318,8 @@ async def _show_user_card(
         text=_render_user_card(target_chat_id, len(events), last_preview, profile_lines),
         reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode, auto_send_on=auto_on, waiting_phase=current_phase, chat_model=chat_model),
     )
-    sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
-    sent_messages.append(int(sent.message_id))
-    if len(sent_messages) > 500:
-        del sent_messages[: len(sent_messages) - 500]
+    _track_msg(application, store, chat_id, sent.message_id,
+               target_chat_id=target_chat_id, msg_type="card")
     last_card[chat_id] = int(sent.message_id)
 
 
@@ -430,6 +488,45 @@ async def _cmd_chat_id_shortcut(update: Update, context: ContextTypes.DEFAULT_TY
     await _set_active_chat_from_id(update, context, target_chat_id)
 
 
+async def _cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete all tracked bot messages in this operator chat."""
+    app = context.application
+    if not await _require_allowed_chat(app, update, app.bot_data.get("allowed_chat_id")):
+        return
+    if update.effective_chat is None:
+        return
+    control_chat_id = int(update.effective_chat.id)
+    service = app.bot_data.get("service")
+    store: Any = getattr(service, "store", None)
+
+    msg_ids = store.get_control_message_ids(control_chat_id) if store else []
+    # Also include in-memory IDs not yet in DB
+    mem_ids = _sent_control_messages(app).get(control_chat_id, [])
+    all_ids = list(dict.fromkeys(msg_ids + mem_ids))  # deduplicated, order preserved
+
+    deleted = 0
+    failed = 0
+    for msg_id in all_ids:
+        try:
+            await app.bot.delete_message(chat_id=control_chat_id, message_id=msg_id)
+            deleted += 1
+        except Exception:
+            failed += 1
+
+    if store:
+        store.delete_control_messages(control_chat_id)
+    _sent_control_messages(app).pop(control_chat_id, None)
+    _last_user_card_message(app).pop(control_chat_id, None)
+
+    confirm = await update.message.reply_text(
+        f"🗑 Cleared {deleted} messages ({failed} already gone)."
+    )
+    # Track the confirmation itself so it can be cleared next time
+    if store:
+        store.add_control_message(control_chat_id, confirm.message_id)
+    _sent_control_messages(app).setdefault(control_chat_id, []).append(confirm.message_id)
+
+
 async def _cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     allowed_chat_id = app.bot_data.get("allowed_chat_id")
@@ -554,10 +651,7 @@ async def _handle_prompt_button(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=_prompt_keyboard(chat_id=chat_id, active_section="overview"),
     )
     _set_prompt_card_context(app, int(sent.message_id), chat_id=chat_id, attempt_id=latest_attempt_id)
-    sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
-    sent_messages.append(int(sent.message_id))
-    if len(sent_messages) > 500:
-        del sent_messages[: len(sent_messages) - 500]
+    _track_msg(app, store, int(message.chat_id), sent.message_id, target_chat_id=chat_id)
     await query.answer("Prompt generated")
 
 
@@ -852,10 +946,7 @@ async def _handle_chat_close_button(update: Update, context: ContextTypes.DEFAUL
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
-    sent_messages = _sent_control_messages(app).setdefault(int(message.chat_id), [])
-    sent_messages.append(int(sent.message_id))
-    if len(sent_messages) > 500:
-        del sent_messages[: len(sent_messages) - 500]
+    _track_msg(app, store, int(message.chat_id), sent.message_id)
 
 
 async def _handle_send_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2169,6 +2260,7 @@ async def _handle_autosend_toggle_button(update: Update, context: ContextTypes.D
 
     service = app.bot_data.get("service")
     store = _resolve_store(service)
+    _save_autosend(store, target_chat_id, new_state, control_chat_id)
     # Chat Card mit neuem Toggle-Status neu rendern
     try:
         await query.message.delete()
@@ -2212,6 +2304,7 @@ async def _handle_autosend_toggle_list_button(update: Update, context: ContextTy
     # Chats-Liste in-place neu rendern (nur Keyboard, Text bleibt)
     service = app.bot_data.get("service")
     store = _resolve_store(service)
+    _save_autosend(store, target_chat_id, new_state, int(query.message.chat_id))
     control_ids: set[int] = app.bot_data.get("allowed_chat_ids", set())
     chat_ids = [c for c in store.list_chat_ids(limit=100) if c not in control_ids]
     _, new_keyboard = _known_chats_card_content(
@@ -2520,10 +2613,7 @@ async def _handle_directives_button(update: Update, context: ContextTypes.DEFAUL
     text = _render_directive_list_card(target_chat_id, directives)
     kb = _directive_card_keyboard(target_chat_id, directives)
     sent = await query.message.reply_text(text, reply_markup=kb)
-    sent_msgs = _sent_control_messages(app).setdefault(int(query.message.chat_id), [])
-    sent_msgs.append(int(sent.message_id))
-    if len(sent_msgs) > 500:
-        del sent_msgs[: len(sent_msgs) - 500]
+    _track_msg(app, store, int(query.message.chat_id), sent.message_id, target_chat_id=target_chat_id)
     await query.answer("Directives")
 
 
@@ -2632,8 +2722,8 @@ async def _handle_directive_reply(update: Update, context: ContextTypes.DEFAULT_
                     chat_id=control_chat_id, text=card_t, reply_markup=card_m
                 )
                 _set_reply_card_state(app, int(sent_card.message_id), **state_payload)
-                sent_msgs = _sent_control_messages(app).setdefault(control_chat_id, [])
-                sent_msgs.append(int(sent_card.message_id))
+                _track_msg(app, store, control_chat_id, sent_card.message_id,
+                           target_chat_id=target_chat_id)
             except Exception as exc:
                 _log.warning("_handle_directive_reply: auto dry-run failed: %s", exc)
         asyncio.create_task(_auto_dryrun())
@@ -2812,6 +2902,7 @@ async def _register_command_menu(application: Application) -> None:
             BotCommand("chat", "set active target chat id"),
             BotCommand("chats", "list known chat ids"),
             BotCommand("history", "show history for active chat"),
+            BotCommand("clear", "delete all tracked bot messages in this chat"),
         ]
     )
 
@@ -2823,7 +2914,13 @@ def create_bot_app(
     telethon_executor: Any | None = None,
     extra_allowed_chat_ids: list[int] | None = None,
 ) -> Any:
-    app = Application.builder().token(token).build()
+    async def _post_init(application: Application) -> None:
+        svc = application.bot_data.get("service")
+        st = getattr(svc, "store", None)
+        if application.bot_data.get("mode") == "live" and st is not None:
+            await _restore_autosend_from_db(application, st)
+
+    app = Application.builder().token(token).post_init(_post_init).build()
     app.bot_data["service"] = service
     app.bot_data["allowed_chat_id"] = allowed_chat_id
     # Alle erlaubten Chat-IDs als Set (persönlicher Chat + ggf. Gruppe)
@@ -2841,6 +2938,7 @@ def create_bot_app(
     app.add_handler(CommandHandler("chat", _cmd_chat))
     app.add_handler(CommandHandler("chats", _cmd_chats))
     app.add_handler(CommandHandler("history", _cmd_history))
+    app.add_handler(CommandHandler("clear", _cmd_clear))
     app.add_handler(MessageHandler(filters.Regex(r"^/(?:c)?[0-9]+(?:\s.*)?$"), _cmd_chat_id_shortcut))
     app.add_handler(CallbackQueryHandler(_handle_select_chat_button, pattern=r"^sc:selchat:-?[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_prompt_button, pattern=r"^sc:prompt:-?[0-9]+$"))

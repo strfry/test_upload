@@ -245,6 +245,44 @@ class AnalysisStore:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id    INTEGER NOT NULL,
+                key        TEXT    NOT NULL,
+                value      TEXT    NOT NULL DEFAULT '',
+                updated_at TEXT    NOT NULL,
+                PRIMARY KEY (chat_id, key)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS control_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                control_chat_id INTEGER NOT NULL,
+                target_chat_id  INTEGER NOT NULL DEFAULT 0,
+                message_id      INTEGER NOT NULL,
+                msg_type        TEXT    NOT NULL DEFAULT 'other',
+                sent_at         TEXT    NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ctrl_msgs_chat ON control_messages(control_chat_id)"
+        )
+        # Migration: move _chat_model from memory → chat_settings
+        mem_rows = self._conn.execute(
+            "SELECT chat_id, value, updated_at FROM memory WHERE key = '_chat_model'"
+        ).fetchall()
+        for row in mem_rows:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO chat_settings(chat_id, key, value, updated_at)"
+                " VALUES (?, 'model', ?, ?)",
+                (row[0], row[1], row[2]),
+            )
+        if mem_rows:
+            self._conn.execute("DELETE FROM memory WHERE key = '_chat_model'")
         self._ensure_analyses_columns()
         self._ensure_generation_attempt_columns()
         self._ensure_events_columns()
@@ -738,31 +776,131 @@ class AnalysisStore:
         )
         self._conn.commit()
 
-    def get_chat_model(self, chat_id: int) -> str | None:
-        """Return per-chat model override, or None to use global default."""
+    # ------------------------------------------------------------------
+    # chat_settings — generic per-chat key/value store
+    # ------------------------------------------------------------------
+
+    def get_chat_setting(self, chat_id: int, key: str) -> str | None:
         row = self._conn.execute(
-            "SELECT value FROM memory WHERE chat_id = ? AND key = '_chat_model'",
-            (chat_id,),
+            "SELECT value FROM chat_settings WHERE chat_id = ? AND key = ?",
+            (chat_id, key),
         ).fetchone()
         if row is None:
             return None
-        value = str(row["value"]).strip()
+        value = str(row[0]).strip()
         return value if value else None
 
-    def set_chat_model(self, chat_id: int, model: str | None) -> None:
-        """Set or clear per-chat model override. Pass None to reset to global default."""
-        if model is None:
+    def set_chat_setting(self, chat_id: int, key: str, value: str | None) -> None:
+        """Set or delete a chat setting. Pass value=None to remove the key."""
+        ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        if value is None:
             self._conn.execute(
-                "DELETE FROM memory WHERE chat_id = ? AND key = '_chat_model'",
-                (chat_id,),
+                "DELETE FROM chat_settings WHERE chat_id = ? AND key = ?",
+                (chat_id, key),
             )
         else:
-            ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             self._conn.execute(
-                "INSERT OR REPLACE INTO memory(chat_id, key, value, updated_at) VALUES (?, '_chat_model', ?, ?)",
-                (chat_id, model, ts),
+                "INSERT OR REPLACE INTO chat_settings(chat_id, key, value, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                (chat_id, key, value, ts),
             )
         self._conn.commit()
+
+    def get_chat_model(self, chat_id: int) -> str | None:
+        """Return per-chat model override, or None to use global default."""
+        return self.get_chat_setting(chat_id, "model")
+
+    def set_chat_model(self, chat_id: int, model: str | None) -> None:
+        """Set or clear per-chat model override."""
+        self.set_chat_setting(chat_id, "model", model)
+
+    def get_autosend_state(self, chat_id: int) -> tuple[bool, int | None]:
+        """Return (enabled, control_chat_id) for a target chat."""
+        enabled = self.get_chat_setting(chat_id, "autosend") == "1"
+        ctrl_raw = self.get_chat_setting(chat_id, "autosend_control_chat")
+        control_chat_id = int(ctrl_raw) if ctrl_raw else None
+        return enabled, control_chat_id
+
+    def set_autosend_state(
+        self, chat_id: int, enabled: bool, control_chat_id: int | None = None
+    ) -> None:
+        """Persist auto-send enabled flag and control chat."""
+        self.set_chat_setting(chat_id, "autosend", "1" if enabled else "0")
+        if control_chat_id is not None:
+            self.set_chat_setting(chat_id, "autosend_control_chat", str(control_chat_id))
+
+    def get_all_autosend_enabled(self) -> list[tuple[int, int | None]]:
+        """Return [(target_chat_id, control_chat_id)] for all chats with autosend=1."""
+        rows = self._conn.execute(
+            "SELECT chat_id FROM chat_settings WHERE key = 'autosend' AND value = '1'"
+        ).fetchall()
+        result: list[tuple[int, int | None]] = []
+        for row in rows:
+            cid = int(row[0])
+            _, ctrl = self.get_autosend_state(cid)
+            result.append((cid, ctrl))
+        return result
+
+    # ------------------------------------------------------------------
+    # control_messages — bot messages sent to the operator chat
+    # ------------------------------------------------------------------
+
+    def add_control_message(
+        self,
+        control_chat_id: int,
+        message_id: int,
+        target_chat_id: int = 0,
+        msg_type: str = "other",
+    ) -> None:
+        ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        self._conn.execute(
+            "INSERT INTO control_messages"
+            "(control_chat_id, target_chat_id, message_id, msg_type, sent_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (control_chat_id, target_chat_id, message_id, msg_type, ts),
+        )
+        self._conn.commit()
+
+    def get_control_message_ids(self, control_chat_id: int) -> list[int]:
+        """All tracked message IDs for this operator chat, oldest first."""
+        rows = self._conn.execute(
+            "SELECT message_id FROM control_messages WHERE control_chat_id = ? ORDER BY id ASC",
+            (control_chat_id,),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def get_last_card_message_id(self, control_chat_id: int, target_chat_id: int) -> int | None:
+        """Last chat-card message ID for a given (control_chat, target_chat) pair."""
+        row = self._conn.execute(
+            "SELECT message_id FROM control_messages"
+            " WHERE control_chat_id = ? AND target_chat_id = ? AND msg_type = 'card'"
+            " ORDER BY id DESC LIMIT 1",
+            (control_chat_id, target_chat_id),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def get_autosend_control_chats(self) -> dict[int, int]:
+        """Return {target_chat_id: control_chat_id} for chats with autosend=1."""
+        rows = self._conn.execute(
+            "SELECT chat_id, value FROM chat_settings"
+            " WHERE key = 'autosend_control_chat'"
+        ).fetchall()
+        enabled_ids = {
+            int(r[0])
+            for r in self._conn.execute(
+                "SELECT chat_id FROM chat_settings WHERE key='autosend' AND value='1'"
+            ).fetchall()
+        }
+        return {int(r[0]): int(r[1]) for r in rows if int(r[0]) in enabled_ids and r[1]}
+
+    def delete_control_messages(self, control_chat_id: int) -> int:
+        """Delete all tracked messages for this operator chat. Returns count deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM control_messages WHERE control_chat_id = ?",
+            (control_chat_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def get_chat_profile(self, chat_id: int) -> ChatProfile | None:
         row = self._conn.execute(
