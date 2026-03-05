@@ -9,7 +9,7 @@ Three-layer design with strict separation:
 - **Core** (`scambaiter/core.py`) — Prompt builder + LLM interface. Generates structured JSON output (`scambait.llm.v1` schema). Never sends messages itself.
 - **Control Bot** (`scambaiter/bot_api.py`) — Telegram bot (`ScamBaiterControl`) for human oversight: inline buttons, prompt cards, forward ingestion, `/chats`, `/queue`, etc.
 - **Telethon** (`scambaiter/telethon_executor.py`) — The sole automated sender/receiver. All delivery goes through here.
-- **Storage** (`scambaiter/storage.py`) — SQLite event store (events, analyses, directives, memory context, profiles, generation attempts).
+- **Storage** (`scambaiter/storage.py`) — SQLite event store (events, analyses, directives, memory context, profiles, generation attempts, chat_settings, control_messages).
 - **Service** (`scambaiter/service.py`) — Orchestration loop, pending state management.
 - **Model Client** (`scambaiter/model_client.py`) — HuggingFace (primary) / OpenAI (fallback) API client.
 
@@ -76,15 +76,45 @@ sqlite3.connect('/home/strfry/scambaiter/scambaiter.sqlite3').execute('PRAGMA wa
 scp strfry.org:~/scambaiter/scambaiter.sqlite3 ./scambaiter.sqlite3
 ```
 
+## Storage-Schema (wichtige Tabellen)
+
+| Tabelle | Zweck |
+|---|---|
+| `events` | Alle Chat-Events (scammer/scambaiter/system), chronologisch |
+| `analyses` | Generierte Suggestions + Analyse-Payloads |
+| `directives` | Operator-Anweisungen pro Chat (aktiv/inaktiv, scope) |
+| `chat_settings` | Per-Chat Key/Value: `model`, `autosend`, `autosend_control_chat` |
+| `control_messages` | Bot-Nachrichten im Operator-Chat (für `/clear` und Keyboard-Restore) |
+| `memory` | KV-Store für LLM-Memory (Kurzzeit-Facts) |
+| `summaries` | Memory-Summaries pro Chat (cursor_event_id) |
+| `chat_profiles` | Telethon-geholte User-Profile (snapshot_json) |
+
+**`chat_settings` Keys:**
+- `model` — per-Chat Model-Override (z.B. `Sao10K/L3-70B-Euryale-v2.1`); `None` = global `HF_MODEL`
+- `autosend` — `"1"` / `"0"` — persistierter Auto-Send-State
+- `autosend_control_chat` — Operator-Chat-ID für Status-Updates
+
+## Bot-Commands (Übersicht)
+
+| Command | Funktion |
+|---|---|
+| `/chats` | Liste aller bekannten Chats mit Auto-Send-Toggle |
+| `/chat <id>` | Chat-Card öffnen (Prompt, Directives, Model, Auto-Send) |
+| `/clear` | Alle getrackten Bot-Nachrichten im Operator-Chat löschen |
+| `/history <id>` | Letzte Events eines Chats anzeigen |
+| `/whoami` | Eigene Chat-/User-ID anzeigen |
+
 ## Scripts
 
-`scripts/` — CLI tools: `prompt_runner.py`, `prompt_cli.py`, `chat_repl.py`, `loop_analyzer.py`, `list_chat_ids.py`, `telethon_forward_helper.py`, `dry_run_cli.py`, and others.
+`scripts/` — CLI tools: `prompt_runner.py`, `prompt_cli.py`, `chat_repl.py`, `loop_analyzer.py`, `list_chat_ids.py`, `telethon_forward_helper.py`, `dry_run_cli.py`, und andere.
 
 ## Notes
 
 - All documentation is written in German.
 - The LLM contract schema (`scambait.llm.v1`) is an internal Core interface, not the external bot API.
 - Core must never send messages directly — only Telethon does.
+- **Per-Chat Model-Override:** In Chat-Card → 🤖 Model-Button → Panel mit Presets (Euryale, Qwen2.5 72B, Llama 3.3 70B, gpt-oss-20b/120b). Gespeichert in `chat_settings.model`.
+- **Auto-Send ist jetzt persistent:** Toggle speichert in `chat_settings.autosend`. Nach Neustart werden alle aktiven Chats automatisch wiederhergestellt (post_init Hook). Für lokale Tests: Auto-Send in DB manuell deaktivieren oder DB-Kopie vom Server ziehen.
 
 ## ScamBaiterDebugBot — Nächstes Experiment
 
