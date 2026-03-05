@@ -2096,8 +2096,9 @@ async def _set_auto_send_phase(
         return
     mode = application.bot_data.get("mode")
     auto_on = _auto_send_enabled(application).get(target_chat_id, False)
-    store = context.bot_data.get("store")
-    chat_model = store.get_chat_model(target_chat_id) if store else None
+    _service = application.bot_data.get("service")
+    _store = getattr(_service, "store", None)
+    chat_model = _store.get_chat_model(target_chat_id) if _store is not None else None
     new_kb = _chat_card_keyboard(
         target_chat_id,
         live_mode=(mode == "live"),
@@ -2754,8 +2755,9 @@ async def _handle_model_panel_button(update: Update, context: ContextTypes.DEFAU
         return
     await query.answer()
     chat_id = int(query.data.split(":")[-1])
-    store: Any = context.bot_data.get("store")
-    current_model = store.get_chat_model(chat_id) if store else None
+    service = context.application.bot_data.get("service")
+    store: Any = getattr(service, "store", None)
+    current_model = store.get_chat_model(chat_id) if store is not None else None
     text = f"Model override for /{chat_id}\n\nCurrent: {current_model or '(global default)'}"
     await query.message.reply_text(text, reply_markup=_model_panel_keyboard(chat_id, current_model))
 
@@ -2772,7 +2774,8 @@ async def _handle_model_set_button(update: Update, context: ContextTypes.DEFAULT
         return
     chat_id = int(parts[2])
     model_key = parts[3]
-    store: Any = context.bot_data.get("store")
+    service = context.application.bot_data.get("service")
+    store: Any = getattr(service, "store", None)
     if store is None:
         return
     if model_key == "default":
