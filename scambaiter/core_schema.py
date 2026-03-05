@@ -300,7 +300,12 @@ TOOL_DEFINITIONS: list[dict] = [
                         },
                     },
                 },
-                "required": ["actions"],
+                # Note: "required" is intentionally omitted here.
+                # Some HF-hosted models (e.g. Llama-3.3) emit tool calls without
+                # the actions wrapper, causing the router to reject the request with
+                # a 400 schema-validation error before we can parse it ourselves.
+                # Removing "required" lets the call through; our own parser handles
+                # missing/malformed actions via the tool_retry phase.
             },
         },
     },
@@ -403,12 +408,21 @@ def detect_text_language(text: str) -> str:
 
 
 def is_no_tool_support_error(exc: BaseException) -> bool:
-    """Return True if the exception indicates the model/server doesn't support tool calling."""
+    """Return True if the exception indicates tool calling won't work with this model/router.
+
+    Catches several HF-router / vLLM 400 error patterns:
+    - Model not configured for tool calling (Euryale, custom fine-tunes)
+    - Router schema validation rejecting malformed tool call arguments (Llama-3.3)
+    - Router unable to generate a valid function call at all
+    """
     msg = str(exc)
+    msg_lower = msg.lower()
     return (
-        "enable-auto-tool-choice" in msg
-        or "tool-call-parser" in msg
-        or "tool choice requires" in msg.lower()
+        "enable-auto-tool-choice" in msg       # vLLM: tool calling not enabled for model
+        or "tool-call-parser" in msg           # vLLM: parser not configured
+        or "tool choice requires" in msg_lower # generic tool-choice config error
+        or "tool call validation failed" in msg_lower  # HF router schema validation
+        or "failed to call a function" in msg_lower    # HF router: can't generate function call
     )
 
 

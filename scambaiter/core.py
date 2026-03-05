@@ -818,7 +818,7 @@ class ScambaiterCore:
         final_response = initial_response
         final_text = initial_text
 
-        if parsed is None and not initial_tool_calls and not _no_tool_mode:
+        if parsed is None and not _no_tool_mode:
             follow_messages = initial_messages + [
                 {"role": "user", "content": "Please use the available tools to respond."}
             ]
