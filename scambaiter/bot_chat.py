@@ -31,10 +31,20 @@ def _chat_card_keyboard(
     auto_send_on: bool = False,
     waiting_phase: str | None = None,
     attempt_no: int | None = None,
+    chat_model: str | None = None,
 ) -> InlineKeyboardMarkup:
+    # Build short model label for button
+    if chat_model:
+        short = chat_model.split("/")[-1]
+        if len(short) > 16:
+            short = short[:14] + "…"
+        model_label = f"🤖 {short}"
+    else:
+        model_label = "🤖 Model: default"
     rows = [
         [InlineKeyboardButton("Prompt", callback_data=f"sc:prompt:{target_chat_id}")],
-        [InlineKeyboardButton("Directives", callback_data=f"sc:directives:{target_chat_id}")],
+        [InlineKeyboardButton("Directives", callback_data=f"sc:directives:{target_chat_id}"),
+         InlineKeyboardButton(model_label, callback_data=f"sc:model_panel:{target_chat_id}")],
     ]
     if live_mode:
         rows.append([

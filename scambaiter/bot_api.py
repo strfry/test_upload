@@ -252,10 +252,11 @@ async def _show_user_card(
     live_mode = application.bot_data.get("mode") == "live"
     auto_on = _auto_send_enabled(application).get(target_chat_id, False)
     current_phase = _auto_send_waiting_phase(application).get(target_chat_id)
+    chat_model = store.get_chat_model(target_chat_id)
     sent = await application.bot.send_message(
         chat_id=chat_id,
         text=_render_user_card(target_chat_id, len(events), last_preview, profile_lines),
-        reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode, auto_send_on=auto_on, waiting_phase=current_phase),
+        reply_markup=_chat_card_keyboard(target_chat_id, live_mode=live_mode, auto_send_on=auto_on, waiting_phase=current_phase, chat_model=chat_model),
     )
     sent_messages = _sent_control_messages(application).setdefault(chat_id, [])
     sent_messages.append(int(sent.message_id))
@@ -2095,12 +2096,15 @@ async def _set_auto_send_phase(
         return
     mode = application.bot_data.get("mode")
     auto_on = _auto_send_enabled(application).get(target_chat_id, False)
+    store = context.bot_data.get("store")
+    chat_model = store.get_chat_model(target_chat_id) if store else None
     new_kb = _chat_card_keyboard(
         target_chat_id,
         live_mode=(mode == "live"),
         auto_send_on=auto_on,
         waiting_phase=phase,
         attempt_no=attempt_no,
+        chat_model=chat_model,
     )
     try:
         await application.bot.edit_message_reply_markup(
@@ -2718,6 +2722,85 @@ async def _handle_dir_close_button(update: Update, context: ContextTypes.DEFAULT
         pass
 
 
+# ---------------------------------------------------------------------------
+# Per-chat model override panel
+# ---------------------------------------------------------------------------
+
+_CHAT_MODEL_PRESETS: list[tuple[str, str | None]] = [
+    ("default (global HF_MODEL)", None),
+    ("Euryale 70B  🎭", "Sao10K/L3-70B-Euryale-v2.1"),
+    ("Qwen2.5 72B", "Qwen/Qwen2.5-72B-Instruct"),
+    ("Llama 3.3 70B", "meta-llama/Llama-3.3-70B-Instruct"),
+    ("gpt-oss-20b  (default)", "openai/gpt-oss-20b"),
+    ("gpt-oss-120b", "openai/gpt-oss-120b"),
+]
+
+def _model_panel_keyboard(chat_id: int, current_model: str | None) -> InlineKeyboardMarkup:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = []
+    for label, model_id in _CHAT_MODEL_PRESETS:
+        active = (model_id == current_model) or (model_id is None and current_model is None)
+        btn_label = f"✅ {label}" if active else label
+        key = model_id or "default"
+        rows.append([InlineKeyboardButton(btn_label, callback_data=f"sc:model_set:{chat_id}:{key}")])
+    rows.append([InlineKeyboardButton("Close", callback_data=f"sc:model_close:{chat_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _handle_model_panel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:model_panel:{chat_id} — show model selection panel."""
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    await query.answer()
+    chat_id = int(query.data.split(":")[-1])
+    store: Any = context.bot_data.get("store")
+    current_model = store.get_chat_model(chat_id) if store else None
+    text = f"Model override for /{chat_id}\n\nCurrent: {current_model or '(global default)'}"
+    await query.message.reply_text(text, reply_markup=_model_panel_keyboard(chat_id, current_model))
+
+
+async def _handle_model_set_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:model_set:{chat_id}:{model_key} — apply model override."""
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    await query.answer()
+    # data format: sc:model_set:{chat_id}:{model_key_possibly_with_slashes}
+    parts = query.data.split(":", 3)
+    if len(parts) < 4:
+        return
+    chat_id = int(parts[2])
+    model_key = parts[3]
+    store: Any = context.bot_data.get("store")
+    if store is None:
+        return
+    if model_key == "default":
+        store.set_chat_model(chat_id, None)
+        new_model = None
+        label = "(global default)"
+    else:
+        store.set_chat_model(chat_id, model_key)
+        new_model = model_key
+        label = model_key
+    await query.edit_message_text(
+        f"Model override for /{chat_id}\n\nCurrent: {label}",
+        reply_markup=_model_panel_keyboard(chat_id, new_model),
+    )
+
+
+async def _handle_model_close_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:model_close:{chat_id}"""
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    await query.answer("Closed")
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+
 async def _register_command_menu(application: Application) -> None:
     await application.bot.set_my_commands(
         [
@@ -2797,6 +2880,9 @@ def create_bot_app(
     app.add_handler(CallbackQueryHandler(_handle_dir_delete_button, pattern=r"^sc:dir_delete:[0-9]+:-?[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dir_toggle_button, pattern=r"^sc:dir_toggle:[0-9]+:-?[0-9]+$"))
     app.add_handler(CallbackQueryHandler(_handle_dir_close_button, pattern=r"^sc:dir_close:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_model_panel_button, pattern=r"^sc:model_panel:-?[0-9]+$"))
+    app.add_handler(CallbackQueryHandler(_handle_model_set_button, pattern=r"^sc:model_set:-?[0-9]+:.+$"))
+    app.add_handler(CallbackQueryHandler(_handle_model_close_button, pattern=r"^sc:model_close:-?[0-9]+$"))
     # Directive reply must come before existing REPLY and ALL handlers (order critical)
     app.add_handler(MessageHandler(filters.REPLY, _handle_directive_reply))
     app.add_handler(MessageHandler(filters.REPLY, _handle_manual_override_response))

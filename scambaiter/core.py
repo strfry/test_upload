@@ -573,7 +573,9 @@ class ScambaiterCore:
 
     def run_hf_dry_run(self, chat_id: int, include_timing: bool = True) -> dict[str, Any]:
         token = (getattr(self.config, "hf_token", None) or "").strip()
-        model = (getattr(self.config, "hf_model", None) or "").strip()
+        # Per-chat model override takes priority over global HF_MODEL.
+        chat_model_override = self.store.get_chat_model(chat_id)
+        model = (chat_model_override or getattr(self.config, "hf_model", None) or "").strip()
         if not token or not model:
             raise RuntimeError("HF_TOKEN/HF_MODEL missing")
         max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))
@@ -851,7 +853,8 @@ class ScambaiterCore:
         # embedded in the prompt — the repair simply forces tool use on a fresh context rebuild.
         _ = (failed_generation, reject_reason)
         token = (getattr(self.config, "hf_token", None) or "").strip()
-        model = (getattr(self.config, "hf_model", None) or "").strip()
+        chat_model_override = self.store.get_chat_model(chat_id)
+        model = (chat_model_override or getattr(self.config, "hf_model", None) or "").strip()
         if not token or not model:
             raise RuntimeError("HF_TOKEN/HF_MODEL missing")
         max_tokens = int(getattr(self.config, "hf_max_tokens", 1500))

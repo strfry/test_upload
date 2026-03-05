@@ -738,6 +738,32 @@ class AnalysisStore:
         )
         self._conn.commit()
 
+    def get_chat_model(self, chat_id: int) -> str | None:
+        """Return per-chat model override, or None to use global default."""
+        row = self._conn.execute(
+            "SELECT value FROM memory WHERE chat_id = ? AND key = '_chat_model'",
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = str(row["value"]).strip()
+        return value if value else None
+
+    def set_chat_model(self, chat_id: int, model: str | None) -> None:
+        """Set or clear per-chat model override. Pass None to reset to global default."""
+        if model is None:
+            self._conn.execute(
+                "DELETE FROM memory WHERE chat_id = ? AND key = '_chat_model'",
+                (chat_id,),
+            )
+        else:
+            ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO memory(chat_id, key, value, updated_at) VALUES (?, '_chat_model', ?, ?)",
+                (chat_id, model, ts),
+            )
+        self._conn.commit()
+
     def get_chat_profile(self, chat_id: int) -> ChatProfile | None:
         row = self._conn.execute(
             """
